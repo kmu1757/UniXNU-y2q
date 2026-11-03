@@ -23,13 +23,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Values cross-checked against the Pong platform DTS and UEFI memory map.
 DRAM_BASE = 0x80000000
-APSS_BASE = 0x17000000
+APSS_BASE = 0x17800000
 APSS_SIZE = 0x02000000
-GIC_DIST = 0x17100000
+GIC_DIST = 0x17A00000
 GIC_DIST_SIZE = 0x10000
-GIC_REDIST = 0x17180000
-GIC_REDIST_SIZE = 0x200000
-GIC_REDIST_STRIDE = 0x40000
+GIC_REDIST = 0x17A60000
+GIC_REDIST_SIZE = 0x100000
+GIC_REDIST_STRIDE = 0x20000
 TIMEBASE = 0x0124F800  # 19.2 MHz from the Pong timer node.
 UFS_HC = 0x01D84000
 UFS_HC_SIZE = 0x3000
@@ -175,7 +175,7 @@ def main():
         # scale becomes 0 in FBSDisplayMode (infinite logical dimensions) and
         # SpringBoard deliberately traps before creating its main display.
         # Keep the real framebuffer pixels; do not substitute an Apple panel.
-        ('display-scale', struct.pack('<I', 3)),
+        ('display-scale', struct.pack('<I', 2)),
         ('pong-dsi-backlight', struct.pack('<Q6I',
             int(backlight['controller'], 0), backlight['register_bytes'],
             backlight['maximum'], backlight['minimum_nonzero'],
@@ -262,7 +262,7 @@ def main():
         ('cmd-db-base', struct.pack('<Q', 0x80860000)),
         ('gpio-offset', struct.pack('<I', 0x100000)),
         ('pins', struct.pack('<6I', 16, 17, 18, 19, 21, 20)),
-        ('max-x', struct.pack('<I', 1080)), ('max-y', struct.pack('<I', 2412)),
+        ('max-x', struct.pack('<I', 2800)), ('max-y', struct.pack('<I', 1752)),
     ])
     tree = node('device-tree', [
         # Keys use the actual SM8475 PMIC-arbiter resources below.
@@ -270,11 +270,11 @@ def main():
         # comes from this model. Keep the restore's J171 board policy (jetsam,
         # arm64 ABI) separate from the requested iPhone presentation identity.
         # Physical resources remain Pong/SM8475; /product is an ADT node.
-        ('model', b'iPhone17,1\0'),
-        ('compatible', b'J171AP\0iPhone17,1\0qcom,sm8475\0'),
+        ('model', b'iPad7,11\0'),
+        ('compatible', b'J171AP\0iPad7,11\0qcom,sm8250\0'),
         ('target-type', b'J171\0'),
         ('target-sub-type', b'J171AP\0'),
-        ('pong,physical-model', b'Nothing Phone (2)\0'),
+        ('pong,physical-model', b'Samsung Galaxy Tab S7+\0'),
         ('#address-cells', struct.pack('<I', 2)),
         ('#size-cells', struct.pack('<I', 2)),
     ], [
@@ -306,24 +306,20 @@ def main():
             ('opposed-power-vol-buttons', struct.pack('<I', 1)),
         ]),
         node('product', [
-            ('product-name', b'iPhone 16 Pro\0'),
-            ('product-description', b'iPhone 16 Pro\0'),
-            ('artwork-device-idiom', b'phone\0'),
-            # iPhone 16 Pro artwork family. Physical display geometry stays
-            # 1080x2412 in /chosen and the framebuffer, not 1206x2622.
-            ('artwork-device-subtype', struct.pack('<I', 2622)),
+            ('product-name', b'iPad (7th generation)\0'),
+            ('product-description', b'iPad (7th generation)\0'),
+            ('artwork-device-idiom', b'pad\0'),
+            ('artwork-device-subtype', struct.pack('<I', 2160)),
             ('artwork-dynamic-displaymode', b'0\0'),
             ('artwork-display-gamut', b'sRGB\0'),
-            ('compatible-device-fallback', b'iPhone17,1\0'),
+            ('compatible-device-fallback', b'iPad7,11\0'),
             ('compatible-app-variant', b'0\0'),
-            # Keep Pong's v82 memory performance tier. Phone artwork does
-            # not authorize a higher memory budget in the 1 GiB XNU window.
             ('device-perf-memory-class', struct.pack('<I', 3)),
             ('thin-bezel', struct.pack('<I', 1)),
             ('allow-32bit-apps', struct.pack('<I', 0)),
             ('ephemeral-data-mode', struct.pack('<I', 0)),
             ('udid-version', struct.pack('<I', 1)),
-            ('artwork-scale-factor', struct.pack('<I', 3)),
+            ('artwork-scale-factor', struct.pack('<I', 2)),
         ]),
     ])
     # Hardware-only probes do not load AppleImage4. Full root boot does, and its

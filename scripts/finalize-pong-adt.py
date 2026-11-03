@@ -116,10 +116,10 @@ def main():
     parser.add_argument('--volume-layout', type=Path, help='layout JSON the kernel was configured with')
     parser.add_argument('--hardware-dtb', type=Path,
                         help='compiled board DTS (default: board.toml [bootimg] dtb under the work tree)')
-    parser.add_argument('--dram-size', type=lambda value: int(value, 0), default=0x300000000,
-                        help='physical DRAM the boot chain reports; a local run passes 12 GiB')
-    parser.add_argument('--window-size', type=lambda value: int(value, 0), default=0x100000000,
-                        help="DarwinBoot's allocation window; a local run passes 4 GiB")
+    parser.add_argument('--dram-size', type=lambda value: int(value, 0), default=0x200000000,
+                        help='physical DRAM the boot chain reports; 8 GiB for T970')
+    parser.add_argument('--window-size', type=lambda value: int(value, 0), default=0x40000000,
+                        help="DarwinBoot's allocation window; 1 GiB for T970")
     parser.add_argument('--cpus', type=int, choices=range(1, 9), default=1,
                         help='CPU nodes in the ADT; a local bring-up run passes 1')
     parser.add_argument('--chip-id', default=None, help='BuildIdentity chip ID (default: board.toml [payload.adt])')
