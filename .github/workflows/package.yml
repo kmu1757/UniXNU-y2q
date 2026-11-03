@@ -312,7 +312,7 @@ jobs:
           # cmake, ninja and llvm have no bottle on this Tier 3 runner, so nothing
           # installs them: the image's own copies are used, and the llvm keg is put
           # on PATH rather than linked.
-          brew install dtc lzfse mtools nasm acpica
+          brew install dtc lzfse mtools nasm acpica lld || brew install dtc lzfse mtools nasm acpica
           ok=1
           for t in dtc lzfse mformat mcopy nasm iasl cmake ninja make unifdef python3; do
             command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
@@ -324,6 +324,21 @@ jobs:
             [ -x "${LLVM_KEG}/bin/${t}" ] || { echo "missing tool: ${LLVM_KEG}/bin/${t}"; ok=0; }
           done
           for t in lld-link ld64.lld; do
+            if [ ! -x "${LLD_KEG}/bin/${t}" ]; then
+              cand=""
+              if [ -x "${LLVM_KEG}/bin/${t}" ]; then
+                cand="${LLVM_KEG}/bin/${t}"
+              elif command -v "$t" >/dev/null 2>&1; then
+                cand="$(command -v "$t")"
+              else
+                cand="$(find /usr/local/opt /usr/local/Cellar -name "$t" -perm +111 2>/dev/null | head -1 || true)"
+              fi
+              if [ -n "$cand" ] && [ -x "$cand" ]; then
+                echo "Providing ${LLD_KEG}/bin/${t} from $cand"
+                sudo mkdir -p "${LLD_KEG}/bin"
+                sudo ln -sf "$cand" "${LLD_KEG}/bin/${t}"
+              fi
+            fi
             [ -x "${LLD_KEG}/bin/${t}" ] || { echo "missing tool: ${LLD_KEG}/bin/${t}"; ok=0; }
           done
           dtc --version
@@ -356,7 +371,7 @@ jobs:
           import json, os, re, tomllib
           from pathlib import Path
           path = Path('device/board.toml')
-          lines = path.read_text().splitlines(keepends=True)
+          lines = path.read_text().replace('\r\n', '\n').splitlines(keepends=True)
           try:
               table = lines.index('[package.defconfig]\n')
           except ValueError:
