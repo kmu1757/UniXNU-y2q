@@ -73,7 +73,6 @@ patches = [
 packages = [
   "{uefi}",
   "{tree}/package",
-  "{tree}/drivers/DarwinBoot24",
   "{edk2}",
   "{uefi}/Platforms/Nothing",
   "{uefi}/Common/Mu",
