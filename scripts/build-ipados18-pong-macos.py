@@ -90,9 +90,19 @@ def main():
     print('Building Darwin 24; log:',log,flush=True)
     with log.open('w') as f:r=subprocess.run(['bash','scripts/build-xnu-ipados18.sh'],cwd=tree,env=env,stdout=f,stderr=subprocess.STDOUT)
     report.update(returncode=r.returncode,log=str(log));result.write_text(json.dumps(report,indent=2)+'\n')
-    if r.returncode:raise SystemExit(f'Build failed; log retained: {log}')
+    a.artifact_dir.mkdir(parents=True,exist_ok=True)
+    try:shutil.copyfile(log,a.artifact_dir/log.name)
+    except Exception:pass
+    if r.returncode:
+        try:
+            lines=log.read_text(errors='replace').splitlines()
+            tail='\n'.join(lines[-200:])
+            print(f'=== BUILD FAILED (rc={r.returncode}) ===\n{tail}\n=== END OF LOG ===',file=sys.stderr,flush=True)
+        except Exception as e:
+            print(f'Failed to print build log tail: {e}',file=sys.stderr)
+        raise SystemExit(f'Build failed; log retained: {log}')
     kernel=tree/'build/xnu/ios-obj/DEVELOPMENT_ARM64_PONG/mach.development.pong'
-    a.artifact_dir.mkdir(parents=True,exist_ok=True);shutil.copyfile(kernel,a.artifact_dir/kernel.name)
+    shutil.copyfile(kernel,a.artifact_dir/kernel.name)
     report.update(build_complete=True,kernel=dict(path=str(a.artifact_dir/kernel.name),bytes=kernel.stat().st_size))
     for dest in (result,a.artifact_dir/'PONG_BUILD_RESULT.json'):dest.write_text(json.dumps(report,indent=2)+'\n')
     print(a.artifact_dir/kernel.name)

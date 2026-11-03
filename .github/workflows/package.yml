@@ -551,6 +551,7 @@ jobs:
           fi
           [ -f ci-volume-layout.json ] && cp -f ci-volume-layout.json products/ || true
           [ -f device/local.toml ] && cp -f device/local.toml products/local.toml || true
+          find . -maxdepth 2 \( -name 'build-*.log' -o -name 'PONG_BUILD_RESULT.json' \) -exec cp -f {} products/ \; || true
           du -sh products
           find products -type f | head -n 40
       - uses: actions/upload-artifact@v4
