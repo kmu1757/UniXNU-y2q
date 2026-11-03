@@ -1,7 +1,7 @@
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -1061,12 +1061,40 @@
+@@ -1061,12 +1061,44 @@
  			goto retry;
  		}
  	}
@@ -17,6 +17,7 @@ diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +native_pong_apfs_upgrade_flags(mount_t mp)
 +{
 +	uint64_t flags = vfs_flags(mp);
++#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
 +	int rootful = 0;
 +	PE_parse_boot_argn("pong_rootful", &rootful, sizeof(rootful));
 +	if (rootful != 1 || !(flags & MNT_ROOTFS) || !rootvnode ||
@@ -34,6 +35,9 @@ diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +	    !native_owner_cache_root_recheck || native_owner_cache_current_root != (uintptr_t)rootvnode) return flags;
 +	printf("PONG rootful: authorized OS-only APFS write upgrade dev=%x\n", device);
 +	return flags & ~MNT_ROOTFS;
++#else
++	return flags;
++#endif
 +}
 +#endif
  
