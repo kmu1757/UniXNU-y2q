@@ -67,6 +67,33 @@ def install_components(unixnu):
     return added, updated
 
 
+def patch_kernel_builder(unixnu):
+    kernel_py = unixnu / 'scripts/unixnu/kernel.py'
+    if not kernel_py.is_file():
+        raise SystemExit(f'{kernel_py} missing: {unixnu} is not a valid UniXNU checkout')
+    text = kernel_py.read_text(encoding='utf-8')
+    marker = "    record = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/startup.o.json'\n"
+    if marker in text and 'has_kernel_component' not in text:
+        injection = """    # When a component kit (e.g. PongPlatform24) provides the kernel aggregate,
+    # delegate kernel compilation directly to component builders and skip legacy BCM2837 pass.
+    has_kernel_component = any(
+        kind == 'component' and spec.get('build_stage') == 'kernel' and
+        any('mach.' in out for out in spec.get('outputs', []))
+        for kind, spec in archive_plan(ctx)
+    )
+    if has_kernel_component:
+        log('kernel: delegated to component kit')
+        ctx.need_config()['XNU_BUILD_ARCHIVES'] = True
+        build_archives(ctx, env)
+        return
+
+"""
+        text = text.replace(marker, injection + marker)
+        kernel_py.write_text(text, encoding='utf-8')
+        return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--unixnu', required=True, type=Path)
@@ -76,8 +103,10 @@ def main():
     profile = board['board']['os_profile']
     target = install_profile(unixnu, profile)
     added, present = install_components(unixnu)
+    kernel_patched = patch_kernel_builder(unixnu)
     print(json.dumps({'profile': profile, 'installed_at': str(target),
-                      'components_added': added, 'components_present': present}, indent=2))
+                      'components_added': added, 'components_present': present,
+                      'kernel_patched': kernel_patched}, indent=2))
 
 
 if __name__ == '__main__':

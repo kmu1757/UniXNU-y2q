@@ -57,7 +57,7 @@ def seed_refer(device, sources):
         if link.is_symlink() or link.exists():
             if link.resolve() == target.resolve():
                 continue
-            raise SystemExit(f'{link} already points elsewhere; remove it and rerun')
+            link.unlink()
         link.symlink_to(target.resolve())
 
 
@@ -83,9 +83,19 @@ def hardware_dtb(device, tree, given=None):
         raise SystemExit('dtc is missing; install it (brew install dtc)')
     for item in spec.get('include_dirs', []):
         kind, _, relative = item.partition(':')
-        directory = device / relative if kind == 'device' else tree / relative
-        if not directory.is_dir():
-            raise SystemExit(f'{directory} missing: [device_tree] include_dirs names it')
+        if kind == 'soc':
+            candidates = [
+                device / 'migration/format2/soc-seed' / relative,
+                device / relative,
+                tree / relative,
+            ]
+            directory = next((c for c in candidates if c.is_dir()), None)
+            if directory is None:
+                raise SystemExit(f'{item} missing: checked {candidates}')
+        else:
+            directory = device / relative if kind == 'device' else tree / relative
+            if not directory.is_dir():
+                raise SystemExit(f'{directory} missing: [device_tree] include_dirs names it')
         command += ['-i', str(directory)]
     output = Path(command[command.index('-o') + 1])
     output.parent.mkdir(parents=True, exist_ok=True)
