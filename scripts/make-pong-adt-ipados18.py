@@ -65,12 +65,19 @@ def load_format2_hardware(path):
     CPU_AFFINITIES=sorted(value(p,'reg') for p in cpus)
     if len(CPU_AFFINITIES)!=8 or CPU_AFFINITIES[0]!=0:
         raise ValueError('This Pong profile requires its eight physical CPU affinities')
-    memory=next(p for p in nodes.values() if p.get('device_type')==b'memory\0')
-    DRAM_BASE=int.from_bytes(memory['reg'][:8],'big')
-    ufs=next(p for p in nodes.values() if b'qcom,sm8475-ufshc\0' in p.get('compatible',b''))
-    UFS_HC=int.from_bytes(ufs['reg'][:8],'big');UFS_HC_SIZE=int.from_bytes(ufs['reg'][8:16],'big')
-    GCC_UFS_PAGE=value(ufs,'pong,gcc-ufs-page');UFS_STREAM_ID=value(ufs,'pong,smmu-stream-id')
-    UFS_SPI=value(ufs,'pong,ufs-spi')
+    memory=next((p for p in nodes.values() if p.get('device_type')==b'memory\0'), None)
+    if memory and 'reg' in memory:
+        DRAM_BASE=int.from_bytes(memory['reg'][:8],'big')
+    ufs=next((p for p in nodes.values() if b'qcom,sm8475-ufshc\0' in p.get('compatible',b'')), None)
+    if ufs is not None:
+        if 'reg' in ufs and len(ufs['reg'])>=16:
+            UFS_HC=int.from_bytes(ufs['reg'][:8],'big');UFS_HC_SIZE=int.from_bytes(ufs['reg'][8:16],'big')
+        if 'pong,gcc-ufs-page' in ufs:
+            GCC_UFS_PAGE=value(ufs,'pong,gcc-ufs-page')
+        if 'pong,smmu-stream-id' in ufs:
+            UFS_STREAM_ID=value(ufs,'pong,smmu-stream-id')
+        if 'pong,ufs-spi' in ufs:
+            UFS_SPI=value(ufs,'pong,ufs-spi')
 
 
 def node(name, properties=(), children=()):

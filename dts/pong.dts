@@ -22,5 +22,10 @@
     reg = <0 0x17a00000 0 0x10000>, <0 0x17a60000 0 0x100000>;
     redistributor-stride = /bits/ 64 <0x20000>;
 };
-&ufs { status = "disabled"; };
+&ufs {
+    status = "disabled";
+    pong,gcc-ufs-page = <0x00187000>;
+    pong,smmu-stream-id = <0xE0>;
+    pong,ufs-spi = <265>;
+};
 &pcie0 { status = "disabled"; };
