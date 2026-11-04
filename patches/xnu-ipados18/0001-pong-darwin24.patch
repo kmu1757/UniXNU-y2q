@@ -10910,19 +10910,23 @@ new file mode 100644
 index 0000000..d3ff8ea
 --- /dev/null
 +++ b/osfmk/arm64/pong_ramoops_console.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,205 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
-+/* Minimal persistent console mirror for Pong. It does not touch VBAR, TTBR,
++/* Minimal persistent console mirror for SM8250 / Pong. It does not touch VBAR, TTBR,
 + * the framebuffer, scheduler state, IOKit, or storage. */
 +#include <arm/caches_internal.h>
 +#include <machine/machine_routines.h>
++#include <pexpert/device_tree.h>
 +
-+#define PONG_RAMOOPS_PHYS_BASE 0x85200000ULL
-+#define PONG_RAMOOPS_CONSOLE_BYTES 0x00200000U
-+#define PONG_RAMOOPS_RESERVED_BYTES 0x00400000U
-+#define PONG_RAMOOPS_HEADER_BYTES 12U
-+#define PONG_RAMOOPS_MAGIC 0x43474244U
-+#define PONG_RAMOOPS_DATA_BYTES (PONG_RAMOOPS_CONSOLE_BYTES - PONG_RAMOOPS_HEADER_BYTES)
++#define PONG_RAMOOPS_PHYS_BASE          0x9FA00000ULL
++#define PONG_RAMOOPS_RESERVED_BYTES     0x00100000U
++#define PONG_RAMOOPS_CONSOLE_OFFSET     0x00040000U
++#define PONG_RAMOOPS_CONSOLE_BYTES      0x00040000U
++#define PONG_RAMOOPS_DIAG_OFFSET        0x000C0000U
++#define PONG_RAMOOPS_DIAG_BYTES         0x00040000U
++
++#define PONG_RAMOOPS_HEADER_BYTES       12U
++#define PONG_RAMOOPS_MAGIC              0x43474244U
 +
 +struct pong_ramoops_header {
 +	volatile uint32_t sig;
@@ -10931,31 +10935,32 @@ index 0000000..d3ff8ea
 +};
 +
 +static vm_offset_t pong_ramoops_base;
++static uint32_t pong_ramoops_capacity;
 +static uint32_t pong_ramoops_start;
 +static uint32_t pong_ramoops_size;
 +static volatile uint32_t pong_ramoops_busy;
++
++static vm_offset_t pong_diagnostic_base;
++static uint32_t pong_diagnostic_capacity;
 +static volatile uint32_t pong_diagnostic_busy;
 +static uint32_t pong_diagnostic_size;
 +
-+/* The second 2 MiB is Pong DT's pmsg zone. Keep a separate bounded record
-+ * there so launchd's console traffic cannot evict application failure data.
-+ * Linux exposes the previous raw bytes as pmsg-ramoops-0 on the next boot.
-+ * This is a persistent_ram buffer, not an Android logcat record stream.
-+ * No storage, allocation, registry access or MMIO outside the DT reserve.
++/* Keep a bounded record in the pmsg zone so console traffic does not evict early diagnostic data.
++ * Linux pstore exposes this as pmsg-ramoops-0.
 + */
 +void pong_ramoops_diagnostic_write(const char *, int);
 +void
 +pong_ramoops_diagnostic_write(const char *text, int length)
 +{
-+	if (!text || length <= 0 || length > 2048 || !pong_ramoops_base ||
++	if (!text || length <= 0 || length > 2048 || !pong_diagnostic_base ||
 +	    __atomic_exchange_n(&pong_diagnostic_busy, 1, __ATOMIC_ACQUIRE)) return;
-+	vm_offset_t base = pong_ramoops_base + PONG_RAMOOPS_CONSOLE_BYTES;
++	vm_offset_t base = pong_diagnostic_base;
 +	struct pong_ramoops_header *header = (struct pong_ramoops_header *)(uintptr_t)base;
 +	volatile uint8_t *data = (volatile uint8_t *)(uintptr_t)(base + PONG_RAMOOPS_HEADER_BYTES);
-+	/* Append until full; preserve the first failures rather than overwrite them. */
++	uint32_t cap = pong_diagnostic_capacity ? pong_diagnostic_capacity : (PONG_RAMOOPS_DIAG_BYTES - PONG_RAMOOPS_HEADER_BYTES);
 +	uint32_t count = (uint32_t)length;
-+	if (count > PONG_RAMOOPS_DATA_BYTES - pong_diagnostic_size)
-+		count = PONG_RAMOOPS_DATA_BYTES - pong_diagnostic_size;
++	if (count > cap - pong_diagnostic_size)
++		count = cap - pong_diagnostic_size;
 +	if (count) {
 +		for (uint32_t i = 0; i < count; i++) data[pong_diagnostic_size + i] = (uint8_t)text[i];
 +		CleanPoC_DcacheRegion_Force(base + PONG_RAMOOPS_HEADER_BYTES + pong_diagnostic_size, count);
@@ -10979,7 +10984,7 @@ index 0000000..d3ff8ea
 +		return;
 +	}
 +
-+	const uint32_t capacity = PONG_RAMOOPS_DATA_BYTES;
++	const uint32_t capacity = pong_ramoops_capacity ? pong_ramoops_capacity : (PONG_RAMOOPS_CONSOLE_BYTES - PONG_RAMOOPS_HEADER_BYTES);
 +	uint32_t old_size = pong_ramoops_size;
 +	uint32_t write_at = old_size < capacity ?
 +	    (pong_ramoops_start + old_size) % capacity : pong_ramoops_start;
@@ -11035,28 +11040,79 @@ index 0000000..d3ff8ea
 +	if (pong_ramoops_base) {
 +		return 1;
 +	}
-+	vm_offset_t mapped = ml_io_map_wcomb(PONG_RAMOOPS_PHYS_BASE,
-+	    PONG_RAMOOPS_RESERVED_BYTES);
++
++	uint64_t phys_base = PONG_RAMOOPS_PHYS_BASE;
++	uint32_t reserved_bytes = PONG_RAMOOPS_RESERVED_BYTES;
++	uint32_t console_offset = PONG_RAMOOPS_CONSOLE_OFFSET;
++	uint32_t console_bytes = PONG_RAMOOPS_CONSOLE_BYTES;
++	uint32_t diag_offset = PONG_RAMOOPS_DIAG_OFFSET;
++	uint32_t diag_bytes = PONG_RAMOOPS_DIAG_BYTES;
++
++	DTEntry chosen;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess) {
++		void const *prop = NULL;
++		unsigned int plen = 0;
++		if (SecureDTGetProperty(chosen, "pong,ramoops-phys", &prop, &plen) == kSuccess &&
++		    prop && plen == 16) {
++			const uint64_t *val = (const uint64_t *)prop;
++			if (val[0] && val[1]) {
++				phys_base = val[0];
++				reserved_bytes = (uint32_t)val[1];
++			}
++		}
++		if (SecureDTGetProperty(chosen, "pong,ramoops-layout", &prop, &plen) == kSuccess &&
++		    prop && plen == 16) {
++			const uint32_t *l = (const uint32_t *)prop;
++			console_offset = l[0];
++			console_bytes = l[1];
++			diag_offset = l[2];
++			diag_bytes = l[3];
++		}
++	}
++
++	vm_offset_t mapped = ml_io_map_wcomb(phys_base, reserved_bytes);
 +	if (!mapped) {
 +		return 0;
 +	}
 +
-+	struct pong_ramoops_header *header =
-+	    (struct pong_ramoops_header *)(uintptr_t)mapped;
-+	header->sig = 0;
-+	header->start = 0;
-+	header->size = 0;
++	pong_ramoops_base = mapped + console_offset;
++	pong_ramoops_capacity = console_bytes > PONG_RAMOOPS_HEADER_BYTES ?
++	    (console_bytes - PONG_RAMOOPS_HEADER_BYTES) : 0;
++
++	struct pong_ramoops_header *c_header =
++	    (struct pong_ramoops_header *)(uintptr_t)pong_ramoops_base;
++	c_header->sig = 0;
++	c_header->start = 0;
++	c_header->size = 0;
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	CleanPoC_DcacheRegion_Force(mapped, PONG_RAMOOPS_HEADER_BYTES);
-+	header->sig = PONG_RAMOOPS_MAGIC;
++	CleanPoC_DcacheRegion_Force(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
++	c_header->sig = PONG_RAMOOPS_MAGIC;
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	CleanPoC_DcacheRegion_Force(mapped, PONG_RAMOOPS_HEADER_BYTES);
++	CleanPoC_DcacheRegion_Force(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +
 +	pong_ramoops_start = 0;
 +	pong_ramoops_size = 0;
-+	pong_ramoops_base = mapped;
-+	static const char ready[] = "PONG DIAGNOSTIC v92: isolated pmsg recorder ready\n";
++
++	if (diag_bytes > PONG_RAMOOPS_HEADER_BYTES && diag_offset + diag_bytes <= reserved_bytes) {
++		pong_diagnostic_base = mapped + diag_offset;
++		pong_diagnostic_capacity = diag_bytes - PONG_RAMOOPS_HEADER_BYTES;
++		struct pong_ramoops_header *d_header =
++		    (struct pong_ramoops_header *)(uintptr_t)pong_diagnostic_base;
++		d_header->sig = 0;
++		d_header->start = 0;
++		d_header->size = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		CleanPoC_DcacheRegion_Force(pong_diagnostic_base, PONG_RAMOOPS_HEADER_BYTES);
++		d_header->sig = PONG_RAMOOPS_MAGIC;
++		__asm__ volatile("dsb sy" ::: "memory");
++		CleanPoC_DcacheRegion_Force(pong_diagnostic_base, PONG_RAMOOPS_HEADER_BYTES);
++		__asm__ volatile("dsb sy" ::: "memory");
++		pong_diagnostic_size = 0;
++	}
++
++	static const char ready[] = "XNU T970 RAMOOPS CONSOLE READY (0x9FA40000, 256K)\n";
++	pong_ramoops_console_write(ready, (int)sizeof(ready)-1);
 +	pong_ramoops_diagnostic_write(ready, (int)sizeof(ready)-1);
 +	return 1;
 +}

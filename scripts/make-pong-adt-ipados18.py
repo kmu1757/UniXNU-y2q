@@ -226,6 +226,9 @@ def main():
         *([('system-volume-auth-blob', system_volume_auth_blob)]
           if system_volume_auth_blob is not None else []),
         *empty_nvram_proxy(),
+        ('pong,ramoops-phys', struct.pack('<QQ', 0x9FA00000, 0x100000)),
+        ('pong,ramoops-layout', struct.pack('<4I', 0x40000, 0x40000, 0xC0000, 0x40000)),
+        ('embedded-panic-log-size', struct.pack('<I', 0x40000)),
     ]
     chosen.append(('psci-method', b'smc\0'))
     cpus = [node(f'cpu{i}', [
@@ -261,8 +264,8 @@ def main():
     # Actual Pong live DT: QUP0 SE4 / Goodix Berlin-D, GPIO20 reset/21 IRQ.
     # Absolute metadata avoids an incomplete arm-io interrupt/reg mapping.
     touch = node('pong-touch', [
-        ('compatible', b'pong,goodix-berlin-d\0'),
-        ('spi-base', struct.pack('<Q', 0x990000)),
+        ('compatible', b'stm,fts_touch\0'),
+        ('spi-base', struct.pack('<Q', 0x994000)),
         ('tlmm-base', struct.pack('<Q', 0xF000000)),
         ('gcc-base', struct.pack('<Q', 0x100000)),
         ('rsc-base', struct.pack('<Q', 0x17A20000)),
@@ -295,7 +298,7 @@ def main():
             ('#size-cells', struct.pack('<I', 2)),
             ('ranges', struct.pack('<QQQ', 0, APSS_BASE, APSS_SIZE)),
         ], [gic, touch, node('pong-buttons', [
-            ('compatible', b'pong,pm8350-keys\0'),
+            ('compatible', b'qcom,pm8150-keys\0'),
             ('core-base', struct.pack('<Q', 0x0c400000)),
             ('cnfg-base', struct.pack('<Q', 0x0c42d000)),
             ('observer-base', struct.pack('<Q', 0x0c440000)),
@@ -303,6 +306,16 @@ def main():
             ('pon-ppid', struct.pack('<I', 0x013)),
             ('volume-up-ppid', struct.pack('<I', 0x18d)),
         ]), *([ufs] if args.ufs_probe else [])]),
+        node('panic-region', [
+            ('reg', struct.pack('<2Q', 0x9FA00000, 0x40000)),
+        ]),
+        node('ramoops', [
+            ('reg', struct.pack('<2Q', 0x9FA00000, 0x100000)),
+            ('console-offset', struct.pack('<I', 0x40000)),
+            ('console-size', struct.pack('<I', 0x40000)),
+            ('pmsg-offset', struct.pack('<I', 0xC0000)),
+            ('pmsg-size', struct.pack('<I', 0x40000)),
+        ]),
         node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
         node('options'),
         # Missing HomeButtonType defaults to a Home-button iPad in Gestalt.
