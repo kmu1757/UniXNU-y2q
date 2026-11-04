@@ -308,6 +308,9 @@ def main():
             ('pon-ppid', struct.pack('<I', 0x013)),
             ('volume-up-ppid', struct.pack('<I', 0x18d)),
         ]), *([ufs] if args.ufs_probe else [])]),
+        node('pram', [
+            ('reg', struct.pack('<2Q', 0x9FA00000, 0x40000)),
+        ]),
         node('panic-region', [
             ('reg', struct.pack('<2Q', 0x9FA00000, 0x40000)),
         ]),

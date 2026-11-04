@@ -9943,6 +9943,651 @@ index c4684c2..ff8590f 100644
  
  libkern/stack_protector.c       standard
  libkern/ptrauth_utils.c         standard
+diff --git a/libkern/crypto/corecrypto_aes.c b/libkern/crypto/corecrypto_aes.c
+index 20ff4f1..d041b1c 100644
+--- a/libkern/crypto/corecrypto_aes.c
++++ b/libkern/crypto/corecrypto_aes.c
+@@ -35,6 +35,7 @@
+ aes_rval
+ aes_encrypt_key(const unsigned char *key, int key_len, aes_encrypt_ctx cx[1])
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+@@ -49,6 +50,7 @@ aes_rval
+ aes_encrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
+     unsigned char *out_blk, aes_encrypt_ctx cx[1])
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
+ 	cccbc_iv_decl(cbc->block_size, ctx_iv);
+ 
+@@ -72,6 +74,7 @@ aes_encrypt(const unsigned char *in_blk, unsigned char *out_blk, aes_encrypt_ctx
+ aes_rval
+ aes_decrypt_key(const unsigned char *key, int key_len, aes_decrypt_ctx cx[1])
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+@@ -86,6 +89,7 @@ aes_rval
+ aes_decrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
+     unsigned char *out_blk, aes_decrypt_ctx cx[1])
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
+ 	cccbc_iv_decl(cbc->block_size, ctx_iv);
+ 
+@@ -134,6 +138,7 @@ aes_decrypt_key256(const unsigned char *key, aes_decrypt_ctx cx[1])
+ aes_rval
+ aes_encrypt_key_gcm(const unsigned char *key, int key_len, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -145,6 +150,7 @@ aes_encrypt_key_gcm(const unsigned char *key, int key_len, ccgcm_ctx *ctx)
+ aes_rval
+ aes_encrypt_key_with_iv_gcm(const unsigned char *key, int key_len, const unsigned char *in_iv, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -156,6 +162,7 @@ aes_encrypt_key_with_iv_gcm(const unsigned char *key, int key_len, const unsigne
+ aes_rval
+ aes_encrypt_set_iv_gcm(const unsigned char *in_iv, unsigned int len, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -167,6 +174,7 @@ aes_encrypt_set_iv_gcm(const unsigned char *in_iv, unsigned int len, ccgcm_ctx *
+ aes_rval
+ aes_encrypt_reset_gcm(ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -178,6 +186,7 @@ aes_encrypt_reset_gcm(ccgcm_ctx *ctx)
+ aes_rval
+ aes_encrypt_inc_iv_gcm(unsigned char *out_iv, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -189,6 +198,7 @@ aes_encrypt_inc_iv_gcm(unsigned char *out_iv, ccgcm_ctx *ctx)
+ aes_rval
+ aes_encrypt_aad_gcm(const unsigned char *aad, unsigned int aad_bytes, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -201,6 +211,7 @@ aes_rval
+ aes_encrypt_gcm(const unsigned char *in_blk, unsigned int num_bytes,
+     unsigned char *out_blk, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -212,6 +223,7 @@ aes_encrypt_gcm(const unsigned char *in_blk, unsigned int num_bytes,
+ aes_rval
+ aes_encrypt_finalize_gcm(unsigned char *tag, size_t tag_bytes, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -228,6 +240,7 @@ aes_encrypt_finalize_gcm(unsigned char *tag, size_t tag_bytes, ccgcm_ctx *ctx)
+ aes_rval
+ aes_decrypt_key_gcm(const unsigned char *key, int key_len, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -239,6 +252,7 @@ aes_decrypt_key_gcm(const unsigned char *key, int key_len, ccgcm_ctx *ctx)
+ aes_rval
+ aes_decrypt_key_with_iv_gcm(const unsigned char *key, int key_len, const unsigned char *in_iv, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -250,6 +264,7 @@ aes_decrypt_key_with_iv_gcm(const unsigned char *key, int key_len, const unsigne
+ aes_rval
+ aes_decrypt_set_iv_gcm(const unsigned char *in_iv, size_t len, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -266,6 +281,7 @@ aes_decrypt_set_iv_gcm(const unsigned char *in_iv, size_t len, ccgcm_ctx *ctx)
+ aes_rval
+ aes_decrypt_reset_gcm(ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -277,6 +293,7 @@ aes_decrypt_reset_gcm(ccgcm_ctx *ctx)
+ aes_rval
+ aes_decrypt_inc_iv_gcm(unsigned char *out_iv, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -288,6 +305,7 @@ aes_decrypt_inc_iv_gcm(unsigned char *out_iv, ccgcm_ctx *ctx)
+ aes_rval
+ aes_decrypt_aad_gcm(const unsigned char *aad, unsigned int aad_bytes, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -300,6 +318,7 @@ aes_rval
+ aes_decrypt_gcm(const unsigned char *in_blk, unsigned int num_bytes,
+     unsigned char *out_blk, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -311,6 +330,7 @@ aes_decrypt_gcm(const unsigned char *in_blk, unsigned int num_bytes,
+ aes_rval
+ aes_decrypt_finalize_gcm(unsigned char *tag, size_t tag_bytes, ccgcm_ctx *ctx)
+ {
++	if (!g_crypto_funcs) return aes_error;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return aes_error;
+@@ -327,6 +347,7 @@ aes_decrypt_finalize_gcm(unsigned char *tag, size_t tag_bytes, ccgcm_ctx *ctx)
+ size_t
+ aes_encrypt_get_ctx_size_gcm(void)
+ {
++	if (!g_crypto_funcs) return 0;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_encrypt;
+ 	if (!gcm) {
+ 		return 0;
+@@ -337,6 +358,7 @@ aes_encrypt_get_ctx_size_gcm(void)
+ size_t
+ aes_decrypt_get_ctx_size_gcm(void)
+ {
++	if (!g_crypto_funcs) return 0;
+ 	const struct ccmode_gcm *gcm = g_crypto_funcs->ccaes_gcm_decrypt;
+ 	if (!gcm) {
+ 		return 0;
+diff --git a/libkern/crypto/corecrypto_aesxts.c b/libkern/crypto/corecrypto_aesxts.c
+index 1b42736..66db5c3 100644
+--- a/libkern/crypto/corecrypto_aesxts.c
++++ b/libkern/crypto/corecrypto_aesxts.c
+@@ -49,7 +49,7 @@ xts_start(uint32_t cipher __unused, // ignored - we're doing this for xts-aes on
+ 	const struct ccmode_xts *enc, *dec;
+ 
+ 	if (!g_crypto_funcs) {
+-		panic("%s: corecrypto not registered!", __FUNCTION__);
++		return -1;
+ 	}
+ 
+ 	enc = g_crypto_funcs->ccaes_xts_encrypt;
+@@ -76,6 +76,7 @@ xts_encrypt(const uint8_t *pt, unsigned long ptlen,
+     const uint8_t *iv,                     // this can be considered the sector IV for this use
+     symmetric_xts *xts)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	const struct ccmode_xts *xtsenc = g_crypto_funcs->ccaes_xts_encrypt;
+ 	ccxts_tweak_decl(xtsenc->tweak_size, tweak);
+ 
+@@ -98,6 +99,7 @@ xts_decrypt(const uint8_t *ct, unsigned long ptlen,
+     const uint8_t *iv,                             // this can be considered the sector IV for this use
+     symmetric_xts *xts)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	const struct ccmode_xts *xtsdec = g_crypto_funcs->ccaes_xts_decrypt;
+ 	ccxts_tweak_decl(xtsdec->tweak_size, tweak);
+ 
+diff --git a/libkern/crypto/corecrypto_chacha20poly1305.c b/libkern/crypto/corecrypto_chacha20poly1305.c
+index 1c134fa..dc32adc 100644
+--- a/libkern/crypto/corecrypto_chacha20poly1305.c
++++ b/libkern/crypto/corecrypto_chacha20poly1305.c
+@@ -45,53 +45,80 @@ info(void)
+ int
+ chacha20poly1305_init(chacha20poly1305_ctx *ctx, const uint8_t *key)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->init(info(), ctx, key);
+ }
+ 
+ int
+ chacha20poly1305_reset(chacha20poly1305_ctx *ctx)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->reset(info(), ctx);
+ }
+ 
+ int
+ chacha20poly1305_setnonce(chacha20poly1305_ctx *ctx, const uint8_t *nonce)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->setnonce(info(), ctx, nonce);
+ }
+ 
+ int
+ chacha20poly1305_incnonce(chacha20poly1305_ctx *ctx, uint8_t *nonce)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->incnonce(info(), ctx, nonce);
+ }
+ 
+ int
+ chacha20poly1305_aad(chacha20poly1305_ctx *ctx, size_t nbytes, const void *aad)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->aad(info(), ctx, nbytes, aad);
+ }
+ 
+ int
+ chacha20poly1305_encrypt(chacha20poly1305_ctx *ctx, size_t nbytes, const void *ptext, void *ctext)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->encrypt(info(), ctx, nbytes, ptext, ctext);
+ }
+ 
+ int
+ chacha20poly1305_finalize(chacha20poly1305_ctx *ctx, uint8_t *tag)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->finalize(info(), ctx, tag);
+ }
+ 
+ int
+ chacha20poly1305_decrypt(chacha20poly1305_ctx *ctx, size_t nbytes, const void *ctext, void *ptext)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->decrypt(info(), ctx, nbytes, ctext, ptext);
+ }
+ 
+ int
+ chacha20poly1305_verify(chacha20poly1305_ctx *ctx, const uint8_t *tag)
+ {
++	if (!g_crypto_funcs || !g_crypto_funcs->ccchacha20poly1305_fns) {
++		return -1;
++	}
+ 	return fns()->verify(info(), ctx, tag);
+ }
+diff --git a/libkern/crypto/corecrypto_des.c b/libkern/crypto/corecrypto_des.c
+index b77967c..8227635 100644
+--- a/libkern/crypto/corecrypto_des.c
++++ b/libkern/crypto/corecrypto_des.c
+@@ -37,6 +37,7 @@
+ int
+ des_ecb_key_sched(des_cblock *key, des_ecb_key_schedule *ks)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	const struct ccmode_ecb *enc = g_crypto_funcs->ccdes_ecb_encrypt;
+ 	const struct ccmode_ecb *dec = g_crypto_funcs->ccdes_ecb_decrypt;
+ 
+@@ -57,6 +58,7 @@ des_ecb_key_sched(des_cblock *key, des_ecb_key_schedule *ks)
+ int
+ des_ecb_encrypt(des_cblock *in, des_cblock *out, des_ecb_key_schedule *ks, int enc)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	const struct ccmode_ecb *ecb = enc ? g_crypto_funcs->ccdes_ecb_encrypt : g_crypto_funcs->ccdes_ecb_decrypt;
+ 	ccecb_ctx *ctx = enc ? ks->enc : ks->dec;
+ 
+@@ -68,6 +70,7 @@ des_ecb_encrypt(des_cblock *in, des_cblock *out, des_ecb_key_schedule *ks, int e
+ int
+ des3_ecb_key_sched(des_cblock *key, des3_ecb_key_schedule *ks)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	const struct ccmode_ecb *enc = g_crypto_funcs->cctdes_ecb_encrypt;
+ 	const struct ccmode_ecb *dec = g_crypto_funcs->cctdes_ecb_decrypt;
+ 
+@@ -88,6 +91,7 @@ des3_ecb_key_sched(des_cblock *key, des3_ecb_key_schedule *ks)
+ int
+ des3_ecb_encrypt(des_cblock *in, des_cblock *out, des3_ecb_key_schedule *ks, int enc)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	const struct ccmode_ecb *ecb = enc ? g_crypto_funcs->cctdes_ecb_encrypt : g_crypto_funcs->cctdes_ecb_decrypt;
+ 	ccecb_ctx *ctx = enc ? ks->enc : ks->dec;
+ 
+@@ -99,5 +103,6 @@ des3_ecb_encrypt(des_cblock *in, des_cblock *out, des3_ecb_key_schedule *ks, int
+ int
+ des_is_weak_key(des_cblock *key)
+ {
++	if (!g_crypto_funcs) return 0;
+ 	return g_crypto_funcs->ccdes_key_is_weak_fn(key, CCDES_KEY_SIZE);
+ }
+diff --git a/libkern/crypto/corecrypto_md5.c b/libkern/crypto/corecrypto_md5.c
+index 242dcdb..64c0c22 100644
+--- a/libkern/crypto/corecrypto_md5.c
++++ b/libkern/crypto/corecrypto_md5.c
+@@ -2,6 +2,182 @@
+ #include <libkern/crypto/md5.h>
+ #include <kern/debug.h>
+ #include <corecrypto/ccdigest.h>
++#include <string.h>
++
++#define MD5_F(x, y, z) (((x) & (y)) | ((~x) & (z)))
++#define MD5_G(x, y, z) (((x) & (z)) | ((y) & (~z)))
++#define MD5_H(x, y, z) ((x) ^ (y) ^ (z))
++#define MD5_I(x, y, z) ((y) ^ ((x) | (~z)))
++
++#define MD5_STEP(f, a, b, c, d, x, t, s) \
++	(a) += f((b), (c), (d)) + (x) + (t); \
++	(a) = (((a) << (s)) | ((a) >> (32 - (s)))) + (b)
++
++static void
++md5_sw_transform(uint32_t state[4], const uint8_t block[64])
++{
++	uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
++	uint32_t x[16];
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		x[i] = ((uint32_t)block[i * 4]) |
++		       ((uint32_t)block[i * 4 + 1] << 8) |
++		       ((uint32_t)block[i * 4 + 2] << 16) |
++		       ((uint32_t)block[i * 4 + 3] << 24);
++	}
++
++	/* Round 1 */
++	MD5_STEP(MD5_F, a, b, c, d, x[0],  0xd76aa478, 7);
++	MD5_STEP(MD5_F, d, a, b, c, x[1],  0xe8c7b756, 12);
++	MD5_STEP(MD5_F, c, d, a, b, x[2],  0x242070db, 17);
++	MD5_STEP(MD5_F, b, c, d, a, x[3],  0xc1bdceee, 22);
++	MD5_STEP(MD5_F, a, b, c, d, x[4],  0xf57c0faf, 7);
++	MD5_STEP(MD5_F, d, a, b, c, x[5],  0x4787c62a, 12);
++	MD5_STEP(MD5_F, c, d, a, b, x[6],  0xa8304613, 17);
++	MD5_STEP(MD5_F, b, c, d, a, x[7],  0xfd469501, 22);
++	MD5_STEP(MD5_F, a, b, c, d, x[8],  0x698098d8, 7);
++	MD5_STEP(MD5_F, d, a, b, c, x[9],  0x8b44f7af, 12);
++	MD5_STEP(MD5_F, c, d, a, b, x[10], 0xffff5bb1, 17);
++	MD5_STEP(MD5_F, b, c, d, a, x[11], 0x895cd7be, 22);
++	MD5_STEP(MD5_F, a, b, c, d, x[12], 0x6b901122, 7);
++	MD5_STEP(MD5_F, d, a, b, c, x[13], 0xfd987193, 12);
++	MD5_STEP(MD5_F, c, d, a, b, x[14], 0xa679438e, 17);
++	MD5_STEP(MD5_F, b, c, d, a, x[15], 0x49b40821, 22);
++
++	/* Round 2 */
++	MD5_STEP(MD5_G, a, b, c, d, x[1],  0xf61e2562, 5);
++	MD5_STEP(MD5_G, d, a, b, c, x[6],  0xc040b340, 9);
++	MD5_STEP(MD5_G, c, d, a, b, x[11], 0x265e5a51, 14);
++	MD5_STEP(MD5_G, b, c, d, a, x[0],  0xe9b6c7aa, 20);
++	MD5_STEP(MD5_G, a, b, c, d, x[5],  0xd62f105d, 5);
++	MD5_STEP(MD5_G, d, a, b, c, x[10], 0x02441453, 9);
++	MD5_STEP(MD5_G, c, d, a, b, x[15], 0xd8a1e681, 14);
++	MD5_STEP(MD5_G, b, c, d, a, x[4],  0xe7d3fbc8, 20);
++	MD5_STEP(MD5_G, a, b, c, d, x[9],  0x21e1cde6, 5);
++	MD5_STEP(MD5_G, d, a, b, c, x[14], 0xc33707d6, 9);
++	MD5_STEP(MD5_G, c, d, a, b, x[3],  0xf4d50d87, 14);
++	MD5_STEP(MD5_G, b, c, d, a, x[8],  0x455a14ed, 20);
++	MD5_STEP(MD5_G, a, b, c, d, x[13], 0xa9e3e905, 5);
++	MD5_STEP(MD5_G, d, a, b, c, x[2],  0xfcefa3f8, 9);
++	MD5_STEP(MD5_G, c, d, a, b, x[7],  0x676f02d9, 14);
++	MD5_STEP(MD5_G, b, c, d, a, x[12], 0x8d2a4c8a, 20);
++
++	/* Round 3 */
++	MD5_STEP(MD5_H, a, b, c, d, x[5],  0xfffa3942, 4);
++	MD5_STEP(MD5_H, d, a, b, c, x[8],  0x8771f681, 11);
++	MD5_STEP(MD5_H, c, d, a, b, x[11], 0x6d9d6122, 16);
++	MD5_STEP(MD5_H, b, c, d, a, x[14], 0xfde5380c, 23);
++	MD5_STEP(MD5_H, a, b, c, d, x[1],  0xa4beea44, 4);
++	MD5_STEP(MD5_H, d, a, b, c, x[4],  0x4bdecfa9, 11);
++	MD5_STEP(MD5_H, c, d, a, b, x[7],  0xf6bb4b60, 16);
++	MD5_STEP(MD5_H, b, c, d, a, x[10], 0xbebfbc70, 23);
++	MD5_STEP(MD5_H, a, b, c, d, x[13], 0x289b7ec6, 4);
++	MD5_STEP(MD5_H, d, a, b, c, x[0],  0xeaa127fa, 11);
++	MD5_STEP(MD5_H, c, d, a, b, x[3],  0xd4ef3085, 16);
++	MD5_STEP(MD5_H, b, c, d, a, x[6],  0x04881d05, 23);
++	MD5_STEP(MD5_H, a, b, c, d, x[9],  0xd9d4d039, 4);
++	MD5_STEP(MD5_H, d, a, b, c, x[12], 0xe6db99e5, 11);
++	MD5_STEP(MD5_H, c, d, a, b, x[15], 0x1fa27cf8, 16);
++	MD5_STEP(MD5_H, b, c, d, a, x[2],  0xc4ac5665, 23);
++
++	/* Round 4 */
++	MD5_STEP(MD5_I, a, b, c, d, x[0],  0xf4292244, 6);
++	MD5_STEP(MD5_I, d, a, b, c, x[7],  0x432aff97, 10);
++	MD5_STEP(MD5_I, c, d, a, b, x[14], 0xab9423a7, 15);
++	MD5_STEP(MD5_I, b, c, d, a, x[5],  0xfc93a039, 21);
++	MD5_STEP(MD5_I, a, b, c, d, x[12], 0x655b59c3, 6);
++	MD5_STEP(MD5_I, d, a, b, c, x[3],  0x8f0ccc92, 10);
++	MD5_STEP(MD5_I, c, d, a, b, x[10], 0xffeff47d, 15);
++	MD5_STEP(MD5_I, b, c, d, a, x[1],  0x85845dd1, 21);
++	MD5_STEP(MD5_I, a, b, c, d, x[8],  0x6fa87e4f, 6);
++	MD5_STEP(MD5_I, d, a, b, c, x[15], 0xfe2ce6e0, 10);
++	MD5_STEP(MD5_I, c, d, a, b, x[6],  0xa3014314, 15);
++	MD5_STEP(MD5_I, b, c, d, a, x[13], 0x4e0811a1, 21);
++	MD5_STEP(MD5_I, a, b, c, d, x[4],  0xf7537e82, 6);
++	MD5_STEP(MD5_I, d, a, b, c, x[11], 0xbd3af235, 10);
++	MD5_STEP(MD5_I, c, d, a, b, x[2],  0x2ad7d2bb, 15);
++	MD5_STEP(MD5_I, b, c, d, a, x[9],  0xeb86d391, 21);
++
++	state[0] += a;
++	state[1] += b;
++	state[2] += c;
++	state[3] += d;
++}
++
++static void
++md5_sw_init(MD5_CTX *ctx)
++{
++	ctx->state[0] = 0x67452301;
++	ctx->state[1] = 0xefcdab89;
++	ctx->state[2] = 0x98badcfe;
++	ctx->state[3] = 0x10325476;
++	ctx->count[0] = 0;
++	ctx->count[1] = 0;
++	memset(ctx->buffer, 0, sizeof(ctx->buffer));
++}
++
++static void
++md5_sw_update(MD5_CTX *ctx, const void *data, size_t len)
++{
++	const uint8_t *p = (const uint8_t *)data;
++	size_t current = (size_t)((ctx->count[0] >> 3) & 0x3f);
++	uint32_t len_bits = (uint32_t)(len << 3);
++
++	ctx->count[0] += len_bits;
++	if (ctx->count[0] < len_bits) {
++		ctx->count[1]++;
++	}
++	ctx->count[1] += (uint32_t)(len >> 29);
++
++	while (len > 0) {
++		size_t take = 64 - current;
++		if (take > len) {
++			take = len;
++		}
++		memcpy(&ctx->buffer[current], p, take);
++		current += take;
++		p += take;
++		len -= take;
++
++		if (current == 64) {
++			md5_sw_transform(ctx->state, ctx->buffer);
++			current = 0;
++		}
++	}
++}
++
++static void
++md5_sw_final(void *digest, MD5_CTX *ctx)
++{
++	uint8_t count_bytes[8];
++	size_t current = (size_t)((ctx->count[0] >> 3) & 0x3f);
++	uint8_t *out = (uint8_t *)digest;
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		count_bytes[i]     = (uint8_t)((ctx->count[0] >> (i * 8)) & 0xff);
++		count_bytes[4 + i] = (uint8_t)((ctx->count[1] >> (i * 8)) & 0xff);
++	}
++
++	ctx->buffer[current++] = 0x80;
++	if (current > 56) {
++		memset(&ctx->buffer[current], 0, 64 - current);
++		md5_sw_transform(ctx->state, ctx->buffer);
++		current = 0;
++	}
++	memset(&ctx->buffer[current], 0, 56 - current);
++	memcpy(&ctx->buffer[56], count_bytes, 8);
++	md5_sw_transform(ctx->state, ctx->buffer);
++
++	for (i = 0; i < 4; i++) {
++		out[i * 4]     = (uint8_t)(ctx->state[i] & 0xff);
++		out[i * 4 + 1] = (uint8_t)((ctx->state[i] >> 8) & 0xff);
++		out[i * 4 + 2] = (uint8_t)((ctx->state[i] >> 16) & 0xff);
++		out[i * 4 + 3] = (uint8_t)((ctx->state[i] >> 24) & 0xff);
++	}
++}
++
+ 
+ static uint64_t
+ getCount(MD5_CTX *ctx)
+@@ -40,6 +216,10 @@ MD5ToDi(const struct ccdigest_info *di, MD5_CTX *md5_ctx, struct ccdigest_ctx *d
+ void
+ MD5Init(MD5_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		md5_sw_init(ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di = g_crypto_funcs->ccmd5_di;
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+@@ -51,6 +231,10 @@ MD5Init(MD5_CTX *ctx)
+ void
+ MD5Update(MD5_CTX *ctx, const void *data, unsigned int len)
+ {
++	if (!g_crypto_funcs) {
++		md5_sw_update(ctx, data, len);
++		return;
++	}
+ 	const struct ccdigest_info *di = g_crypto_funcs->ccmd5_di;
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+@@ -62,6 +246,10 @@ MD5Update(MD5_CTX *ctx, const void *data, unsigned int len)
+ void
+ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		md5_sw_final(digest, ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di = g_crypto_funcs->ccmd5_di;
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+diff --git a/libkern/crypto/corecrypto_rand.c b/libkern/crypto/corecrypto_rand.c
+index d46815b..3a082dd 100644
+--- a/libkern/crypto/corecrypto_rand.c
++++ b/libkern/crypto/corecrypto_rand.c
+@@ -29,6 +29,7 @@
+ #include <libkern/crypto/crypto_internal.h>
+ #include <corecrypto/ccrng.h>
+ #include <libkern/crypto/rand.h>
++#include <prng/random.h>
+ 
+ int
+ cc_rand_generate(void *out, size_t outlen)
+@@ -41,6 +42,9 @@ cc_rand_generate(void *out, size_t outlen)
+ 		if (rng_state != NULL) {
+ 			error = ccrng_generate(rng_state, outlen, out);
+ 		}
++	} else {
++		read_random(out, (u_int)outlen);
++		error = 0;
+ 	}
+ 
+ 	return error;
+@@ -58,6 +62,10 @@ crypto_random_generate(
+ 	void *random,
+ 	size_t random_size)
+ {
++	if (!g_crypto_funcs) {
++		read_random(random, (u_int)random_size);
++		return;
++	}
+ 	g_crypto_funcs->random_generate_fn(ctx, random, random_size);
+ }
+ 
+@@ -67,12 +75,25 @@ crypto_random_uniform(
+ 	uint64_t bound,
+ 	uint64_t *random)
+ {
++	if (!g_crypto_funcs) {
++		uint64_t r = 0;
++		read_random(&r, sizeof(r));
++		if (bound > 0) {
++			*random = r % bound;
++		} else {
++			*random = 0;
++		}
++		return;
++	}
+ 	g_crypto_funcs->random_uniform_fn(ctx, bound, random);
+ }
+ 
+ size_t
+ crypto_random_kmem_ctx_size(void)
+ {
++	if (!g_crypto_funcs) {
++		return 64;
++	}
+ 	return g_crypto_funcs->random_kmem_ctx_size_fn();
+ }
+ 
+@@ -80,5 +101,8 @@ void
+ crypto_random_kmem_init(
+ 	crypto_random_ctx_t ctx)
+ {
++	if (!g_crypto_funcs) {
++		return;
++	}
+ 	g_crypto_funcs->random_kmem_init_fn(ctx);
+ }
+diff --git a/libkern/crypto/corecrypto_rsa.c b/libkern/crypto/corecrypto_rsa.c
+index d47da83..c2e3cb0 100644
+--- a/libkern/crypto/corecrypto_rsa.c
++++ b/libkern/crypto/corecrypto_rsa.c
+@@ -36,6 +36,7 @@ rsa_make_pub(rsa_pub_ctx *pub,
+     size_t exp_nbytes, const uint8_t *exp,
+     size_t mod_nbytes, const uint8_t *mod)
+ {
++	if (!g_crypto_funcs) return -1;
+ 	if ((exp_nbytes > RSA_MAX_KEY_BITSIZE / 8)
+ 	    || (mod_nbytes > RSA_MAX_KEY_BITSIZE / 8)) {
+ 		return -1; // Too big
+@@ -52,6 +53,7 @@ rsa_verify_pkcs1v15(rsa_pub_ctx *pub, const uint8_t *oid,
+     size_t sig_len, const uint8_t *sig,
+     bool *valid)
+ {
++	if (!g_crypto_funcs) { if (valid) *valid = false; return -1; }
+ 	return g_crypto_funcs->ccrsa_verify_pkcs1v15_fn(pub->key, oid,
+ 	           digest_len, digest,
+ 	           sig_len, sig, valid);
 diff --git a/libkern/crypto/corecrypto_sha1.c b/libkern/crypto/corecrypto_sha1.c
 index 5fd982b..03fdefe 100644
 --- a/libkern/crypto/corecrypto_sha1.c
@@ -10104,6 +10749,442 @@ index 5fd982b..03fdefe 100644
 +	}
  	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
  	ccdigest_di_decl(di, di_ctx);
+ 
+diff --git a/libkern/crypto/corecrypto_sha2.c b/libkern/crypto/corecrypto_sha2.c
+index 7392f0c..da0592d 100644
+--- a/libkern/crypto/corecrypto_sha2.c
++++ b/libkern/crypto/corecrypto_sha2.c
+@@ -34,9 +34,343 @@
+ 
+ #if defined(CRYPTO_SHA2)
+ 
++#include <string.h>
++
++/* SHA-256 software fallback */
++#define ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
++#define Ch32(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
++#define Maj32(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
++#define S0_256(x) (ROR32(x, 2) ^ ROR32(x, 13) ^ ROR32(x, 22))
++#define S1_256(x) (ROR32(x, 6) ^ ROR32(x, 11) ^ ROR32(x, 25))
++#define s0_256(x) (ROR32(x, 7) ^ ROR32(x, 18) ^ ((x) >> 3))
++#define s1_256(x) (ROR32(x, 17) ^ ROR32(x, 19) ^ ((x) >> 10))
++
++static const uint32_t k256[64] = {
++	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
++};
++
++struct sha256_sw_ctx {
++	uint32_t state[8];
++	uint64_t count;
++	uint8_t buffer[64];
++};
++
++static void
++sha256_sw_transform(uint32_t state[8], const uint8_t buffer[64])
++{
++	uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
++	uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
++	uint32_t w[64];
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		w[i] = ((uint32_t)buffer[i * 4] << 24) |
++		       ((uint32_t)buffer[i * 4 + 1] << 16) |
++		       ((uint32_t)buffer[i * 4 + 2] << 8) |
++		       ((uint32_t)buffer[i * 4 + 3]);
++	}
++	for (i = 16; i < 64; i++) {
++		w[i] = s1_256(w[i - 2]) + w[i - 7] + s0_256(w[i - 15]) + w[i - 16];
++	}
++	for (i = 0; i < 64; i++) {
++		uint32_t t1 = h + S1_256(e) + Ch32(e, f, g) + k256[i] + w[i];
++		uint32_t t2 = S0_256(a) + Maj32(a, b, c);
++		h = g;
++		g = f;
++		f = e;
++		e = d + t1;
++		d = c;
++		c = b;
++		b = a;
++		a = t1 + t2;
++	}
++
++	state[0] += a;
++	state[1] += b;
++	state[2] += c;
++	state[3] += d;
++	state[4] += e;
++	state[5] += f;
++	state[6] += g;
++	state[7] += h;
++}
++
++static void
++sha256_sw_init(struct sha256_sw_ctx *ctx)
++{
++	ctx->state[0] = 0x6a09e667;
++	ctx->state[1] = 0xbb67ae85;
++	ctx->state[2] = 0x3c6ef372;
++	ctx->state[3] = 0xa54ff53a;
++	ctx->state[4] = 0x510e527f;
++	ctx->state[5] = 0x9b05688c;
++	ctx->state[6] = 0x1f83d9ab;
++	ctx->state[7] = 0x5be0cd19;
++	ctx->count = 0;
++	memset(ctx->buffer, 0, sizeof(ctx->buffer));
++}
++
++static void
++sha256_sw_update(struct sha256_sw_ctx *ctx, const void *data, size_t len)
++{
++	const uint8_t *p = (const uint8_t *)data;
++	size_t current = (size_t)(ctx->count % 64);
++	ctx->count += len;
++
++	while (len > 0) {
++		size_t take = 64 - current;
++		if (take > len) {
++			take = len;
++		}
++		memcpy(&ctx->buffer[current], p, take);
++		current += take;
++		p += take;
++		len -= take;
++
++		if (current == 64) {
++			sha256_sw_transform(ctx->state, ctx->buffer);
++			current = 0;
++		}
++	}
++}
++
++static void
++sha256_sw_final(void *digest, struct sha256_sw_ctx *ctx)
++{
++	uint64_t total_bits = ctx->count * 8;
++	size_t current = (size_t)(ctx->count % 64);
++	uint8_t *out = (uint8_t *)digest;
++	int i;
++
++	ctx->buffer[current++] = 0x80;
++	if (current > 56) {
++		memset(&ctx->buffer[current], 0, 64 - current);
++		sha256_sw_transform(ctx->state, ctx->buffer);
++		current = 0;
++	}
++	memset(&ctx->buffer[current], 0, 56 - current);
++
++	for (i = 7; i >= 0; i--) {
++		ctx->buffer[56 + (7 - i)] = (uint8_t)((total_bits >> (i * 8)) & 0xff);
++	}
++	sha256_sw_transform(ctx->state, ctx->buffer);
++
++	for (i = 0; i < 8; i++) {
++		out[i * 4]     = (uint8_t)((ctx->state[i] >> 24) & 0xff);
++		out[i * 4 + 1] = (uint8_t)((ctx->state[i] >> 16) & 0xff);
++		out[i * 4 + 2] = (uint8_t)((ctx->state[i] >> 8) & 0xff);
++		out[i * 4 + 3] = (uint8_t)(ctx->state[i] & 0xff);
++	}
++}
++
++/* SHA-512 / SHA-384 software fallback */
++#define ROR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
++#define Ch64(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
++#define Maj64(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
++#define S0_512(x) (ROR64(x, 28) ^ ROR64(x, 34) ^ ROR64(x, 39))
++#define S1_512(x) (ROR64(x, 14) ^ ROR64(x, 18) ^ ROR64(x, 41))
++#define s0_512(x) (ROR64(x, 1)  ^ ROR64(x, 8)  ^ ((x) >> 7))
++#define s1_512(x) (ROR64(x, 19) ^ ROR64(x, 61) ^ ((x) >> 6))
++
++static const uint64_t k512[80] = {
++	0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
++	0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
++	0xd807aa98a3030242ULL, 0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
++	0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
++	0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL, 0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
++	0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
++	0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
++	0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL, 0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
++	0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
++	0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
++	0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL, 0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
++	0xd192e819d6ef5218ULL, 0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
++	0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
++	0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL, 0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
++	0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
++	0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
++	0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
++	0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
++	0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
++	0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
++};
++
++struct sha512_sw_ctx {
++	uint64_t state[8];
++	uint64_t count;
++	uint8_t buffer[128];
++};
++
++static uint64_t
++load64_be(const uint8_t *p)
++{
++	return ((uint64_t)p[0] << 56) |
++	       ((uint64_t)p[1] << 48) |
++	       ((uint64_t)p[2] << 40) |
++	       ((uint64_t)p[3] << 32) |
++	       ((uint64_t)p[4] << 24) |
++	       ((uint64_t)p[5] << 16) |
++	       ((uint64_t)p[6] << 8)  |
++	       ((uint64_t)p[7]);
++}
++
++static void
++sha512_sw_transform(uint64_t state[8], const uint8_t buffer[128])
++{
++	uint64_t a = state[0], b = state[1], c = state[2], d = state[3];
++	uint64_t e = state[4], f = state[5], g = state[6], h = state[7];
++	uint64_t w[80];
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		w[i] = load64_be(&buffer[i * 8]);
++	}
++	for (i = 16; i < 80; i++) {
++		w[i] = s1_512(w[i - 2]) + w[i - 7] + s0_512(w[i - 15]) + w[i - 16];
++	}
++	for (i = 0; i < 80; i++) {
++		uint64_t t1 = h + S1_512(e) + Ch64(e, f, g) + k512[i] + w[i];
++		uint64_t t2 = S0_512(a) + Maj64(a, b, c);
++		h = g;
++		g = f;
++		f = e;
++		e = d + t1;
++		d = c;
++		c = b;
++		b = a;
++		a = t1 + t2;
++	}
++
++	state[0] += a;
++	state[1] += b;
++	state[2] += c;
++	state[3] += d;
++	state[4] += e;
++	state[5] += f;
++	state[6] += g;
++	state[7] += h;
++}
++
++static void
++sha512_sw_init(struct sha512_sw_ctx *ctx)
++{
++	ctx->state[0] = 0x6a09e667f3bcc908ULL;
++	ctx->state[1] = 0xbb67ae8584caa73bULL;
++	ctx->state[2] = 0x3c6ef372fe94f82bULL;
++	ctx->state[3] = 0xa54ff53a5f1d36f1ULL;
++	ctx->state[4] = 0x510e527fade682d1ULL;
++	ctx->state[5] = 0x9b05688c2b3e6c1fULL;
++	ctx->state[6] = 0x1f83d9abfb41bd6bULL;
++	ctx->state[7] = 0x5be0cd19137e2179ULL;
++	ctx->count = 0;
++	memset(ctx->buffer, 0, sizeof(ctx->buffer));
++}
++
++static void
++sha384_sw_init(struct sha512_sw_ctx *ctx)
++{
++	ctx->state[0] = 0xcbbb9d5dc1059ed8ULL;
++	ctx->state[1] = 0x629a292a367cd507ULL;
++	ctx->state[2] = 0x9159015a3070dd17ULL;
++	ctx->state[3] = 0x152fecd8f70e5939ULL;
++	ctx->state[4] = 0x67332667ffc00b31ULL;
++	ctx->state[5] = 0x8eb44a8768581511ULL;
++	ctx->state[6] = 0xdb0c2e0d64f98fa7ULL;
++	ctx->state[7] = 0x47b5481dbefa4fa4ULL;
++	ctx->count = 0;
++	memset(ctx->buffer, 0, sizeof(ctx->buffer));
++}
++
++static void
++sha512_sw_update(struct sha512_sw_ctx *ctx, const void *data, size_t len)
++{
++	const uint8_t *p = (const uint8_t *)data;
++	size_t current = (size_t)(ctx->count % 128);
++	ctx->count += len;
++
++	while (len > 0) {
++		size_t take = 128 - current;
++		if (take > len) {
++			take = len;
++		}
++		memcpy(&ctx->buffer[current], p, take);
++		current += take;
++		p += take;
++		len -= take;
++
++		if (current == 128) {
++			sha512_sw_transform(ctx->state, ctx->buffer);
++			current = 0;
++		}
++	}
++}
++
++static void
++sha512_sw_final_internal(struct sha512_sw_ctx *ctx)
++{
++	uint64_t total_bits = ctx->count * 8;
++	size_t current = (size_t)(ctx->count % 128);
++	int i;
++
++	ctx->buffer[current++] = 0x80;
++	if (current > 112) {
++		memset(&ctx->buffer[current], 0, 128 - current);
++		sha512_sw_transform(ctx->state, ctx->buffer);
++		current = 0;
++	}
++	memset(&ctx->buffer[current], 0, 112 - current);
++
++	/* 128-bit big-endian length: high 64 bits = 0, low 64 bits = total_bits */
++	memset(&ctx->buffer[112], 0, 8);
++	for (i = 7; i >= 0; i--) {
++		ctx->buffer[120 + (7 - i)] = (uint8_t)((total_bits >> (i * 8)) & 0xff);
++	}
++	sha512_sw_transform(ctx->state, ctx->buffer);
++}
++
++static void
++sha512_sw_final(void *digest, struct sha512_sw_ctx *ctx)
++{
++	uint8_t *out = (uint8_t *)digest;
++	int i, j;
++
++	sha512_sw_final_internal(ctx);
++	for (i = 0; i < 8; i++) {
++		for (j = 7; j >= 0; j--) {
++			out[i * 8 + (7 - j)] = (uint8_t)((ctx->state[i] >> (j * 8)) & 0xff);
++		}
++	}
++}
++
++static void
++sha384_sw_final(void *digest, struct sha512_sw_ctx *ctx)
++{
++	uint8_t *out = (uint8_t *)digest;
++	int i, j;
++
++	sha512_sw_final_internal(ctx);
++	for (i = 0; i < 6; i++) {
++		for (j = 7; j >= 0; j--) {
++			out[i * 8 + (7 - j)] = (uint8_t)((ctx->state[i] >> (j * 8)) & 0xff);
++		}
++	}
++}
++
++
+ void
+ SHA256_Init(SHA256_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha256_sw_init((struct sha256_sw_ctx *)ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha256_di;
+ 
+@@ -51,6 +385,10 @@ SHA256_Init(SHA256_CTX *ctx)
+ void
+ SHA256_Update(SHA256_CTX *ctx, const void *data, size_t len)
+ {
++	if (!g_crypto_funcs) {
++		sha256_sw_update((struct sha256_sw_ctx *)ctx, data, len);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha256_di;
+ 
+@@ -60,6 +398,10 @@ SHA256_Update(SHA256_CTX *ctx, const void *data, size_t len)
+ void
+ SHA256_Final(void *digest, SHA256_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha256_sw_final(digest, (struct sha256_sw_ctx *)ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha256_di;
+ 
+@@ -69,6 +411,10 @@ SHA256_Final(void *digest, SHA256_CTX *ctx)
+ void
+ SHA384_Init(SHA384_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha384_sw_init((struct sha512_sw_ctx *)ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha384_di;
+ 
+@@ -83,6 +429,10 @@ SHA384_Init(SHA384_CTX *ctx)
+ void
+ SHA384_Update(SHA384_CTX *ctx, const void *data, size_t len)
+ {
++	if (!g_crypto_funcs) {
++		sha512_sw_update((struct sha512_sw_ctx *)ctx, data, len);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha384_di;
+ 
+@@ -93,6 +443,10 @@ SHA384_Update(SHA384_CTX *ctx, const void *data, size_t len)
+ void
+ SHA384_Final(void *digest, SHA384_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha384_sw_final(digest, (struct sha512_sw_ctx *)ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha384_di;
+ 
+@@ -102,6 +456,10 @@ SHA384_Final(void *digest, SHA384_CTX *ctx)
+ void
+ SHA512_Init(SHA512_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha512_sw_init((struct sha512_sw_ctx *)ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha512_di;
+ 
+@@ -116,6 +474,10 @@ SHA512_Init(SHA512_CTX *ctx)
+ void
+ SHA512_Update(SHA512_CTX *ctx, const void *data, size_t len)
+ {
++	if (!g_crypto_funcs) {
++		sha512_sw_update((struct sha512_sw_ctx *)ctx, data, len);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha512_di;
+ 
+@@ -125,6 +487,10 @@ SHA512_Update(SHA512_CTX *ctx, const void *data, size_t len)
+ void
+ SHA512_Final(void *digest, SHA512_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha512_sw_final(digest, (struct sha512_sw_ctx *)ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di;
+ 	di = g_crypto_funcs->ccsha512_di;
  
 diff --git a/libsa/conf/Makefile.template b/libsa/conf/Makefile.template
 index bb36037..3b08b38 100644
@@ -12478,10 +13559,56 @@ index 05903a4..079ef4d 100644
  /*
   * Should only be called by platform code at the end of each interrupt.
 diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
-index f51b4b0..c712c20 100644
+index f51b4b0..9b1ea81 100644
 --- a/osfmk/prng/prng_random.c
 +++ b/osfmk/prng/prng_random.c
-@@ -544,3 +544,35 @@ random_bool_gen_bits(struct bool_gen * bg, unsigned int * buffer, unsigned int c
+@@ -410,16 +410,22 @@ random_cpu_init(int cpu)
+ 	assert3s(cpu, !=, master_cpu);
+ 
+ 	if (!prng_ready) {
+-		panic("random_cpu_init: kernel prng has not been installed");
++		return;
+ 	}
+ 
+-	prng_funcs.initgen(prng_ctx, cpu);
++	if (prng_funcs.initgen) {
++		prng_funcs.initgen(prng_ctx, cpu);
++	}
+ }
+ 
+ /* export good random numbers to the rest of the kernel */
+ void
+ read_random(void * buffer, u_int numbytes)
+ {
++	if (__improbable(!prng_ready)) {
++		read_erandom(buffer, numbytes);
++		return;
++	}
+ 	prng_funcs.refresh(prng_ctx);
+ 	read_random_generate(buffer, numbytes);
+ }
+@@ -447,6 +453,10 @@ ensure_gsbase(void)
+ static void
+ read_random_generate(uint8_t *buffer, size_t numbytes)
+ {
++	if (__improbable(!prng_ready || !prng_funcs.generate)) {
++		read_erandom(buffer, numbytes);
++		return;
++	}
+ 	ensure_gsbase();
+ 
+ 	while (numbytes > 0) {
+@@ -462,6 +472,9 @@ read_random_generate(uint8_t *buffer, size_t numbytes)
+ int
+ write_random(void * buffer, u_int numbytes)
+ {
++	if (__improbable(!prng_ready || !prng_funcs.reseed)) {
++		return 0;
++	}
+ 	uint8_t seed[SHA256_DIGEST_LENGTH];
+ 	SHA256_CTX ctx;
+ 
+@@ -544,3 +557,35 @@ random_bool_gen_bits(struct bool_gen * bg, unsigned int * buffer, unsigned int c
  	}
  	return rbits;
  }
