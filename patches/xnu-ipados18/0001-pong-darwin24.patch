@@ -3271,7 +3271,7 @@ new file mode 100644
 index 0000000..86a48e9
 --- /dev/null
 +++ b/bsd/pthread/pthread_kext.c
-@@ -0,0 +1,4562 @@
+@@ -0,0 +1,4566 @@
 +/*
 + * Standalone pthread kernel extension (com.apple.kec.pthread) for XNU.
 + * Built into the kernel for prelink=false environments.
@@ -3389,6 +3389,10 @@ index 0000000..86a48e9
 +#include <mach/shared_region.h>
 +#include <mach/vm_region.h>
 +#include <mach/vm_statistics.h>
++
++#ifndef VM_MAKE_TAG
++#define VM_MAKE_TAG(tag) ((tag) << 24)
++#endif
 +
 +#include <kern/kern_types.h>
 +#include <kern/task.h>
