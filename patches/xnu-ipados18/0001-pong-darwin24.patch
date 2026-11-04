@@ -3271,7 +3271,7 @@ new file mode 100644
 index 0000000..86a48e9
 --- /dev/null
 +++ b/bsd/pthread/pthread_kext.c
-@@ -0,0 +1,4531 @@
+@@ -0,0 +1,4557 @@
 +/*
 + * Standalone pthread kernel extension (com.apple.kec.pthread) for XNU.
 + * Built into the kernel for prelink=false environments.
@@ -3303,7 +3303,33 @@ index 0000000..86a48e9
 +#define pthread_kern pthread_kext_kern
 +#define current_uthread pthread_kext_current_uthread
 +
-+#include <TargetConditionals.h>
++#ifndef TARGET_OS_IOS
++#if defined(XNU_TARGET_OS_IOS)
++#define TARGET_OS_IOS 1
++#else
++#define TARGET_OS_IOS 0
++#endif
++#endif
++
++#ifndef TARGET_OS_OSX
++#if defined(XNU_TARGET_OS_OSX)
++#define TARGET_OS_OSX 1
++#else
++#define TARGET_OS_OSX 0
++#endif
++#endif
++
++#ifndef TARGET_OS_VISION
++#define TARGET_OS_VISION 0
++#endif
++
++#ifndef TARGET_CPU_ARM64
++#if defined(__arm64__)
++#define TARGET_CPU_ARM64 1
++#else
++#define TARGET_CPU_ARM64 0
++#endif
++#endif
 +#include <sys/cdefs.h>
 +#include <sys/param.h>
 +#include <sys/queue.h>
