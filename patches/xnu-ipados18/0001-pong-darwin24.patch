@@ -10910,7 +10910,7 @@ new file mode 100644
 index 0000000..d3ff8ea
 --- /dev/null
 +++ b/osfmk/arm64/pong_ramoops_console.h
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,205 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Minimal persistent console mirror for SM8250 / Pong. It does not touch VBAR, TTBR,
 + * the framebuffer, scheduler state, IOKit, or storage. */
@@ -11070,10 +11070,7 @@ index 0000000..d3ff8ea
 +		}
 +	}
 +
-+	vm_offset_t mapped = ml_static_ptovirt(phys_base);
-+	if (!mapped) {
-+		mapped = ml_io_map_wcomb(phys_base, reserved_bytes);
-+	}
++	vm_offset_t mapped = ml_io_map_wcomb(phys_base, reserved_bytes);
 +	if (!mapped) {
 +		return 0;
 +	}
