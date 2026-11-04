@@ -10910,7 +10910,7 @@ new file mode 100644
 index 0000000..d3ff8ea
 --- /dev/null
 +++ b/osfmk/arm64/pong_ramoops_console.h
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,208 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Minimal persistent console mirror for SM8250 / Pong. It does not touch VBAR, TTBR,
 + * the framebuffer, scheduler state, IOKit, or storage. */
@@ -10963,13 +10963,13 @@ index 0000000..d3ff8ea
 +		count = cap - pong_diagnostic_size;
 +	if (count) {
 +		for (uint32_t i = 0; i < count; i++) data[pong_diagnostic_size + i] = (uint8_t)text[i];
-+		CleanPoC_DcacheRegion_Force(base + PONG_RAMOOPS_HEADER_BYTES + pong_diagnostic_size, count);
++		FlushPoC_DcacheRegion(base + PONG_RAMOOPS_HEADER_BYTES + pong_diagnostic_size, count);
 +		__asm__ volatile("dsb sy" ::: "memory");
 +		pong_diagnostic_size += count;
 +		header->start = pong_diagnostic_size;
 +		header->size = pong_diagnostic_size;
 +		header->sig = PONG_RAMOOPS_MAGIC;
-+		CleanPoC_DcacheRegion_Force(base, PONG_RAMOOPS_HEADER_BYTES);
++		FlushPoC_DcacheRegion(base, PONG_RAMOOPS_HEADER_BYTES);
 +		__asm__ volatile("dsb sy" ::: "memory");
 +	}
 +	__atomic_store_n(&pong_diagnostic_busy, 0, __ATOMIC_RELEASE);
@@ -11011,10 +11011,10 @@ index 0000000..d3ff8ea
 +	}
 +
 +	if (first) {
-+		CleanPoC_DcacheRegion_Force((vm_offset_t)(uintptr_t)(data + data_at), first);
++		FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)(data + data_at), first);
 +	}
 +	if (second) {
-+		CleanPoC_DcacheRegion_Force((vm_offset_t)(uintptr_t)data, second);
++		FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)data, second);
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
 +
@@ -11027,7 +11027,7 @@ index 0000000..d3ff8ea
 +	header->start = new_start;
 +	header->size = new_size;
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	CleanPoC_DcacheRegion_Force(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
++	FlushPoC_DcacheRegion(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	pong_ramoops_start = new_start;
 +	pong_ramoops_size = new_size;
@@ -11070,7 +11070,10 @@ index 0000000..d3ff8ea
 +		}
 +	}
 +
-+	vm_offset_t mapped = ml_io_map_wcomb(phys_base, reserved_bytes);
++	vm_offset_t mapped = ml_static_ptovirt(phys_base);
++	if (!mapped) {
++		mapped = ml_io_map_wcomb(phys_base, reserved_bytes);
++	}
 +	if (!mapped) {
 +		return 0;
 +	}
@@ -11085,10 +11088,10 @@ index 0000000..d3ff8ea
 +	c_header->start = 0;
 +	c_header->size = 0;
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	CleanPoC_DcacheRegion_Force(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
++	FlushPoC_DcacheRegion(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
 +	c_header->sig = PONG_RAMOOPS_MAGIC;
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	CleanPoC_DcacheRegion_Force(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
++	FlushPoC_DcacheRegion(pong_ramoops_base, PONG_RAMOOPS_HEADER_BYTES);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +
 +	pong_ramoops_start = 0;
@@ -11103,10 +11106,10 @@ index 0000000..d3ff8ea
 +		d_header->start = 0;
 +		d_header->size = 0;
 +		__asm__ volatile("dsb sy" ::: "memory");
-+		CleanPoC_DcacheRegion_Force(pong_diagnostic_base, PONG_RAMOOPS_HEADER_BYTES);
++		FlushPoC_DcacheRegion(pong_diagnostic_base, PONG_RAMOOPS_HEADER_BYTES);
 +		d_header->sig = PONG_RAMOOPS_MAGIC;
 +		__asm__ volatile("dsb sy" ::: "memory");
-+		CleanPoC_DcacheRegion_Force(pong_diagnostic_base, PONG_RAMOOPS_HEADER_BYTES);
++		FlushPoC_DcacheRegion(pong_diagnostic_base, PONG_RAMOOPS_HEADER_BYTES);
 +		__asm__ volatile("dsb sy" ::: "memory");
 +		pong_diagnostic_size = 0;
 +	}
@@ -11954,7 +11957,6 @@ index 7b3c26a..8c32639 100644
  	exception_info_t info = {
  		/*
 diff --git a/osfmk/kern/kalloc.c b/osfmk/kern/kalloc.c
-index 6e17b34..b658546 100644
 --- a/osfmk/kern/kalloc.c
 +++ b/osfmk/kern/kalloc.c
 @@ -970,6 +970,8 @@ kalloc_type_view_copy(
@@ -11966,7 +11968,7 @@ index 6e17b34..b658546 100644
  __startup_func
  static uint64_t
  kalloc_type_view_parse(const kalloc_type_variant_t type)
-@@ -1052,10 +1054,46 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+@@ -1052,10 +1054,46 @@ kalloc_type_view_parse(const kalloc_type
  		cur = prelink_sect->addr;
  		end = prelink_sect->addr + prelink_sect->size;
  
@@ -12014,7 +12016,7 @@ index 6e17b34..b658546 100644
  			if (kext_mh->magic == 0) {
  				/*
  				 * Assert that we have processed all kexts and all that is left
-@@ -1078,6 +1116,15 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+@@ -1078,6 +1116,15 @@ kalloc_type_view_parse(const kalloc_type
  
  			for (uint32_t i = 0; i < kext_mh->ncmds && (vm_offset_t)lc < end;
  			    i++, lc = (struct load_command *)((vm_offset_t)lc + lc->cmdsize)) {
@@ -12030,7 +12032,7 @@ index 6e17b34..b658546 100644
  				if (lc->cmd == LC_SEGMENT_SPLIT_INFO) {
  					isSplitKext = true;
  					continue;
-@@ -1087,6 +1134,10 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+@@ -1087,6 +1134,10 @@ kalloc_type_view_parse(const kalloc_type
  
  				kernel_segment_command_t *seg_cmd =
  				    (struct segment_command_64 *)(vm_offset_t)lc;
@@ -12041,7 +12043,7 @@ index 6e17b34..b658546 100644
  				/*
  				 * Parse kalloc_type section
  				 */
-@@ -1120,7 +1171,9 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+@@ -1120,7 +1171,9 @@ kalloc_type_view_parse(const kalloc_type
  				break;
  			}
  
@@ -12052,6 +12054,44 @@ index 6e17b34..b658546 100644
  		}
  	} else {
  		/*
+@@ -1493,6 +1546,17 @@ kalloc_type_apply_policy(
+ 	wasted_zones += kalloc_type_distribute_budget(freq_total_list,
+ 	    kt_zones_type, zbudget_type, 0);
+ 	kalloc_type_redistribute_budget(freq_total_list, kt_zones_type);
++	for (uint16_t i = 0; i < MAX_K_ZONE(kt_zone_cfg); i++) {
++		while (kt_zones_sig[i] + kt_zones_type[i] + 1 > 64) {
++			if (kt_zones_type[i] > 0) {
++				kt_zones_type[i]--;
++			} else if (kt_zones_sig[i] > 1) {
++				kt_zones_sig[i]--;
++			} else {
++				break;
++			}
++		}
++	}
+ 
+ 	/*
+ 	 * Print stats when KT_OPTIONS_DEBUG boot-arg present
+@@ -1645,7 +1709,7 @@ kalloc_type_distribute_zone_for_type(
+ 	uint16_t            zones_total_type,
+ 	uint16_t            total_types,
+ 	uint16_t           *kt_skip_list,
+-	zone_t              kt_zones_for_size[32],
++	zone_t              kt_zones_for_size[64],
+ 	uint16_t            type_zones_start,
+ 	zone_t              sig_zone,
+ 	zone_t              early_zone)
+@@ -1742,8 +1806,8 @@ kalloc_type_create_zones_fixed(
+ 		}
+ 
+ 		zone_carry = 0;
+-		assert(n_zones_sig + n_zones_type + 1 <= 32);
+-		zone_t kt_zones_for_size[32] = {};
++		assert(n_zones_sig + n_zones_type + 1 <= 64);
++		zone_t kt_zones_for_size[64] = {};
+ 		kalloc_type_create_zone_for_size(kt_zones_for_size,
+ 		    n_zones_sig + n_zones_type, z_size);
+ 
 diff --git a/osfmk/kern/kpc.h b/osfmk/kern/kpc.h
 index d60d8b3..2f8b901 100644
 --- a/osfmk/kern/kpc.h
