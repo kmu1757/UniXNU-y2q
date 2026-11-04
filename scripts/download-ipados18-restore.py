@@ -5,9 +5,7 @@ Transport offsets/lengths are checked; no image digest or image audit is run
 unless --sha256 asks for one, which is a whole-file hash of what was written.
 Apple inputs stay in the ignored local directory, never in source control.
 
-The default is the pinned 22H374 iPad restore this repository builds against.
---url downloads another restore instead, which is what a workflow needs when the
-IPSW is an input rather than a constant: the file name, byte length and
+--url passes the restore IPSW URL to download: the file name, byte length and
 checkpoint then describe that URL, and a checkpoint written for one restore is
 still refused for another.
 """
@@ -25,9 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
-URL = ('https://updates.cdn-apple.com/2026WinterFCS/fullrestores/140-97955/'
-       'A3F72236-89AD-47C5-8394-5E824079C175/iPad_10.2_18.7.10_22H374_Restore.ipsw')
-SIZE = 7891396130
+URL = ''
+SIZE = 0
 
 
 def file_name(url):
@@ -72,7 +69,7 @@ def main():
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=8)
     parser.add_argument('--chunk-mib', type=int, default=64)
-    parser.add_argument('--url', help='restore URL to download; defaults to the pinned 22H374 iPad restore')
+    parser.add_argument('--url', help='restore URL to download')
     parser.add_argument('--size', type=int,
                         help='restore byte length; asked of the server when omitted')
     parser.add_argument('--sha256',
@@ -81,9 +78,11 @@ def main():
     if not 1 <= args.jobs <= 16 or not 8 <= args.chunk_mib <= 256:
         raise SystemExit('Use1..16 jobs and8..256 MiB chunks')
     url = (args.url or URL).strip()
+    if not url:
+        raise SystemExit('No restore URL specified. Pass --url https://...')
     if not url.startswith('https://'):
         raise SystemExit('the restore URL must be https, got: ' + url)
-    size = args.size or (SIZE if url == URL else remote_size(url))
+    size = args.size or (SIZE if url == URL and SIZE else remote_size(url))
     if size <= 0:
         raise SystemExit('the restore size must be positive, got %d' % size)
     expected = (args.sha256 or '').strip().lower() or None

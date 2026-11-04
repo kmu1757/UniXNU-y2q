@@ -13,7 +13,7 @@ kit = "pong"
 
 # iPadOS 18.7.10 restore selected from the matching J171 BuildIdentity.
 [ipsw]
-url = "https://updates.cdn-apple.com/2026WinterFCS/fullrestores/140-97955/A3F72236-89AD-47C5-8394-5E824079C175/iPad_10.2_18.7.10_22H374_Restore.ipsw"
+url = ""
 product = "iPad7,11"
 version = "18.7.10"
 build = "22H374"

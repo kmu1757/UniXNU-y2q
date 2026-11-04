@@ -141,7 +141,13 @@ def main():
     unixnu_root = Path(os.environ.get('UNIXNU_ROOT', DEVICE.parent / 'UniXNU')).resolve()
     output = args.output_dir or unixnu_root / 'out/ipsw' / board['build']
     output.mkdir(parents=True, exist_ok=True)
-    source = Path(args.ipsw).open('rb') if args.ipsw else RangeFile(board['url'])
+    if not args.ipsw:
+        url = board.get('url', '').strip()
+        if not url:
+            raise SystemExit('board.toml has no ipsw.url configured. Pass --ipsw <path-to-restore.ipsw>')
+        source = RangeFile(url)
+    else:
+        source = Path(args.ipsw).open('rb')
     archive = zipfile.ZipFile(source)
     manifest = plistlib.loads(member_bytes(archive, archive.getinfo('BuildManifest.plist')))
     if (manifest['ProductVersion'], manifest['ProductBuildVersion']) != (board['version'], board['build']):
