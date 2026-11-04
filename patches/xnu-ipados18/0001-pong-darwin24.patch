@@ -10501,18 +10501,19 @@ index 242dcdb..64c0c22 100644
  	ccdigest_di_decl(di, di_ctx);
  
 diff --git a/libkern/crypto/corecrypto_rand.c b/libkern/crypto/corecrypto_rand.c
-index d46815b..3a082dd 100644
+index d46815b..515b7ad 100644
 --- a/libkern/crypto/corecrypto_rand.c
 +++ b/libkern/crypto/corecrypto_rand.c
-@@ -29,6 +29,7 @@
- #include <libkern/crypto/crypto_internal.h>
+@@ -30,6 +30,8 @@
  #include <corecrypto/ccrng.h>
  #include <libkern/crypto/rand.h>
-+#include <prng/random.h>
  
++extern void read_random(void *buffer, u_int numbytes);
++
  int
  cc_rand_generate(void *out, size_t outlen)
-@@ -41,6 +42,9 @@ cc_rand_generate(void *out, size_t outlen)
+ {
+@@ -41,6 +43,9 @@ cc_rand_generate(void *out, size_t outlen)
  		if (rng_state != NULL) {
  			error = ccrng_generate(rng_state, outlen, out);
  		}
@@ -10522,7 +10523,7 @@ index d46815b..3a082dd 100644
  	}
  
  	return error;
-@@ -58,6 +62,10 @@ crypto_random_generate(
+@@ -58,6 +63,10 @@ crypto_random_generate(
  	void *random,
  	size_t random_size)
  {
@@ -10533,7 +10534,7 @@ index d46815b..3a082dd 100644
  	g_crypto_funcs->random_generate_fn(ctx, random, random_size);
  }
  
-@@ -67,12 +75,25 @@ crypto_random_uniform(
+@@ -67,12 +76,25 @@ crypto_random_uniform(
  	uint64_t bound,
  	uint64_t *random)
  {
@@ -10559,7 +10560,7 @@ index d46815b..3a082dd 100644
  	return g_crypto_funcs->random_kmem_ctx_size_fn();
  }
  
-@@ -80,5 +101,8 @@ void
+@@ -80,5 +102,8 @@ void
  crypto_random_kmem_init(
  	crypto_random_ctx_t ctx)
  {
