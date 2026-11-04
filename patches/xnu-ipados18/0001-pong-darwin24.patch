@@ -9943,6 +9943,168 @@ index c4684c2..ff8590f 100644
  
  libkern/stack_protector.c       standard
  libkern/ptrauth_utils.c         standard
+diff --git a/libkern/crypto/corecrypto_sha1.c b/libkern/crypto/corecrypto_sha1.c
+index 5fd982b..03fdefe 100644
+--- a/libkern/crypto/corecrypto_sha1.c
++++ b/libkern/crypto/corecrypto_sha1.c
+@@ -2,6 +2,124 @@
+ #include <libkern/crypto/sha1.h>
+ #include <kern/debug.h>
+ #include <corecrypto/ccdigest.h>
++#include <string.h>
++
++#define SHA1_ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
++
++static void
++sha1_sw_transform(uint32_t state[5], const uint8_t buffer[64])
++{
++	uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
++	uint32_t w[80];
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		w[i] = ((uint32_t)buffer[i * 4] << 24) |
++		       ((uint32_t)buffer[i * 4 + 1] << 16) |
++		       ((uint32_t)buffer[i * 4 + 2] << 8) |
++		       ((uint32_t)buffer[i * 4 + 3]);
++	}
++	for (i = 16; i < 80; i++) {
++		w[i] = SHA1_ROL(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++	}
++
++	for (i = 0; i < 80; i++) {
++		uint32_t f, k;
++		if (i < 20) {
++			f = (b & c) | ((~b) & d);
++			k = 0x5A827999;
++		} else if (i < 40) {
++			f = b ^ c ^ d;
++			k = 0x6ED9EBA1;
++		} else if (i < 60) {
++			f = (b & c) | (b & d) | (c & d);
++			k = 0x8F1BBCDC;
++		} else {
++			f = b ^ c ^ d;
++			k = 0xCA62C1D6;
++		}
++		uint32_t temp = SHA1_ROL(a, 5) + f + e + k + w[i];
++		e = d;
++		d = c;
++		c = SHA1_ROL(b, 30);
++		b = a;
++		a = temp;
++	}
++
++	state[0] += a;
++	state[1] += b;
++	state[2] += c;
++	state[3] += d;
++	state[4] += e;
++}
++
++static void
++sha1_sw_init(SHA1_CTX *ctx)
++{
++	ctx->h.b32[0] = 0x67452301;
++	ctx->h.b32[1] = 0xEFCDAB89;
++	ctx->h.b32[2] = 0x98BADCFE;
++	ctx->h.b32[3] = 0x10325476;
++	ctx->h.b32[4] = 0xC3D2E1F0;
++	ctx->c.b64[0] = 0;
++	memset(ctx->m.b8, 0, sizeof(ctx->m.b8));
++	ctx->count = 0;
++}
++
++static void
++sha1_sw_update(SHA1_CTX *ctx, const void *data, size_t len)
++{
++	const uint8_t *p = (const uint8_t *)data;
++	size_t current = (size_t)(ctx->c.b64[0] % 64);
++	ctx->c.b64[0] += len;
++
++	while (len > 0) {
++		size_t take = 64 - current;
++		if (take > len) {
++			take = len;
++		}
++		memcpy(&ctx->m.b8[current], p, take);
++		current += take;
++		p += take;
++		len -= take;
++
++		if (current == 64) {
++			sha1_sw_transform(ctx->h.b32, ctx->m.b8);
++			current = 0;
++		}
++	}
++}
++
++static void
++sha1_sw_final(void *digest, SHA1_CTX *ctx)
++{
++	uint64_t total_bits = ctx->c.b64[0] * 8;
++	size_t current = (size_t)(ctx->c.b64[0] % 64);
++	uint8_t *out = (uint8_t *)digest;
++	int i;
++
++	ctx->m.b8[current++] = 0x80;
++
++	if (current > 56) {
++		memset(&ctx->m.b8[current], 0, 64 - current);
++		sha1_sw_transform(ctx->h.b32, ctx->m.b8);
++		current = 0;
++	}
++	memset(&ctx->m.b8[current], 0, 56 - current);
++
++	for (i = 7; i >= 0; i--) {
++		ctx->m.b8[56 + (7 - i)] = (uint8_t)((total_bits >> (i * 8)) & 0xff);
++	}
++	sha1_sw_transform(ctx->h.b32, ctx->m.b8);
++
++	for (i = 0; i < 5; i++) {
++		out[i * 4]     = (uint8_t)((ctx->h.b32[i] >> 24) & 0xff);
++		out[i * 4 + 1] = (uint8_t)((ctx->h.b32[i] >> 16) & 0xff);
++		out[i * 4 + 2] = (uint8_t)((ctx->h.b32[i] >> 8) & 0xff);
++		out[i * 4 + 3] = (uint8_t)(ctx->h.b32[i] & 0xff);
++	}
++}
++
+ 
+ 
+ static uint64_t
+@@ -40,6 +158,10 @@ SHA1ToDi(const struct ccdigest_info *di, SHA1_CTX *sha1_ctx, struct ccdigest_ctx
+ void
+ SHA1Init(SHA1_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha1_sw_init(ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+@@ -51,6 +173,10 @@ SHA1Init(SHA1_CTX *ctx)
+ void
+ SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
+ {
++	if (!g_crypto_funcs) {
++		sha1_sw_update(ctx, data, len);
++		return;
++	}
+ 	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+@@ -62,6 +188,10 @@ SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
+ void
+ SHA1Final(void *digest, SHA1_CTX *ctx)
+ {
++	if (!g_crypto_funcs) {
++		sha1_sw_final(digest, ctx);
++		return;
++	}
+ 	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
+ 	ccdigest_di_decl(di, di_ctx);
+ 
 diff --git a/libsa/conf/Makefile.template b/libsa/conf/Makefile.template
 index bb36037..3b08b38 100644
 --- a/libsa/conf/Makefile.template

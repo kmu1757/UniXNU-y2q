@@ -102,7 +102,9 @@ def empty_nvram_proxy():
     image = bytearray(8192)
     image[:16] = header(b'nvram', 32)
     image[32:48] = header(b'common', 16 + 2048)
-    free_at = 32 + 16 + 2048
+    system_at = 32 + 16 + 2048
+    image[system_at:system_at + 16] = header(b'system', 16 + 2048)
+    free_at = system_at + 16 + 2048
     image[free_at:free_at + 16] = header(b'free', len(image) - free_at)
     struct.pack_into('<I', image, 16, zlib.adler32(image[20:]))
     return [
