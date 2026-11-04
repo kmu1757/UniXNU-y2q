@@ -141,6 +141,7 @@ def main():
     layout = json.loads(args.volume_layout.read_text()) if args.volume_layout else {}
     root_uuid = (layout.get('os') or {}).get('uuid')
     chip_id = args.chip_id or str(board.get('payload', {}).get('adt', {}).get('chip_id', '0x8010'))
+    board_name = board.get('board', {}).get('description') or board.get('board', {}).get('name') or BOARD
 
     spec = board.get('payload', {})
     boot_args = 'keepsyms=1 cpus=%d' % args.cpus
@@ -157,7 +158,7 @@ def main():
         'system_volume_auth_blob_sha256': None,
         'kernel_sha384': None,
         'loader_sha384': None,
-        'board': BOARD,
+        'board': board_name,
         'boot_args': boot_args,
         'root_volume_uuid': root_uuid,
         'requested_memory_window_bytes': args.window_size,
@@ -223,6 +224,16 @@ def main():
               'image_sha256': sha256(target), 'hardware_tested': False}
     (work / 'boot/pong-boot.json').write_text(json.dumps(record, indent=2) + '\n')
     (work / 'payload/pong-adt.json').write_text(json.dumps(record, indent=2) + '\n')
+    payload_json = work / 'payload/payload.json'
+    if payload_json.is_file():
+        try:
+            pj = json.loads(payload_json.read_text())
+            pj['payload_sha256'] = sha256(payload)
+            pj['payload_bytes'] = payload.stat().st_size
+            pj['adt_sha256'] = sha256(generated)
+            payload_json.write_text(json.dumps(pj, indent=2) + '\n')
+        except Exception:
+            pass
     manifest_path = work / 'package.manifest.json'
     if manifest_path.is_file():
         package = json.loads(manifest_path.read_text())
