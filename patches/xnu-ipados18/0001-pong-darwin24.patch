@@ -3271,7 +3271,7 @@ new file mode 100644
 index 0000000..86a48e9
 --- /dev/null
 +++ b/bsd/pthread/pthread_kext.c
-@@ -0,0 +1,4554 @@
+@@ -0,0 +1,4562 @@
 +/*
 + * Standalone pthread kernel extension (com.apple.kec.pthread) for XNU.
 + * Built into the kernel for prelink=false environments.
@@ -3327,10 +3327,32 @@ index 0000000..86a48e9
 +#define TARGET_CPU_ARM64 0
 +#endif
 +#endif
++
 +#include <sys/cdefs.h>
 +#include <sys/types.h>
 +#include <sys/param.h>
 +#include <sys/queue.h>
++#include <mach/mach_types.h>
++
++/*
++ * Define full struct ksyn_waitq_element and _SYS_PTHREAD_INTERNAL_H_
++ * BEFORE including sys/user.h, so that sys/user.h uses the full struct
++ * instead of the opaque stub in sys/pthread_internal.h.
++ */
++struct ksyn_waitq_element {
++	TAILQ_ENTRY(ksyn_waitq_element) kwe_list;	/* link to other list members */
++	void *          kwe_kwqqueue;			/* queue blocked on */
++	thread_t        kwe_thread;
++	uint16_t        kwe_state;			/* state */
++	uint16_t        kwe_flags;
++	uint32_t        kwe_lockseq;			/* the sequence of the entry */
++	uint32_t	kwe_count;			/* upper bound on number of matches still pending */
++	uint32_t	kwe_psynchretval;		/* thread retval */
++	void		*kwe_uth;			/* uthread */
++};
++typedef struct ksyn_waitq_element * ksyn_waitq_element_t;
++#define _SYS_PTHREAD_INTERNAL_H_ 1
++
 +#include <sys/resourcevar.h>
 +#include <sys/kauth.h>
 +#include <sys/systm.h>
@@ -3352,7 +3374,6 @@ index 0000000..86a48e9
 +#include <sys/pthread_shims.h>
 +
 +#include <mach/mach_port.h>
-+#include <mach/mach_types.h>
 +#include <mach/semaphore.h>
 +#include <mach/sync_policy.h>
 +#include <mach/task.h>
@@ -3367,6 +3388,7 @@ index 0000000..86a48e9
 +#include <mach/thread_act.h>
 +#include <mach/shared_region.h>
 +#include <mach/vm_region.h>
++#include <mach/vm_statistics.h>
 +
 +#include <kern/kern_types.h>
 +#include <kern/task.h>
@@ -3409,8 +3431,6 @@ index 0000000..86a48e9
 +#define _PTHREAD_SET_SELF_WQ_KEVENT_UNBIND 0x10
 +#define _PTHREAD_SET_SELF_ALTERNATE_CLUSTER 0x20
 +#define _PTHREAD_SET_SELF_QOS_OVERRIDE_FLAG 0x40
-+
-+struct ksyn_waitq_element;
 +
 +/*
 + * Copyright (c) 2000-2013 Apple Inc. All rights reserved.
@@ -3754,8 +3774,8 @@ index 0000000..86a48e9
 + * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
 + */
 +
-+#ifndef _SYS_PTHREAD_INTERNAL_H_
-+#define _SYS_PTHREAD_INTERNAL_H_
++
++
 +
 +
 +
@@ -3852,24 +3872,13 @@ index 0000000..86a48e9
 +
 +extern pthread_callbacks_t pthread_kern;
 +
-+struct ksyn_waitq_element {
-+	TAILQ_ENTRY(ksyn_waitq_element) kwe_list;	/* link to other list members */
-+	void *          kwe_kwqqueue;			/* queue blocked on */
-+	thread_t        kwe_thread;
-+	uint16_t        kwe_state;			/* state */
-+	uint16_t        kwe_flags;
-+	uint32_t        kwe_lockseq;			/* the sequence of the entry */
-+	uint32_t	kwe_count;			/* upper bound on number of matches still pending */
-+	uint32_t	kwe_psynchretval;		/* thread retval */
-+	void		*kwe_uth;			/* uthread */
-+};
-+typedef struct ksyn_waitq_element * ksyn_waitq_element_t;
++/* struct ksyn_waitq_element defined in top header */
 +
 +#define PTH_DEFAULT_STACKSIZE 512*1024
 +#define MAX_PTHREAD_SIZE 64*1024
 +
 +/* exported from the kernel but not present in any headers. */
-+extern thread_t port_name_to_thread(mach_port_name_t port_name);
++
 +
 +/* function declarations for pthread_kext.c */
 +void pthread_init(void);
@@ -3949,7 +3958,7 @@ index 0000000..86a48e9
 +// magical `nkevents` values for _pthread_wqthread
 +#define WORKQ_EXIT_THREAD_NKEVENT   (-1)
 +
-+#endif /* _SYS_PTHREAD_INTERNAL_H_ */
++
 +
 +/*
 + * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
@@ -4434,7 +4443,7 @@ index 0000000..86a48e9
 +ksyn_wqunlock(ksyn_wait_queue_t kwq)
 +{
 +	/* remove timeout override when rdar://96649414 is addressed */
-+	pthread_kern->abandon_preemption_disable_measurement();
++	/* pthread_kern->abandon_preemption_disable_measurement(); */
 +	lck_spin_unlock(&kwq->kw_lock);
 +}
 +
@@ -4976,7 +4985,7 @@ index 0000000..86a48e9
 +	}
 +	
 +	if (threadport != 0) {
-+		th = port_name_to_thread((mach_port_name_t)threadport);
++		th = port_name_to_thread((mach_port_name_t)threadport, PORT_INTRANS_OPTIONS_NONE);
 +		if (th == THREAD_NULL) {
 +			return ESRCH;
 +		}
@@ -6808,8 +6817,7 @@ index 0000000..86a48e9
 +#undef pthread_rwlock_t
 +
 +
-+// <rdar://problem/26158937> panic() should be marked noreturn
-+extern void panic(const char *string, ...) __printflike(1,2) __dead2;
++
 +
 +//#include <sys/proc_internal.h>
 +//#include <sys/sysproto.h>
@@ -7529,7 +7537,7 @@ index 0000000..86a48e9
 +
 +		int error = pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
 +		if (error != KERN_SUCCESS) {
-+			panic(__func__ ": thread_set_wq_state failed: %d", error);
++			panic("workq_setup_thread: thread_set_wq_state failed: %d", error);
 +		}
 +	} else {
 +		x86_thread_state64_t state64 = {
@@ -7547,7 +7555,7 @@ index 0000000..86a48e9
 +
 +		int error = pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state64);
 +		if (error != KERN_SUCCESS) {
-+			panic(__func__ ": thread_set_wq_state failed: %d", error);
++			panic("workq_setup_thread: thread_set_wq_state failed: %d", error);
 +		}
 +	}
 +#elif defined(__arm__) || defined(__arm64__)
@@ -7567,7 +7575,7 @@ index 0000000..86a48e9
 +
 +		int error = pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
 +		if (error != KERN_SUCCESS) {
-+			panic(__func__ ": thread_set_wq_state failed: %d", error);
++			panic("workq_setup_thread: thread_set_wq_state failed: %d", error);
 +		}
 +	} else {
 +#if defined(__arm64__)
@@ -7585,7 +7593,7 @@ index 0000000..86a48e9
 +
 +		int error = pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state);
 +		if (error != KERN_SUCCESS) {
-+			panic(__func__ ": thread_set_wq_state failed: %d", error);
++			panic("workq_setup_thread: thread_set_wq_state failed: %d", error);
 +		}
 +#else /* defined(__arm64__) */
 +		panic("Shouldn't have a 64-bit thread on a 32-bit kernel...");
@@ -7680,9 +7688,9 @@ index 0000000..86a48e9
 +		vm_map_offset_t th_page = vm_map_trunc_page_mask(th_addrs.self, mask);
 +		vm_map_offset_t stk_page = vm_map_trunc_page_mask(th_addrs.stack_top - 1, mask);
 +		if (th_page != stk_page) {
-+			vm_fault(map, stk_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
++			vm_fault(map, stk_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, VM_KERN_MEMORY_NONE, THREAD_UNINT, NULL, 0);
 +		}
-+		vm_fault(map, th_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
++		vm_fault(map, th_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, VM_KERN_MEMORY_NONE, THREAD_UNINT, NULL, 0);
 +	}
 +
 +	if (setup_flags & WQ_SETUP_EXIT_THREAD) {
