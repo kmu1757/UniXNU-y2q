@@ -44,3 +44,17 @@ __pycache__/
 /local.toml
 /unixnu.local.toml
 /build-services*.log
+
+# Step 5 (root mount): Apple userland lives in iOSPort/private/, never here.
+# dyld_shared_cache_arm64 has NO extension, so none of the patterns above catch it.
+dyld_shared_cache_arm64*
+/private/
+*.apfs
+*.sparseimage
+*.sparsebundle/
+*.shsh
+*.shsh2
+# sealed blobs are kept outside the repo too
+*.gpg
+*.asc
+*.age
