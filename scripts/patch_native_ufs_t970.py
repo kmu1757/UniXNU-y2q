@@ -155,24 +155,12 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
     if t_cpp.is_file():
         txt = t_cpp.read_text(encoding='utf-8')
         if 'pong_smmu_lease_lock(void) {' not in txt:
-            txt = txt.replace(
-                'extern "C" bool pong_smmu_lease_lock(void) __attribute__((weak_import));\nextern "C" void pong_smmu_lease_unlock(void) __attribute__((weak_import));',
-                '__attribute__((weak)) extern "C" bool pong_smmu_lease_lock(void) { return true; }\n__attribute__((weak)) extern "C" void pong_smmu_lease_unlock(void) {}'
-            )
+            target_smmu = 'extern "C" bool pong_smmu_lease_lock(void) __attribute__((weak_import));\nextern "C" void pong_smmu_lease_unlock(void) __attribute__((weak_import));'
+            repl_smmu = '__attribute__((weak)) extern "C" bool pong_smmu_lease_lock(void) { return true; }\n__attribute__((weak)) extern "C" void pong_smmu_lease_unlock(void) {}'
+            assert target_smmu in txt, "PongUfsTransport.cpp weak SMMU target not found"
+            txt = txt.replace(target_smmu, repl_smmu)
 
-        # Update RootDiskWindow
-        if 'uint64_t baseByte;' in txt:
-            txt = txt.replace('uint64_t baseByte;', 'uint64_t fileOffset;')
-
-        # Update reportWriteProtection
-        if 'window.baseByte & 4095' in txt:
-            txt = txt.replace('window.baseByte & 4095', 'window.fileOffset & 4095')
-
-        # Update PongUfsBlock::init
-        if 'selected.baseByte & 4095' in txt:
-            txt = txt.replace('selected.baseByte & 4095', 'selected.fileOffset & 4095')
-
-        # Update PongUfsBlock::start
+        # Update PongUfsBlock::start FIRST before any baseByte string replacements
         old_start = """  gRootDiagnostic.stage = "first root read";
   if (hostRead4k(0, window.baseByte / 4096, 1, bounce) != kIOReturnSuccess)
     return transportFailure("first root read");
@@ -223,8 +211,8 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
   IOLog("PONG_UFS: SHNGROOT %s first read complete signature=1 offset=%llx bytes=%llx extents=%u; publish 512-byte %s disk\\n",
         window.name, window.fileOffset, window.size, gExtentCount, writableWindow ? "read-write" : "read-only");"""
 
-        if old_start in txt:
-            txt = txt.replace(old_start, new_start)
+        assert old_start in txt, "PongUfsTransport.cpp old_start not found"
+        txt = txt.replace(old_start, new_start)
 
         # Update PongUfsBlock::doAsyncReadWrite
         old_rw = """  while (done < bytes) {
@@ -314,24 +302,41 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
     done += take;
   }"""
 
-        if old_rw in txt:
-            txt = txt.replace(old_rw, new_rw)
+        assert old_rw in txt, "PongUfsTransport.cpp old_rw not found"
+        txt = txt.replace(old_rw, new_rw)
+
+        # Update RootDiskWindow struct definition
+        assert 'uint64_t baseByte;' in txt, "PongUfsTransport.cpp baseByte struct member not found"
+        txt = txt.replace('uint64_t baseByte;', 'uint64_t fileOffset;')
+
+        # Update reportWriteProtection
+        assert 'window.baseByte & 4095' in txt, "PongUfsTransport.cpp reportWriteProtection baseByte not found"
+        txt = txt.replace('window.baseByte & 4095', 'window.fileOffset & 4095')
+
+        # Update PongUfsBlock::init
+        assert 'selected.baseByte & 4095' in txt, "PongUfsTransport.cpp init selected.baseByte not found"
+        txt = txt.replace('selected.baseByte & 4095', 'selected.fileOffset & 4095')
 
         # Update geometry check
-        txt = txt.replace(
-            'if (layout.userdataFirst != kPongUserdataFirst4k || layout.userdataLast != kPongUserdataLast4k ||\n      layout.userdataLast >= gHost.blocks)',
-            'if (layout.userdataFirst > layout.userdataLast || layout.userdataLast >= gHost.blocks)'
-        )
+        old_geo = "if (layout.userdataFirst != kPongUserdataFirst4k || layout.userdataLast != kPongUserdataLast4k ||\n      layout.userdataLast >= gHost.blocks)"
+        new_geo = "if (layout.userdataFirst > layout.userdataLast || layout.userdataLast >= gHost.blocks)"
+        assert old_geo in txt, "PongUfsTransport.cpp old_geo not found"
+        txt = txt.replace(old_geo, new_geo)
 
-        # Update gRootWindows population
-        old_win = 'gRootWindows[gRootWindowCount++] = {item.name, item.product, item.signature, item.offset,\n        layout.userdataFirst * 4096ULL + layout.window[index].offset, layout.window[index].size};'
-        new_win = 'gRootWindows[gRootWindowCount++] = {item.name, item.product, item.signature, item.offset,\n        layout.window[index].offset, layout.window[index].size};'
-        if old_win in txt:
-            txt = txt.replace(old_win, new_win)
+        # Update gRootWindows assignment:
+        # layout.userdataFirst * 4096ULL + layout.window[index].offset -> layout.window[index].offset
+        old_gw = "layout.userdataFirst * 4096ULL + layout.window[index].offset,"
+        new_gw = "layout.window[index].offset,"
+        assert old_gw in txt, "PongUfsTransport.cpp old_gw not found"
+        txt = txt.replace(old_gw, new_gw)
+
+        assert 'baseByte' not in txt, "PongUfsTransport.cpp unexpected baseByte remaining!"
 
         t_cpp.write_text(txt, encoding='utf-8')
         print(f'Applied PongUfsTransport extents and translation patch to {t_cpp}', flush=True)
 
 if __name__ == '__main__':
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('drivers/NativeUfs')
-    patch_native_ufs(target)
+    if len(sys.argv) > 1:
+        patch_native_ufs(Path(sys.argv[1]))
+    else:
+        patch_native_ufs(Path('.'))
