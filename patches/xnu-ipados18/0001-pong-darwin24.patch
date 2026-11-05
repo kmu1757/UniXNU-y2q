@@ -7774,7 +7774,7 @@ index 0000000..86a48e9
 +		pthread_mutex_default_policy = policy_bootarg;
 +	}
 +
-+	sysctl_register_oid(&sysctl__kern_pthread_mutex_default_policy);
++	/* sysctl_register_oid not needed: SYSCTL_INT registers early via __init_entry_set */
 +}
 +//
 +//  pthread.c
