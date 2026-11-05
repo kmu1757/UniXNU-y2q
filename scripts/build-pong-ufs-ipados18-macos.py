@@ -71,18 +71,36 @@ def main():
     (out / 'transport-build.log').write_text(result.stdout + result.stderr)
     if result.returncode:
         raise SystemExit(result.stderr)
+    # PONG_STORAGE_BINDING picks where IOBlockStorageDevice (the base class of
+    # PongUfsBlock) comes from. 'self' compiles IOStorageFamily-323's own
+    # IOBlockStorageDevice.cpp into this archive; it is the only choice that works
+    # in an image without Apple's kernelcache merged in. 'original' binds to the
+    # Apple 22H374 addresses, which exist only in the locally prelinked image.
+    binding = os.environ.get('PONG_STORAGE_BINDING', 'self')
+    if binding not in ('self', 'original'):
+        raise SystemExit('PONG_STORAGE_BINDING must be self or original')
     subprocess.run([str(Path(os.sys.executable)), str(DEVICE / 'scripts/bind-ipados18-storage.py'),
-                    '--object', str(transport), '--output', str(out)], check=True, env=env)
+                    '--object', str(transport), '--output', str(out), '--mode', binding], check=True, env=env)
+    if binding == 'original':
+        base_objects = [out / 'original-bindings.o']
+    else:
+        # prepare-ipados18-storage.py compiled this exact source with these headers
+        # to read the vtable layout; strip its debug info and link that object.
+        reference = DEVICE / 'mac-build/storage-abi18/reference.o'
+        base_object = out / 'IOBlockStorageDevice.o'
+        shutil.copyfile(reference, base_object)
+        subprocess.run(['xcrun', 'strip', '-S', str(base_object)], check=True, env=env)
+        base_objects = [base_object]
     archive = out / 'libNativeUfs.a'
     archive.unlink(missing_ok=True)
-    subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj), str(transport), str(out / 'original-bindings.o')],
+    subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj), str(transport)] + [str(o) for o in base_objects],
                    check=True, env=env)
     report = {
         'host': platform.machine(), 'target': 'arm64-apple-ios18.0',
         'build_tree': str(tree),
         'source': str(source),
         'image_verification': 'skipped by request' if args.skip_image_verification else 'digest recorded',
-        'read_write_capable': True, 'runtime_write_arg': 'pong_ufs_readwrite=1',
+        'storage_binding': binding, 'read_write_capable': True, 'runtime_write_arg': 'pong_ufs_readwrite=1',
         'write_scope': 'declared SHNGROOT OS/SystemOS/Data windows; each mount retains its own flags',
         'storage_commands': ['NOP', 'READ ATTRIBUTE', 'START STOP ACTIVE', 'TEST UNIT READY', 'READ CAPACITY', 'READ(10)', 'WRITE(10) FUA', 'SYNCHRONIZE CACHE(10)'],
         'smmu_writes': 'exclusive UFS SID 0xe0 only after queue stop',

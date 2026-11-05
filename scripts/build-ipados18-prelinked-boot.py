@@ -31,6 +31,7 @@ def main():
  native=(a.artifact_dir/'mach.development.pong').read_bytes();original=arm64_image(a.original.read_bytes());m=macho(original)
  bindings=json.loads((ROOT/'mac-build/native-ufs/bindings.json').read_text())
  if bindings['build']!='22H374':raise SystemExit('Storage imports belong to another restore')
+ if bindings.get('binding_mode')!='original':raise SystemExit('The prelinked image needs NativeUfs bound to the Apple kernelcache; rebuild with PONG_STORAGE_BINDING=original')
  base=min(s['va'] for s in m['segments'] if s['name'] in COALESCED and s['size']);slide=int(bindings['fixed_prelink_base'],16)-base
  roots=['com.apple.kec.corecrypto','com.apple.kec.pthread','com.apple.filesystems.apfs','com.apple.kec.Compression','com.apple.AppleFSCompression.AppleFSCompressionTypeZlib']
  library={'com.apple.driver.AppleARMWatchdogTimer','com.apple.driver.AppleARMPlatform','com.apple.driver.ApplePMGR','com.apple.driver.AppleEffaceableStorage','com.apple.driver.AppleMobileFileIntegrity'}

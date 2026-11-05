@@ -548,6 +548,13 @@ jobs:
           if report.get('hardware_tested') is not True:
               print('note: no device has run this boot image')
           PY
+      - name: kernel symbols stay inside the image
+        run: |
+          set -euo pipefail
+          # A symbol bound to an address no segment covers (an Apple kernelcache
+          # address without that kernelcache merged in) faults on first use.
+          kernel=$(find UniXNU/out/pong -path '*/kernel/kernel.macho' | head -n 1)
+          python3 device/scripts/check-image-symbols.py "${kernel}"
       - name: collect the products
         if: always()
         run: |

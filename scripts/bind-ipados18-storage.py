@@ -4,9 +4,16 @@ import argparse,json,struct,subprocess,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'kits/NativePrelink'))
 import native_prelink as np
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--object',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--object',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
+p.add_argument('--mode',choices=('self','original'),default='self',help='self: IOBlockStorageDevice is compiled into the image (the object build-pong-ufs links). original: bind to the Apple 22H374 kernelcache addresses, valid only in the locally prelinked image that merges that kernelcache')
+a=p.parse_args()
 r=json.loads((ROOT/'mac-build/storage-abi18/bindings-layout.json').read_text())
 if r['build']!='22H374':raise SystemExit('Wrong target storage bindings')
+if a.mode=='self':
+ # The base class lives in this image; nothing is imported from an Apple address.
+ r.update(bindings={},binding_mode='self-contained',constructor='compiled from IOStorageFamily-323 IOBlockStorageDevice.cpp',image_verification='skipped by request')
+ r.pop('fixed_prelink_base',None);r.pop('methods',None)
+ (a.output/'bindings.json').write_text(json.dumps(r,indent=2)+'\n');print('UFS carries its own IOBlockStorageDevice; no Apple address bindings');raise SystemExit(0)
 b=a.object.read_bytes();m=np.macho(b);at=next(o for c,o,l in m['commands'] if c==2);sy,n,st,sz=struct.unpack_from('<4I',b,at+8)
 undefined=[]
 for i in range(n):
@@ -24,5 +31,5 @@ text+=' str x8,[x0]\n ldp x29,x30,[sp],#16\n ret\n'
 text+=f'.globl {dtor}\n{dtor}:\n b __ZN9IOServiceD2Ev\n'
 source=a.output/'original-bindings.S';source.write_text(text)
 subprocess.run(['xcrun','--sdk','iphoneos','clang','-target','arm64-apple-ios18.0','-c',str(source),'-o',str(a.output/'original-bindings.o')],check=True)
-r.update(bindings={n:r['bindings'][n] for n in undefined if n in r['bindings']},constructor='public IOBlockStorageDevice forwarding definition, Darwin 24 IOService ABI',image_verification='skipped by request')
+r.update(bindings={n:r['bindings'][n] for n in undefined if n in r['bindings']},binding_mode='original',constructor='public IOBlockStorageDevice forwarding definition, Darwin 24 IOService ABI',image_verification='skipped by request')
 (a.output/'bindings.json').write_text(json.dumps(r,indent=2)+'\n');print('Linked UFS with actual 22H374 storage dispatch and public base constructor/destructor')
