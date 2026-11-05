@@ -22,9 +22,20 @@ index 4f7a231..c089f19 100644
    return false;
  }
 diff --git a/PongUfsTransport.cpp b/PongUfsTransport.cpp
-index 256fc97..5275dfe 100644
+index 256fc97..7ebc7ab 100644
 --- a/PongUfsTransport.cpp
 +++ b/PongUfsTransport.cpp
+@@ -26,8 +26,8 @@
+ #include "../PongProbe.h"
+ // Power/USB/WLAN share the Apps SMMU. UFS also builds without that optional
+ // aggregate, so weak imports retain the single-owner storage-only profile.
+-extern "C" bool pong_smmu_lease_lock(void) __attribute__((weak_import));
+-extern "C" void pong_smmu_lease_unlock(void) __attribute__((weak_import));
++__attribute__((weak)) extern "C" bool pong_smmu_lease_lock(void) { return true; }
++__attribute__((weak)) extern "C" void pong_smmu_lease_unlock(void) {}
+ 
+ namespace {
+ #include "RootTransportLayout.h"
 @@ -464,8 +464,8 @@ bool PongUfsBlock::start(IOService *provider) {
      PongProbeRecord(4, "ufs-transport", PongProbeFail, detail, window.baseByte);
      return false;
