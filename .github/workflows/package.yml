@@ -56,6 +56,10 @@ on:
         description: "Optional sha256 of that IPSW; a mismatch stops the run."
         type: string
         default: ""
+      boot_args_extra:
+        description: "Extra kernel boot-args appended to board.toml kernel_args (for example a device-specific pong_shngroot_4k=<lba>). Empty adds nothing."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -465,6 +469,7 @@ jobs:
       - name: boot image for the firmware
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          BOOT_ARGS_EXTRA: ${{ inputs.boot_args_extra }}
         run: |
           set -euo pipefail
           # `release` writes the document's artifacts: boot/boot.img with the raw
@@ -478,12 +483,20 @@ jobs:
           #              the pong,* properties the kernel reads from /arm-io.
           #   container  Android boot v4 with an empty kernel slot and the payload
           #              in the PONGFAT1 envelope PongBootMemoryDxe publishes.
+          #
+          # boot_args_extra carries values that belong to one device, such as the
+          # physical LBA of the root image, so they stay out of board.toml.
+          extra=()
+          if [ -n "${BOOT_ARGS_EXTRA//[[:space:]]/}" ]; then
+            extra=(--extra-kernel-args "${BOOT_ARGS_EXTRA}")
+          fi
           python3 device/scripts/finalize-pong-adt.py \
             --work-dir "UniXNU/out/pong/${OS_PROFILE}/pong_ipados18_ci" \
             --uefi uefi-pong \
             --unique-chip-id "${UNIXNU_UNIQUE_CHIP_ID}" \
             --volume-layout ci-volume-layout.json \
-            --ufs-probe
+            --ufs-probe \
+            ${extra[@]+"${extra[@]}"}
       - name: check the products
         run: |
           set -euo pipefail

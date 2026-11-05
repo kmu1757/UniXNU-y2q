@@ -127,6 +127,10 @@ def main():
                         help='publish the UFS nub; a local bring-up image leaves it out')
     parser.add_argument('--no-development-debug', dest='development_debug', action='store_false',
                         help='leave the DT debugger gate off; a local run turns it on')
+    parser.add_argument('--extra-kernel-args', action='append', default=[], metavar='ARGS',
+                        help='extra boot-args appended after board.toml kernel_args; whitespace separated, '
+                             'repeatable. Keeps device-specific values (for example a physical LBA) out of '
+                             'the public repository')
     args = parser.parse_args()
 
     work = args.work_dir.resolve()
@@ -147,6 +151,21 @@ def main():
     boot_args = 'keepsyms=1 cpus=%d' % args.cpus
     extra = [item for item in spec.get('kernel_args', []) if item.split('=', 1)[0] not in ('keepsyms', 'cpus')]
     boot_args += ''.join(' ' + item for item in extra)
+    # Injected arguments override a board.toml entry with the same key rather than
+    # repeating it: XNU's PE_parse_boot_argn takes the first occurrence.
+    injected = [item for chunk in args.extra_kernel_args for item in chunk.split()]
+    if injected:
+        injected_keys = {item.split('=', 1)[0] for item in injected}
+        kept = [item for item in boot_args.split(' ') if item.split('=', 1)[0] not in injected_keys]
+        boot_args = ' '.join(kept + injected)
+    # DarwinBoot copies the command line into a 1024-byte buffer and refuses more
+    # than 1000 bytes; fail here instead of letting the firmware drop it silently.
+    if not boot_args.isascii():
+        raise SystemExit('boot_args must be ASCII')
+    if len(boot_args) > 1000:
+        raise SystemExit(f'boot_args is {len(boot_args)} bytes, over the 1000-byte DarwinBoot limit')
+    # The length only: injected values are device specific and CI logs are public.
+    print(f'boot_args: {len(boot_args)} bytes, {len(injected)} injected argument(s)', flush=True)
     # The manifest a local run stages: scripts/build-ipados18-bootimg-local.py
     # writes exactly these keys, and with --skip-image-verification the digests
     # of the kernel and the loader stay null.

@@ -194,10 +194,10 @@ index 256fc97..5a297f0 100644
        break;
      }
 diff --git a/RootLayout.h b/RootLayout.h
-index 4a596c8..90bda39 100644
+index 4a596c8..bdb2d10 100644
 --- a/RootLayout.h
 +++ b/RootLayout.h
-@@ -54,6 +54,91 @@ static bool rootEntryUsed (const uint8_t *entry)
+@@ -54,6 +54,105 @@ static bool rootEntryUsed (const uint8_t *entry)
    return used != 0;
  }
  
@@ -251,31 +251,45 @@ index 4a596c8..90bda39 100644
 +}
 +
 +static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
-+  if (tableLba4k == 0) return false;
++  if (tableLba4k == 0) {
++    IOLog("PONG_UFS: SHNGEXT1 table LBA is zero; fall back to contiguous window\n");
++    return false;
++  }
 +  if (hostRead4k(0, tableLba4k, 1, gScratch) != kIOReturnSuccess) {
++    IOLog("PONG_UFS: SHNGEXT1 hostRead4k failed lba=%llx blocks=1; fall back to contiguous window\n", tableLba4k);
 +    return false;
 +  }
 +  const ShngExtentHeader *hdr = reinterpret_cast<const ShngExtentHeader *>(gScratch);
 +  if (hdr->magic != 0x31545845474e4853ULL) {
++    IOLog("PONG_UFS: SHNGEXT1 bad magic=%llx lba=%llx; fall back to contiguous window\n", hdr->magic, tableLba4k);
 +    return false;
 +  }
 +  if (hdr->version != 1 || hdr->extentCount == 0 || hdr->extentCount > kMaxExtents) {
++    IOLog("PONG_UFS: SHNGEXT1 bad version=%u extents=%u max=%u; fall back to contiguous window\n",
++          hdr->version, hdr->extentCount, kMaxExtents);
 +    return false;
 +  }
 +  uint32_t payloadBytes = sizeof(ShngExtentHeader) + hdr->extentCount * sizeof(ShngExtentEntry);
 +  uint32_t blocksNeeded = (payloadBytes + 4095) / 4096;
 +  if (blocksNeeded > (kDataMax / 4096)) {
++    IOLog("PONG_UFS: SHNGEXT1 table needs %u blocks, scratch holds %u; fall back to contiguous window\n",
++          blocksNeeded, (uint32_t)(kDataMax / 4096));
 +    return false;
 +  }
 +  if (blocksNeeded > 1) {
 +    if (hostRead4k(0, tableLba4k, blocksNeeded, gScratch) != kIOReturnSuccess) {
++      IOLog("PONG_UFS: SHNGEXT1 hostRead4k failed lba=%llx blocks=%u; fall back to contiguous window\n",
++            tableLba4k, blocksNeeded);
 +      return false;
 +    }
 +    hdr = reinterpret_cast<const ShngExtentHeader *>(gScratch);
 +  }
 +  const uint8_t *entriesData = gScratch + sizeof(ShngExtentHeader);
 +  uint32_t entriesBytes = hdr->extentCount * sizeof(ShngExtentEntry);
-+  if (rootCrc32(entriesData, entriesBytes) != hdr->crc32) {
++  uint32_t crcComputed = rootCrc32(entriesData, entriesBytes);
++  if (crcComputed != hdr->crc32) {
++    IOLog("PONG_UFS: SHNGEXT1 crc32 mismatch computed=%08x header=%08x extents=%u; fall back to contiguous window\n",
++          crcComputed, hdr->crc32, hdr->extentCount);
 +    return false;
 +  }
 +  const ShngExtentEntry *src = reinterpret_cast<const ShngExtentEntry *>(entriesData);
@@ -289,7 +303,7 @@ index 4a596c8..90bda39 100644
  // Find the partition named "userdata" in LUN 0's primary GPT (4096-byte sectors), then read the
  // manifest at its first block. Read-only. Returns false only if the GPT itself is unusable.
  static bool findRootLayout (RootLayout *layout, const char **why)
-@@ -141,6 +226,18 @@ static bool findRootLayout (RootLayout *layout, const char **why)
+@@ -141,6 +240,18 @@ static bool findRootLayout (RootLayout *layout, const char **why)
      *why = "no userdata partition";
      return false;
    }
@@ -308,7 +322,7 @@ index 4a596c8..90bda39 100644
    gRootDiagnostic.first = layout->userdataFirst;
    gRootDiagnostic.last = layout->userdataLast;
    gRootDiagnostic.stage = "root manifest";
-@@ -207,6 +304,13 @@ static bool findRootLayout (RootLayout *layout, const char **why)
+@@ -207,6 +318,13 @@ static bool findRootLayout (RootLayout *layout, const char **why)
            layout->windows = n;
            layout->imageBytes = imageBytes;
            layout->manifestStatus = 0;
