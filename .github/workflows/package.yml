@@ -453,7 +453,8 @@ jobs:
           PONG_LLVM: ${{ env.LLVM_KEG }}/bin
         run: |
           set -euo pipefail
-          args=(--os "${OS_PROFILE}" --uefi ../uefi-pong -j 3 --unique-chip-id "${UNIXNU_UNIQUE_CHIP_ID}")
+          ncpu=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+          args=(--os "${OS_PROFILE}" --uefi ../uefi-pong -j "${ncpu}" --unique-chip-id "${UNIXNU_UNIQUE_CHIP_ID}")
           # Without an original kernelcache the kernel step stages the native
           # build as kernel.macho, which is the bootable one. With prelink it
           # prelinks the extracted 22H374 kernelcache instead.
