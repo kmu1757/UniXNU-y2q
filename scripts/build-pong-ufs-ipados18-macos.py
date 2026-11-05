@@ -17,6 +17,59 @@ DEFAULT_TREE = pong_paths.build_tree(name='Pong-iPadOS18-native')
 DEVELOPER = pong_paths.developer_dir()
 
 
+def patch_native_ufs_for_t970(ufs_source: Path):
+    ufs_source = ufs_source.resolve()
+    # 1. NativeUfs.cpp: support SM8250 ufshc
+    n_cpp = ufs_source / 'NativeUfs.cpp'
+    if n_cpp.is_file():
+        txt = n_cpp.read_text(encoding='utf-8')
+        if 'sm8250-ufshc' not in txt:
+            txt = txt.replace(
+                'contains (bytes, data->getLength (), "qcom,sm8450-ufshc"));',
+                'contains (bytes, data->getLength (), "qcom,sm8450-ufshc") ||\n                     contains (bytes, data->getLength (), "qcom,sm8250-ufshc") ||\n                     contains (bytes, data->getLength (), "qcom,ufshc"));'
+            ).replace(
+                '!strcmp (bytes, "qcom,sm8450-ufshc"));',
+                '!strcmp (bytes, "qcom,sm8450-ufshc") ||\n                     !strcmp (bytes, "qcom,sm8250-ufshc") ||\n                     !strcmp (bytes, "qcom,ufshc"));'
+            )
+            n_cpp.write_text(txt, encoding='utf-8')
+            print(f'Applied SM8250 compatible patch to {n_cpp}', flush=True)
+
+    # 2. PongUfsTransport.cpp: weak SMMU stubs and generic SHNGROOT bounds
+    t_cpp = ufs_source / 'PongUfsTransport.cpp'
+    if t_cpp.is_file():
+        txt = t_cpp.read_text(encoding='utf-8')
+        if 'pong_smmu_lease_lock(void) {' not in txt:
+            txt = txt.replace(
+                'extern "C" bool pong_smmu_lease_lock(void) __attribute__((weak_import));\nextern "C" void pong_smmu_lease_unlock(void) __attribute__((weak_import));',
+                '__attribute__((weak)) extern "C" bool pong_smmu_lease_lock(void) { return true; }\n__attribute__((weak)) extern "C" void pong_smmu_lease_unlock(void) {}'
+            ).replace(
+                'gRootDiagnostic.first = kPongUserdataFirst4k;\n  gRootDiagnostic.last = kPongUserdataLast4k;',
+                'gRootDiagnostic.first = window.baseByte / 4096ULL;\n  gRootDiagnostic.last = (window.baseByte + window.size) / 4096ULL;'
+            ).replace(
+                'if (layout.userdataFirst != kPongUserdataFirst4k || layout.userdataLast != kPongUserdataLast4k ||\n      layout.userdataLast >= gHost.blocks)',
+                'if (layout.userdataFirst > layout.userdataLast || layout.userdataLast >= gHost.blocks)'
+            )
+            t_cpp.write_text(txt, encoding='utf-8')
+            print(f'Applied weak SMMU stubs and geometry patch to {t_cpp}', flush=True)
+
+    # 3. RootLayout.h: pinned SHNGROOT boot arg support (pong_shngroot_4k)
+    r_h = ufs_source / 'RootLayout.h'
+    if r_h.is_file():
+        txt = r_h.read_text(encoding='utf-8')
+        if 'pong_shngroot_4k' not in txt:
+            target = '  if (!found || layout->userdataLast < layout->userdataFirst) {\n    *why = "no userdata partition";\n    return false;\n  }\n'
+            addition = (
+                '  if (!found || layout->userdataLast < layout->userdataFirst) {\n    *why = "no userdata partition";\n    return false;\n  }\n'
+                '  uint64_t pinnedLba = 0;\n'
+                '  if (PE_parse_boot_argn ("pong_shngroot_4k", &pinnedLba, sizeof (pinnedLba)) && pinnedLba != 0) {\n'
+                '    layout->userdataFirst = pinnedLba;\n'
+                '    layout->userdataLast = pinnedLba + (20ULL * 1024 * 1024 * 1024 / 4096) - 1;\n'
+                '  }\n'
+            )
+            txt = txt.replace(target, addition)
+            r_h.write_text(txt, encoding='utf-8')
+            print(f'Applied pong_shngroot_4k pinned LBA patch to {r_h}', flush=True)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tree', type=Path, default=DEFAULT_TREE,
@@ -31,11 +84,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     subprocess.run([os.sys.executable, str(DEVICE/'scripts/prepare-ipados18-storage.py'), '--tree', str(tree)],check=True)
     ufs_source = DEVICE / 'drivers/NativeUfs'
-    patch = DEVICE / 'patches/native-ufs/0001-t970-rootlayout-pinned-shngroot.patch'
-    if patch.is_file():
-        check = subprocess.run(['git', 'apply', '--check', str(patch)], cwd=ufs_source, capture_output=True)
-        if check.returncode == 0:
-            subprocess.run(['git', 'apply', str(patch)], cwd=ufs_source, check=True)
+    patch_native_ufs_for_t970(ufs_source)
     source = DEVICE / 'drivers/NativeUfs/NativeUfs.cpp'
     framework = tree / '.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A'
     env = dict(os.environ, DEVELOPER_DIR=str(DEVELOPER))
