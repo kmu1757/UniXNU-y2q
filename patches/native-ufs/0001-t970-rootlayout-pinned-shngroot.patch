@@ -1,0 +1,64 @@
+diff --git a/NativeUfs.cpp b/NativeUfs.cpp
+index 4f7a231..c089f19 100644
+--- a/NativeUfs.cpp
++++ b/NativeUfs.cpp
+@@ -56,12 +56,16 @@ static bool compatible (IOService *provider)
+   if (OSData *data = OSDynamicCast (OSData, property)) {
+     const char *bytes = static_cast<const char *> (data->getBytesNoCopy ());
+     return bytes && (contains (bytes, data->getLength (), "qcom,sm8475-ufshc") ||
+-                     contains (bytes, data->getLength (), "qcom,sm8450-ufshc"));
++                     contains (bytes, data->getLength (), "qcom,sm8450-ufshc") ||
++                     contains (bytes, data->getLength (), "qcom,sm8250-ufshc") ||
++                     contains (bytes, data->getLength (), "qcom,ufshc"));
+   }
+   if (OSString *string = OSDynamicCast (OSString, property)) {
+     const char *bytes = string->getCStringNoCopy ();
+     return bytes && (!strcmp (bytes, "qcom,sm8475-ufshc") ||
+-                     !strcmp (bytes, "qcom,sm8450-ufshc"));
++                     !strcmp (bytes, "qcom,sm8450-ufshc") ||
++                     !strcmp (bytes, "qcom,sm8250-ufshc") ||
++                     !strcmp (bytes, "qcom,ufshc"));
+   }
+   return false;
+ }
+diff --git a/PongUfsTransport.cpp b/PongUfsTransport.cpp
+index 256fc97..5275dfe 100644
+--- a/PongUfsTransport.cpp
++++ b/PongUfsTransport.cpp
+@@ -464,8 +464,8 @@ bool PongUfsBlock::start(IOService *provider) {
+     PongProbeRecord(4, "ufs-transport", PongProbeFail, detail, window.baseByte);
+     return false;
+   }
+-  gRootDiagnostic.first = kPongUserdataFirst4k;
+-  gRootDiagnostic.last = kPongUserdataLast4k;
++  gRootDiagnostic.first = window.baseByte / 4096ULL;
++  gRootDiagnostic.last = (window.baseByte + window.size) / 4096ULL;
+   gRootDiagnostic.windowBytes = window.size;
+   const bool writableWindow = gHost.writable && !(window.baseByte & 4095) && !(window.size & 4095);
+   IOLog("PONG_UFS: SHNGROOT %s first read complete signature=1 base=%llx bytes=%llx; publish 512-byte %s disk\n",
+@@ -576,8 +576,7 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
+   RootLayout layout;
+   const char *why = nullptr;
+   if (!findRootLayout(&layout, &why)) return transportFailure(why);
+-  if (layout.userdataFirst != kPongUserdataFirst4k || layout.userdataLast != kPongUserdataLast4k ||
+-      layout.userdataLast >= gHost.blocks)
++  if (layout.userdataFirst > layout.userdataLast || layout.userdataLast >= gHost.blocks)
+     return transportFailure("Pong userdata geometry changed");
+   if (layout.manifestStatus) return transportFailure("invalid SHNGROOT manifest/hash/bounds");
+   static const struct { const char *name, *product, *signature; unsigned offset; } wanted[] = {
+diff --git a/RootLayout.h b/RootLayout.h
+index 4a596c8..25a733c 100644
+--- a/RootLayout.h
++++ b/RootLayout.h
+@@ -141,6 +141,11 @@ static bool findRootLayout (RootLayout *layout, const char **why)
+     *why = "no userdata partition";
+     return false;
+   }
++  uint64_t pinnedLba = 0;
++  if (PE_parse_boot_argn ("pong_shngroot_4k", &pinnedLba, sizeof (pinnedLba)) && pinnedLba != 0) {
++    layout->userdataFirst = pinnedLba;
++    layout->userdataLast = pinnedLba + (20ULL * 1024 * 1024 * 1024 / 4096) - 1;
++  }
+   gRootDiagnostic.first = layout->userdataFirst;
+   gRootDiagnostic.last = layout->userdataLast;
+   gRootDiagnostic.stage = "root manifest";

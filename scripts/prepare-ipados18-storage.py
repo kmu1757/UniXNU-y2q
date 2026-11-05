@@ -42,33 +42,45 @@ for g in m['segments']:
 methods=[]
 while vt+16+len(methods)*8 in rel:methods.append(rel[vt+16+len(methods)*8])
 if not 150<len(methods)<256:raise SystemExit('Unexpected public storage vtable size')
-b=np.arm64_image(a.kernel.read_bytes());m=np.macho(b);ex=np.exports(b,m);known={n:v for v,ns in ex.items() for n in ns}
-s=next(s for g in m['segments'] for s in g['sections'] if s['name']=='__info')
-info=np.unserialize_xml(b[s['fileoff']:s['fileoff']+s['size']].rstrip(b'\0'))
-e=next(e for e in info['_PrelinkInfoDictionary'] if e.get('CFBundleIdentifier')=='com.apple.iokit.IOStorageFamily')
-km=np.macho(b,np.backed_offset(m['segments'],e['_PrelinkExecutableLoadAddr'],32,len(b)))
-const=next(s for s in km['segments'] if s['name']=='__DATA_CONST');text=next(s for s in km['segments'] if s['name']=='__TEXT_EXEC')
-def read(va,size):
- at=np.backed_offset(m['segments'],va,size,len(b));return b[at:at+size]
-blob=read(const['va'],const['size']);matches=[];count=len(methods)
-for at in range(0,len(blob)-(count+2)*8+1,8):
- if blob[at:at+16]!=bytes(16):continue
- pointers=struct.unpack_from('<'+'Q'*count,blob,at+16)
- if sum(name in known for name in methods)>count//2 and all(pointers[i]==known[name] for i,name in enumerate(methods) if name in known):matches.append((const['va']+at,pointers))
-if len(matches)!=1:raise SystemExit(f'22H374 storage interface does not match the public class: {len(matches)} candidates')
-table,pointers=matches[0]
-def branch(pc,w):
- v=w&0x3ffffff;return pc+(v-(1<<26) if v&(1<<25) else v)*4
-def adrp(pc,w):
- v=((w>>5&0x7ffff)<<2)|(w>>29&3);return (pc&~4095)+(v-(1<<21) if v&(1<<20) else v)*4096
-# New kernelcache LTO can inline the abstract base constructor/destructor.
-# Their public definitions only forward to IOService; emit source thunks in
-# bind-ipados18-storage.py and bind the real original vtable/metaclass.
-x,add,ret=struct.unpack('<3I',read(pointers[7],12))
-if x&0x9f00001f!=0x90000000 or add&0xffc003ff!=0x91000000 or ret!=0xd65f03c0:raise SystemExit('22H374 storage metaclass getter layout changed')
-meta=adrp(pointers[7],x)+(add>>10&4095)
-base=min(s['va'] for s in m['segments'] if s['name'].startswith('__PRELINK') and s['size']);fixed=0xfffffff00b000000;slide=fixed-base
-bindings={name:pointers[i]+slide for i,name in enumerate(methods) if name not in known and name!='___cxa_pure_virtual'}
+seed_file=DEVICE/'configs/storage-seed-22H374.json'
+if a.kernel.is_file():
+ b=np.arm64_image(a.kernel.read_bytes());m=np.macho(b);ex=np.exports(b,m);known={n:v for v,ns in ex.items() for n in ns}
+ s=next(s for g in m['segments'] for s in g['sections'] if s['name']=='__info')
+ info=np.unserialize_xml(b[s['fileoff']:s['fileoff']+s['size']].rstrip(b'\0'))
+ e=next(e for e in info['_PrelinkInfoDictionary'] if e.get('CFBundleIdentifier')=='com.apple.iokit.IOStorageFamily')
+ km=np.macho(b,np.backed_offset(m['segments'],e['_PrelinkExecutableLoadAddr'],32,len(b)))
+ const=next(s for s in km['segments'] if s['name']=='__DATA_CONST');text=next(s for s in km['segments'] if s['name']=='__TEXT_EXEC')
+ def read(va,size):
+  at=np.backed_offset(m['segments'],va,size,len(b));return b[at:at+size]
+ blob=read(const['va'],const['size']);matches=[];count=len(methods)
+ for at in range(0,len(blob)-(count+2)*8+1,8):
+  if blob[at:at+16]!=bytes(16):continue
+  pointers=struct.unpack_from('<'+'Q'*count,blob,at+16)
+  if sum(name in known for name in methods)>count//2 and all(pointers[i]==known[name] for i,name in enumerate(methods) if name in known):matches.append((const['va']+at,pointers))
+ if len(matches)!=1:raise SystemExit(f'22H374 storage interface does not match the public class: {len(matches)} candidates')
+ table,pointers=matches[0]
+ def branch(pc,w):
+  v=w&0x3ffffff;return pc+(v-(1<<26) if v&(1<<25) else v)*4
+ def adrp(pc,w):
+  v=((w>>5&0x7ffff)<<2)|(w>>29&3);return (pc&~4095)+(v-(1<<21) if v&(1<<20) else v)*4096
+ x,add,ret=struct.unpack('<3I',read(pointers[7],12))
+ if x&0x9f00001f!=0x90000000 or add&0xffc003ff!=0x91000000 or ret!=0xd65f03c0:raise SystemExit('22H374 storage metaclass getter layout changed')
+ meta=adrp(pointers[7],x)+(add>>10&4095)
+ base=min(s['va'] for s in m['segments'] if s['name'].startswith('__PRELINK') and s['size']);fixed=0xfffffff00b000000;slide=fixed-base
+ known_filter=known
+elif seed_file.is_file():
+ seed=json.loads(seed_file.read_text())
+ table=int(seed['table'],16)
+ meta=int(seed['meta'],16)
+ fixed=int(seed['fixed'],16)
+ slide=int(seed['slide'],16)
+ pointers=[int(p,16) for p in seed['pointers']]
+ count=len(pointers)
+ if count!=len(methods):raise SystemExit(f'Storage seed pointer count ({count}) does not match method count ({len(methods)})')
+ known_filter={}
+else:
+ raise SystemExit(f'Neither kernelcache ({a.kernel}) nor seed file ({seed_file}) found')
+bindings={name:pointers[i]+slide for i,name in enumerate(methods) if name not in known_filter and name!='___cxa_pure_virtual'}
 bindings.update({'__ZN20IOBlockStorageDevice10gMetaClassE':meta+slide,'__ZTV20IOBlockStorageDevice':table+slide})
 report=dict(build='22H374',darwin='24.6.0',source=str(source),method_slots=count,fixed_prelink_base=hex(fixed),bindings={k:hex(v) for k,v in bindings.items()},methods=[dict(slot=i,reference_name=n) for i,n in enumerate(methods)],image_verification='skipped by request')
 (out/'bindings-layout.json').write_text(json.dumps(report,indent=2)+'\n');print(f'Derived {len(bindings)} original storage imports from 22H374 ({count} slots)')

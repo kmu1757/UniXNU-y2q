@@ -481,7 +481,8 @@ jobs:
             --work-dir "UniXNU/out/pong/${OS_PROFILE}/pong_ipados18_ci" \
             --uefi uefi-pong \
             --unique-chip-id "${UNIXNU_UNIQUE_CHIP_ID}" \
-            --volume-layout ci-volume-layout.json
+            --volume-layout ci-volume-layout.json \
+            --ufs-probe
       - name: check the products
         run: |
           set -euo pipefail

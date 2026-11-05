@@ -119,7 +119,6 @@ kernel_args = [
   "pong_skip_setup=1",
   "ignition_level=1",
   "dyld_flags=0x8",
-  "launchd_rd=md0",
   "pong_init_trace=1",
   "applog=1",
   "applog_name=launchd,backboardd,SpringBoard,containermanagerd,lsd,runningboardd,logd_helper,powerd",

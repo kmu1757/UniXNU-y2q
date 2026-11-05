@@ -30,6 +30,12 @@ def main():
     out = tree / 'build/native-ufs'
     out.mkdir(parents=True, exist_ok=True)
     subprocess.run([os.sys.executable, str(DEVICE/'scripts/prepare-ipados18-storage.py'), '--tree', str(tree)],check=True)
+    ufs_source = DEVICE / 'drivers/NativeUfs'
+    patch = DEVICE / 'patches/native-ufs/0001-t970-rootlayout-pinned-shngroot.patch'
+    if patch.is_file():
+        check = subprocess.run(['git', 'apply', '--check', str(patch)], cwd=ufs_source, capture_output=True)
+        if check.returncode == 0:
+            subprocess.run(['git', 'apply', str(patch)], cwd=ufs_source, check=True)
     source = DEVICE / 'drivers/NativeUfs/NativeUfs.cpp'
     framework = tree / '.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A'
     env = dict(os.environ, DEVELOPER_DIR=str(DEVELOPER))
