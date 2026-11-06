@@ -42,7 +42,11 @@ def compile_storage_family(command, out, env):
     patched = out / 'storage-family'
     patched.mkdir(parents=True, exist_ok=True)
     flags = [f for f in command[:command.index('-c')] if f not in ('-Wall', '-Wextra', '-Werror')]
-    flags += ['-w', '-I' + str(family), '-I' + str(patched)]
+    # IOPerfControl.h is not among the installed Kernel.framework headers of this tree; the
+    # XNU source has it (it only needs IOService.h, kern/bits.h and OSPtr.h). IOMediaBSDClient
+    # still uses 'register', which C++17 rejects as an error by default.
+    xnu_iokit = out.parent.parent / '.cache/xnu-work/iokit'
+    flags += ['-w', '-Wno-register', '-Wno-error', '-I' + str(family), '-I' + str(patched), '-I' + str(xnu_iokit)]
     jobs = []
     for name in STORAGE_FAMILY_SOURCES:
         source = family / (name + '.cpp')
