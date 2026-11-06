@@ -56,6 +56,11 @@ on:
         description: "Optional sha256 of that IPSW; a mismatch stops the run."
         type: string
         default: ""
+      storage_binding:
+        description: "NativeUfs base class: self compiles IOStorageFamily into the kernel (public image, no APFS); original binds to the Apple 22H374 kernelcache addresses and is only valid after the local prelink merge. Never publish an original-binding kernel as an image."
+        type: choice
+        options: ["self", "original"]
+        default: "self"
       boot_args_extra:
         description: "Extra kernel boot-args appended to board.toml kernel_args (for example a device-specific pong_shngroot_4k=<lba>). Empty adds nothing."
         type: string
@@ -75,6 +80,7 @@ env:
   IPSW_URL: ${{ inputs.ipsw_url }}
   IPSW_SHA256: ${{ inputs.ipsw_sha256 }}
   PRELINK: ${{ inputs.prelink }}
+  PONG_STORAGE_BINDING: ${{ inputs.storage_binding || 'self' }}
   # Pinned: `release`, its steps and this repository's scripts/package.sh are one
   # interface. Move both together.
   UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
@@ -549,6 +555,7 @@ jobs:
               print('note: no device has run this boot image')
           PY
       - name: kernel symbols stay inside the image
+        if: ${{ (inputs.storage_binding || 'self') == 'self' }}
         run: |
           set -euo pipefail
           # A symbol bound to an address no segment covers (an Apple kernelcache
