@@ -412,6 +412,42 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
         t_cpp.write_text(txt, encoding='utf-8')
         print(f'Applied PongUfsTransport extents and translation patch to {t_cpp}', flush=True)
 
+    # 4. PongUfsTransport.cpp: with the IOStorageFamily classes linked into the image
+    # (XNU_PONG_SELF_STORAGE=1) there is no kext to load; the kernel cannot load one
+    # this early anyway. Register their personalities instead. Without the flag the
+    # original kext-loading path is kept for the locally prelinked image.
+    t_cpp = ufs_source / 'PongUfsTransport.cpp'
+    if t_cpp.is_file():
+        txt = t_cpp.read_text(encoding='utf-8')
+        if 'pong_storage_family_start' not in txt:
+            old_load = r"""  OSReturn loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
+  if (loaded != kOSReturnSuccess) {
+    gRootDiagnostic.result = static_cast<uint32_t>(loaded);
+    return transportFailure("IOStorageFamily load/start failed");
+  }
+  loaded = OSKextLoadKextWithIdentifier("com.apple.filesystems.apfs");
+  if (loaded != kOSReturnSuccess) {
+    gRootDiagnostic.result = static_cast<uint32_t>(loaded);
+    return transportFailure("APFS load/start failed");
+  }
+"""
+            new_load = r"""#if defined(XNU_PONG_SELF_STORAGE) && XNU_PONG_SELF_STORAGE
+  // IOStorageFamily is compiled into this image, so there is nothing to load. The APFS
+  // kext is Apple's and is not part of a public image: media is published and readable,
+  // but no APFS volume will appear until that kext is merged in.
+  if (!pong_storage_family_start()) return transportFailure("built-in IOStorageFamily registration failed");
+  IOLog("PONG_UFS: built-in IOStorageFamily in use; no APFS kext in this image\n");
+#else
+""" + old_load + r"""#endif
+"""
+            assert txt.count(old_load) == 1, 'PongUfsTransport.cpp kext-load anchor not found'
+            txt = txt.replace(old_load, new_load)
+            old_head = 'extern "C" bool pong_ufs_transport_start(IOService *provider) {\n'
+            assert txt.count(old_head) == 1, 'PongUfsTransport.cpp transport_start anchor not found'
+            txt = txt.replace(old_head, 'extern "C" bool pong_storage_family_start(void);\n' + old_head)
+            t_cpp.write_text(txt, encoding='utf-8')
+            print(f'Applied built-in IOStorageFamily start to {t_cpp}', flush=True)
+
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         patch_native_ufs(Path(sys.argv[1]))

@@ -126,7 +126,7 @@ index 4f7a231..a2740dd 100644
        !(pong_ufs_report[ReportHostEnable] & 1U))
      return probeFailure ("host disabled or invalid version", pong_ufs_report[ReportHostEnable]);
 diff --git a/PongUfsTransport.cpp b/PongUfsTransport.cpp
-index 256fc97..5a297f0 100644
+index 256fc97..a0d34f3 100644
 --- a/PongUfsTransport.cpp
 +++ b/PongUfsTransport.cpp
 @@ -26,8 +26,8 @@
@@ -278,7 +278,37 @@ index 256fc97..5a297f0 100644
        }
      }
      IOLockUnlock(gHost.lock);
-@@ -576,8 +585,7 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
+@@ -547,6 +556,7 @@ IOReturn PongUfsBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block
+   completion->action(completion->target, completion->parameter, result, done);
+   return kIOReturnSuccess;
+ }
++extern "C" bool pong_storage_family_start(void);
+ extern "C" bool pong_ufs_transport_start(IOService *provider) {
+   if (gTransportAttempted) {
+     IOLog("PONG_UFS: transport attempt already completed; skip duplicate match\n");
+@@ -555,6 +565,13 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
+   gTransportAttempted = true;
+   // A built-in transport has no separate kext dependency record. Explicitly
+   // start the genuine family and its personalities before using its classes.
++#if defined(XNU_PONG_SELF_STORAGE) && XNU_PONG_SELF_STORAGE
++  // IOStorageFamily is compiled into this image, so there is nothing to load. The APFS
++  // kext is Apple's and is not part of a public image: media is published and readable,
++  // but no APFS volume will appear until that kext is merged in.
++  if (!pong_storage_family_start()) return transportFailure("built-in IOStorageFamily registration failed");
++  IOLog("PONG_UFS: built-in IOStorageFamily in use; no APFS kext in this image\n");
++#else
+   OSReturn loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
+   if (loaded != kOSReturnSuccess) {
+     gRootDiagnostic.result = static_cast<uint32_t>(loaded);
+@@ -565,6 +582,7 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
+     gRootDiagnostic.result = static_cast<uint32_t>(loaded);
+     return transportFailure("APFS load/start failed");
+   }
++#endif
+   // Original prelinked storage metadata must be initialized before allocation.
+   OSSharedPtr<const OSSymbol> name(OSSymbol::withCStringNoCopy("IOBlockStorageDevice"), OSNoRetain);
+   const OSMetaClass *meta = name ? OSMetaClass::getMetaClassWithName(name.get()) : nullptr;
+@@ -576,8 +594,7 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
    RootLayout layout;
    const char *why = nullptr;
    if (!findRootLayout(&layout, &why)) return transportFailure(why);
@@ -288,7 +318,7 @@ index 256fc97..5a297f0 100644
      return transportFailure("Pong userdata geometry changed");
    if (layout.manifestStatus) return transportFailure("invalid SHNGROOT manifest/hash/bounds");
    static const struct { const char *name, *product, *signature; unsigned offset; } wanted[] = {
-@@ -594,7 +602,7 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
+@@ -594,7 +611,7 @@ extern "C" bool pong_ufs_transport_start(IOService *provider) {
        if (strcmp(layout.window[index].name, item.name)) continue;
        if (gRootWindowCount >= 3) return transportFailure("too many SHNGROOT disks");
        gRootWindows[gRootWindowCount++] = {item.name, item.product, item.signature, item.offset,

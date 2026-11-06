@@ -27,6 +27,59 @@ def patch_native_ufs_for_t970(ufs_source: Path):
         import patch_native_ufs_t970
     patch_native_ufs_t970.patch_native_ufs(ufs_source)
 
+# IOStorageFamily-323 sources linked into the image when PONG_STORAGE_BINDING=self, plus the
+# registration glue. Everything else in that repository either is DriverKit support
+# (IOUserBlockStorageDevice, which needs iig-generated headers) or a partition scheme the
+# Pong disks do not use (Apple, FDisk, AppleLabel).
+STORAGE_FAMILY_SOURCES = ['IOStorage', 'IOMedia', 'IOBlockStorageDriver', 'IOMediaBSDClient',
+                          'IOPartitionScheme', 'IOFilterScheme', 'IOGUIDPartitionScheme']
+
+
+def compile_storage_family(command, out, env):
+    """Compile the family; try every file and report all failures together, because a CI
+    round trip is long and a second error should not wait behind the first."""
+    family = pong_paths.storage_headers()
+    patched = out / 'storage-family'
+    patched.mkdir(parents=True, exist_ok=True)
+    flags = [f for f in command[:command.index('-c')] if f not in ('-Wall', '-Wextra', '-Werror')]
+    flags += ['-w', '-I' + str(family), '-I' + str(patched)]
+    jobs = []
+    for name in STORAGE_FAMILY_SOURCES:
+        source = family / (name + '.cpp')
+        text = source.read_text(encoding='utf-8')
+        if name == 'IOBlockStorageDriver':
+            # The DriverKit user block device needs iig-generated headers and has no
+            # provider here: this driver only ever sits on PongUfsBlock.
+            for old, new in (('#include "IOUserBlockStorageDevice_kext.h"\n', ''),
+                             ('OSDynamicCast(IOUserBlockStorageDevice, provider)', 'NULL'),
+                             ('_perfControlClient = _userBlockStorageDevice->getPerfControlClient();',
+                              '_perfControlClient = NULL;')):
+                assert text.count(old) == 1, 'IOBlockStorageDriver.cpp anchor not found: ' + old
+                text = text.replace(old, new)
+            source = patched / (name + '.cpp')
+            source.write_text(text, encoding='utf-8')
+        jobs.append((name, source))
+    jobs.append(('PongStorageFamily', DEVICE / 'drivers/PongStorageFamily.cpp'))
+    objects, failures = [], []
+    for name, source in jobs:
+        obj = out / (name + '.o')
+        result = subprocess.run(flags + ['-c', str(source), '-o', str(obj)], capture_output=True, text=True, env=env)
+        (out / (name + '-build.log')).write_text(result.stdout + result.stderr)
+        if result.returncode:
+            errors = [line for line in (result.stderr + result.stdout).splitlines() if 'error:' in line]
+            failures.append((name, errors[:12] or [result.stderr[-400:]]))
+            continue
+        subprocess.run(['xcrun', 'strip', '-S', str(obj)], check=True, env=env)
+        objects.append(obj)
+    if failures:
+        for name, errors in failures:
+            print('IOStorageFamily %s.cpp failed:' % name, file=sys.stderr)
+            for line in errors:
+                print('   ' + line, file=sys.stderr)
+        raise SystemExit('%d of %d IOStorageFamily sources failed to compile' % (len(failures), len(jobs)))
+    return objects
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tree', type=Path, default=DEFAULT_TREE,
@@ -48,12 +101,16 @@ def main():
     sdk = subprocess.check_output(
         ['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True, env=env).strip()
     obj = out / 'NativeUfs.o'
+    binding = os.environ.get('PONG_STORAGE_BINDING', 'self')
+    if binding not in ('self', 'original'):
+        raise SystemExit('PONG_STORAGE_BINDING must be self or original')
     trace_enabled = 'CONFIG_XNU_PONG_EARLY_TRACE=y' in (DEVICE / 'configs/pong_ipados18_defconfig').read_text().splitlines()
     command = ['xcrun', '--sdk', 'iphoneos', 'clang++', '-target', 'arm64-apple-ios18.0',
         '-isysroot', sdk, '-mkernel', '-ffreestanding', '-fno-builtin', '-fno-exceptions',
         '-fno-rtti', '-fno-stack-check', '-std=gnu++17', '-fblocks', '-O2',
         '-DKERNEL=1', '-DKERNEL_PRIVATE=1', '-DXNU_KERNEL_PRIVATE=1',
         '-DXNU_PONG_EARLY_TRACE=' + str(int(trace_enabled)),
+        '-DXNU_PONG_SELF_STORAGE=' + str(int(binding == 'self')),
         '-DXNU_PONG_UFS_DATA=' + str(int('CONFIG_XNU_OWNER_DATA_UFS=y' in (DEVICE/'configs/pong_ipados18_defconfig').read_text().splitlines())),
         '-I' + str(DEVICE / 'mac-build/storage-abi18/include'),
         '-I' + str(tree / '.cache/xnu-work/EXTERNAL_HEADERS'),
@@ -76,9 +133,6 @@ def main():
     # IOBlockStorageDevice.cpp into this archive; it is the only choice that works
     # in an image without Apple's kernelcache merged in. 'original' binds to the
     # Apple 22H374 addresses, which exist only in the locally prelinked image.
-    binding = os.environ.get('PONG_STORAGE_BINDING', 'self')
-    if binding not in ('self', 'original'):
-        raise SystemExit('PONG_STORAGE_BINDING must be self or original')
     subprocess.run([str(Path(os.sys.executable)), str(DEVICE / 'scripts/bind-ipados18-storage.py'),
                     '--object', str(transport), '--output', str(out), '--mode', binding], check=True, env=env)
     if binding == 'original':
@@ -90,7 +144,7 @@ def main():
         base_object = out / 'IOBlockStorageDevice.o'
         shutil.copyfile(reference, base_object)
         subprocess.run(['xcrun', 'strip', '-S', str(base_object)], check=True, env=env)
-        base_objects = [base_object]
+        base_objects = [base_object] + compile_storage_family(command, out, env)
     archive = out / 'libNativeUfs.a'
     archive.unlink(missing_ok=True)
     subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj), str(transport)] + [str(o) for o in base_objects],
