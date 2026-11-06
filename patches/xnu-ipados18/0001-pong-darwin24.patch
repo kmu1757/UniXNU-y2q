@@ -10241,7 +10241,7 @@ index 0000000..65a0b78
 +	refresh->setObject("displayRefreshStepMachTime", step);
 +	setProperty("IOMFBDisplayRefresh", refresh);
 +	OSSafeReleaseNULL(interval); OSSafeReleaseNULL(step); OSSafeReleaseNULL(refresh);
-+	IOLog("MiniIOMobileFramebuffer: Pong fixed refresh %u Hz, 1080x2412 NT37705 mode; GPU frame rate observed separately\n", refreshHz());
++	IOLog("MiniIOMobileFramebuffer: fixed refresh %u Hz, %ux%u panel mode; GPU frame rate observed separately\n", refreshHz(), fPanelWidth, fPanelHeight);
 +	fStartingDisplayNode = createDisplayNode();
 +	if (fStartingDisplayNode == NULL) {
 +		IOLog("MiniIOMobileFramebuffer: incomplete display DT node; service not published\n");

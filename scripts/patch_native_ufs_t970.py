@@ -21,6 +21,69 @@ def patch_native_ufs(ufs_source: Path):
             n_cpp.write_text(txt, encoding='utf-8')
             print(f'Applied SM8250 compatible patch to {n_cpp}', flush=True)
 
+    # 1b. NativeUfs.cpp: pick the GCC UFS register layout from the ADT's
+    # pong,gcc-ufs-page instead of hardcoding SM8450/SM8475, and say why a probe
+    # failed. Offsets are from Linux drivers/clk/qcom/gcc-sm8450.c (UFS clock
+    # block at GCC+0x87000) and gcc-sm8250.c (GCC+0x77000); GCC is at 0x100000 on both.
+    if n_cpp.is_file():
+        txt = n_cpp.read_text(encoding='utf-8')
+        if 'kGccProfiles' not in txt:
+            def swap(old, new):
+                nonlocal txt
+                assert txt.count(old) == 1, 'NativeUfs.cpp anchor not found: ' + old.splitlines()[0]
+                txt = txt.replace(old, new)
+
+            swap('constexpr uint64_t kGccUfsPage = 0x00187000ULL;\n', r"""struct GccProfile {
+  const char *name;
+  uint64_t page;
+  unsigned gdsc, axi, ahb, tx, rx0, rx1, unipro, ice, aux, aggregate;
+};
+// Register offsets inside the 4 KiB GCC page that holds the UFS PHY GDSC and branches.
+constexpr GccProfile kGccProfiles[] = {
+  {"SM8475", 0x00187000ULL, 0x004, 0x018, 0x020, 0x024, 0x028, 0x0c0, 0x064, 0x06c, 0x0a4, 0x0d4},
+  {"SM8250", 0x00177000ULL, 0x004, 0x010, 0x018, 0x01c, 0x020, 0x0b8, 0x05c, 0x064, 0x09c, 0x0cc},
+};
+""")
+            swap('  native_ufs_status |= 0x80000000U;\n  PongProbeRecord',
+                 '  native_ufs_status |= 0x80000000U;\n'
+                 '  IOLog ("PONG_UFS: probe failed: %s detail=%llx\\n", reason, (unsigned long long) detail);\n'
+                 '  PongProbeRecord')
+            swap('    {"pong,gcc-ufs-page", kGccUfsPage},\n', '')
+            swap('  IOLog ("PONG_UFS: matched SM8475, validate firmware clocks\\n");\n', r"""  const GccProfile *profile = nullptr;
+  {
+    OSData *value = OSDynamicCast (OSData, provider->getProperty ("pong,gcc-ufs-page"));
+    uint64_t page = 0;
+    if (!value || value->getLength () != sizeof (page)) return probeFailure ("pong,gcc-ufs-page");
+    memcpy (&page, value->getBytesNoCopy (), sizeof (page));
+    for (const auto &candidate : kGccProfiles) {
+      if (candidate.page == page) profile = &candidate;
+    }
+    if (!profile) return probeFailure ("pong,gcc-ufs-page", page);
+  }
+  IOLog ("PONG_UFS: matched %s, validate firmware clocks (GCC UFS page %llx)\n",
+         profile->name, (unsigned long long) profile->page);
+""")
+            swap('mapPhysical (kGccUfsPage, 0x1000, gccMap)', 'mapPhysical (profile->page, 0x1000, gccMap)')
+            for field, old_off in (('gdsc', '0x004'), ('axi', '0x018'), ('ahb', '0x020'), ('tx', '0x024'),
+                                   ('rx0', '0x028'), ('rx1', '0x0c0'), ('unipro', '0x064'), ('ice', '0x06c'),
+                                   ('aux', '0x0a4'), ('aggregate', '0x0d4')):
+                swap('read32 (gcc, %s);' % old_off, 'read32 (gcc, profile->%s);' % field)
+            swap('  bool powered = (pong_ufs_report[ReportGdsc]', r"""  IOLog ("PONG_UFS: GCC %s page %llx: gdsc[%03x]=%08x (need bit31) axi[%03x]=%08x ahb[%03x]=%08x "
+         "aggr[%03x]=%08x (need bit0 each)\n",
+         profile->name, (unsigned long long) profile->page,
+         profile->gdsc, pong_ufs_report[ReportGdsc], profile->axi, pong_ufs_report[ReportAxi],
+         profile->ahb, pong_ufs_report[ReportAhb], profile->aggregate, pong_ufs_report[ReportAggregate]);
+  bool powered = (pong_ufs_report[ReportGdsc]""")
+            swap('  if (!powered || !buses) return probeFailure ("power/clocks unavailable; host access skipped");',
+                 '  if (!powered || !buses) return probeFailure ("power/clocks unavailable; host access skipped",\n'
+                 '                                              ((uint64_t) powered << 1) | (uint64_t) buses);')
+            swap('  if (!pong_ufs_report[ReportVersion] || pong_ufs_report[ReportVersion] == 0xffffffffU ||',
+                 '  IOLog ("PONG_UFS: host regs cap=%08x ver=%08x hce=%08x (need ver != 0/ffffffff and hce bit0)\\n",\n'
+                 '         pong_ufs_report[ReportCapability], pong_ufs_report[ReportVersion], pong_ufs_report[ReportHostEnable]);\n'
+                 '  if (!pong_ufs_report[ReportVersion] || pong_ufs_report[ReportVersion] == 0xffffffffU ||')
+            n_cpp.write_text(txt, encoding='utf-8')
+            print(f'Applied GCC profile selection and probe diagnostics to {n_cpp}', flush=True)
+
     # 2. RootLayout.h: SHNGEXT1 extents structures, translateFileBlock4k, loadShngExtentTable
     r_h = ufs_source / 'RootLayout.h'
     if r_h.is_file():

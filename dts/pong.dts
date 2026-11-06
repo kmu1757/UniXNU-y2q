@@ -24,7 +24,9 @@
 };
 &ufs {
     status = "disabled";
-    pong,gcc-ufs-page = <0x00187000>;
+    /* SM8250: the GCC UFS PHY GDSC and branch registers sit at GCC (0x100000) + 0x77000, per
+       Linux drivers/clk/qcom/gcc-sm8250.c. SM8450/SM8475 use + 0x87000 (0x187000). */
+    pong,gcc-ufs-page = <0x00177000>;
     pong,smmu-stream-id = <0xE0>;
     pong,ufs-spi = <265>;
 };

@@ -247,7 +247,8 @@ def main():
         ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE)),
     ])
     ufs = node('ufshc', [
-        ('compatible', b'qcom,sm8475-ufshc\0qcom,sm8450-ufshc\0'),
+        # SM8250 first: the driver picks its GCC register layout from pong,gcc-ufs-page.
+        ('compatible', b'qcom,sm8250-ufshc\0qcom,ufshc\0qcom,sm8475-ufshc\0qcom,sm8450-ufshc\0'),
         ('pong,ufs-hc-base', struct.pack('<Q', UFS_HC)),
         ('pong,ufs-hc-size', struct.pack('<Q', UFS_HC_SIZE)),
         ('pong,gcc-ufs-page', struct.pack('<Q', GCC_UFS_PAGE)),
