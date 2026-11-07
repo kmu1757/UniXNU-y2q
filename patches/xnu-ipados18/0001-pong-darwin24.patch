@@ -8757,7 +8757,7 @@ index 22125b4..7e592af 100644
  	nameidone(&nd);
  done:
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index fe34d1b..eab9b59 100644
+index fe34d1b..d7dd7c3 100644
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
 @@ -72,6 +72,10 @@
@@ -8771,7 +8771,57 @@ index fe34d1b..eab9b59 100644
  #include <sys/systm.h>
  #include <sys/syslimits.h> /* For MAXLONGPATHLEN */
  #include <sys/namei.h>
-@@ -4709,6 +4713,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -4673,9 +4677,49 @@ fg_vn_data_free(void *fgvndata)
+  *
+  * XXX Need to implement uid, gid
+  */
++#if defined(PONG)
++static TUNABLE_WRITEABLE(int, pong_open_trace, "pong_open_trace", 0);
++#endif
++
++static int
++open1_internal(vfs_context_t ctx, struct nameidata *ndp, int uflags,
++    struct vnode_attr *vap, fp_initfn_t fp_init, void *initarg, int32_t *retval, int authfd);
++
+ int
+ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+     struct vnode_attr *vap, fp_initfn_t fp_init, void *initarg, int32_t *retval, int authfd)
++{
++#if defined(PONG)
++	char pong_open_path[256];
++	pong_open_path[0] = '\0';
++	proc_t p = vfs_context_proc(ctx);
++	if (pong_open_trace && p && (proc_getpid(p) == 1 || (p->p_comm && strcmp(p->p_comm, "launchd.ios") == 0))) {
++		size_t copied = 0;
++		if (UIO_SEG_IS_USER_SPACE(ndp->ni_segflg)) {
++			(void)copyinstr(ndp->ni_dirp, pong_open_path, sizeof(pong_open_path), &copied);
++		} else if (ndp->ni_dirp) {
++			copystr(CAST_DOWN(void *, ndp->ni_dirp), pong_open_path, sizeof(pong_open_path), &copied);
++		}
++		pong_open_path[sizeof(pong_open_path) - 1] = '\0';
++	}
++#endif
++
++	int error = open1_internal(ctx, ndp, uflags, vap, fp_init, initarg, retval, authfd);
++
++#if defined(PONG)
++	if (pong_open_trace && pong_open_path[0] != '\0') {
++		printf("PONG_OPEN: [%d(%s)] path='%s' flags=0x%x -> %s=%d\n",
++		    proc_getpid(p), p->p_comm ? p->p_comm : "unknown", pong_open_path, uflags,
++		    error ? "error" : "fd", error ? error : (retval ? *retval : -1));
++	}
++#endif
++
++	return error;
++}
++
++static int
++open1_internal(vfs_context_t ctx, struct nameidata *ndp, int uflags,
++    struct vnode_attr *vap, fp_initfn_t fp_init, void *initarg, int32_t *retval, int authfd)
+ {
+ 	proc_t p = vfs_context_proc(ctx);
+ 	kauth_cred_t p_cred = current_cached_proc_cred(PROC_NULL);
+@@ -4709,6 +4753,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
  	if ((error = falloc_withinit(p, p_cred, ctx, &fp, &indx, fp_init, initarg)) != 0) {
  		return error;
  	}
@@ -8782,7 +8832,7 @@ index fe34d1b..eab9b59 100644
  	if (flags & O_CLOEXEC) {
  		fp->fp_flags |= FP_CLOEXEC;
  	}
-@@ -4735,6 +4743,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -4735,6 +4783,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
  		}
  	}
  
@@ -8793,7 +8843,7 @@ index fe34d1b..eab9b59 100644
  	if ((error = vn_open_auth(ndp, &flags, vap, authvp))) {
  		if (authvp != NULLVP) {
  			vnode_put(authvp);
-@@ -4756,6 +4768,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -4756,6 +4808,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
  		vnode_put(authvp);
  	}
  
@@ -8804,7 +8854,7 @@ index fe34d1b..eab9b59 100644
  	uu->uu_dupfd = 0;
  	vp = ndp->ni_vp;
  
-@@ -5201,7 +5217,15 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+@@ -5201,7 +5257,15 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
  	int cmode;
  	int error;
  
@@ -8820,7 +8870,7 @@ index fe34d1b..eab9b59 100644
  	vap = &__open_data->va;
  	ndp = &__open_data->nd;
  
-@@ -5223,7 +5247,14 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+@@ -5223,7 +5287,14 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
  int
  open(proc_t p, struct open_args *uap, int32_t *retval)
  {
@@ -8836,10 +8886,74 @@ index fe34d1b..eab9b59 100644
  }
  
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
-index 2620af5..b782b15 100644
+index 2620af5..d6c5731 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -1070,6 +1070,128 @@ static void shared_region_map_and_slide_cleanup(
+@@ -963,6 +963,14 @@ shared_region_check_np(
+ 
+ 	/* retrieve the current tasks's shared region */
+ 	shared_region = vm_shared_region_get(task);
++	SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0x%llx) enter (sr=%p ref=%d first=0x%llx base=0x%llx)\n",
++	    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++	    proc_getpid(p), p->p_comm,
++	    (uint64_t)uap->start_address,
++	    (void *)VM_KERNEL_ADDRPERM(shared_region),
++	    shared_region ? shared_region->sr_ref_count : 0,
++	    (uint64_t)(shared_region ? shared_region->sr_first_mapping : 0),
++	    (uint64_t)(shared_region ? shared_region->sr_base_address : 0)));
+ 	if (shared_region != NULL) {
+ 		/*
+ 		 * A NULL argument is used by dyld to indicate the task
+@@ -970,6 +978,10 @@ shared_region_check_np(
+ 		 */
+ 		if (uap->start_address == 0) {
+ 			/* unmap it first */
++			SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0) unmapping sr=%p\n",
++			    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++			    proc_getpid(p), p->p_comm,
++			    (void *)VM_KERNEL_ADDRPERM(shared_region)));
+ 			vm_shared_region_remove(task, shared_region);
+ 			vm_shared_region_set(task, NULL);
+ 		} else {
+@@ -978,10 +990,12 @@ shared_region_check_np(
+ 			if (kr != KERN_SUCCESS) {
+ 				SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] "
+ 				    "check_np(0x%llx) "
+-				    "vm_shared_region_start_address() failed\n",
++				    "vm_shared_region_start_address() failed (kr=0x%x sr_first_mapping=0x%llx, sr empty -> ENOMEM)\n",
+ 				    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 				    proc_getpid(p), p->p_comm,
+-				    (uint64_t)uap->start_address));
++				    (uint64_t)uap->start_address,
++				    kr,
++				    (uint64_t)shared_region->sr_first_mapping));
+ 				error = ENOMEM;
+ 			} else {
+ #if __has_feature(ptrauth_calls)
+@@ -1014,6 +1028,11 @@ shared_region_check_np(
+ 							proc_getpid(p), p->p_comm,
+ 							(uint64_t)uap->start_address, (uint64_t)start_address,
+ 							error));
++					} else {
++						SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0x%llx) success start_address=0x%llx\n",
++						    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++						    proc_getpid(p), p->p_comm,
++						    (uint64_t)uap->start_address, (uint64_t)start_address));
+ 					}
+ 				}
+ 			}
+@@ -1021,6 +1040,10 @@ shared_region_check_np(
+ 		vm_shared_region_deallocate(shared_region);
+ 	} else {
+ 		/* no shared region ! */
++		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0x%llx) no shared region in task -> EINVAL\n",
++		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++		    proc_getpid(p), p->p_comm,
++		    (uint64_t)uap->start_address));
+ 		error = EINVAL;
+ 	}
+ 
+@@ -1070,6 +1093,193 @@ static void shared_region_map_and_slide_cleanup(
  	struct _sr_file_mappings *sr_file_mappings,
  	struct vm_shared_region  *shared_region);
  
@@ -8927,39 +9041,104 @@ index 2620af5..b782b15 100644
 +	boolean_t authorized = FALSE;
 +	dev_t actual = NODEV;
 +
-+	if (process_root != rootvnode || !file || vnode_vtype(file) != VREG ||
-+	    native_owner_cache_status != 0 || !native_owner_cache_authorized ||
-+	    !native_owner_cache_root_recheck || !native_owner_cache_readonly ||
-+	    native_owner_cache_current_root != (uintptr_t)rootvnode ||
-+	    native_owner_cache_selected_device == NODEV ||
++	if (process_root != rootvnode) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: process_root(%p) != rootvnode(%p)\n",
++		    (void *)VM_KERNEL_ADDRPERM(process_root), (void *)VM_KERNEL_ADDRPERM(rootvnode)));
++		return FALSE;
++	}
++	if (!file || vnode_vtype(file) != VREG) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: file=%p type=%d != VREG\n",
++		    (void *)VM_KERNEL_ADDRPERM(file), file ? vnode_vtype(file) : -1));
++		return FALSE;
++	}
++	if (native_owner_cache_status != 0 || !native_owner_cache_authorized ||
++	    !native_owner_cache_root_recheck || !native_owner_cache_readonly) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: flags check failed status=%d auth=%d recheck=%d ro=%d\n",
++		    native_owner_cache_status, native_owner_cache_authorized,
++		    native_owner_cache_root_recheck, native_owner_cache_readonly));
++		return FALSE;
++	}
++	if (native_owner_cache_current_root != (uintptr_t)rootvnode) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: current_root 0x%lx != rootvnode 0x%lx\n",
++		    (unsigned long)native_owner_cache_current_root, (unsigned long)(uintptr_t)rootvnode));
++		return FALSE;
++	}
++	if (native_owner_cache_selected_device == NODEV ||
 +	    native_owner_cache_selected_device != native_owner_cache_mounted_device) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: dev mismatch selected=0x%x mounted=0x%x\n",
++		    (int)native_owner_cache_selected_device, (int)native_owner_cache_mounted_device));
 +		return FALSE;
 +	}
 +	mount_t root_mount = vnode_mount(process_root);
 +	mount_t cache_mount = vnode_mount(file);
 +	int rootful = 0;
 +	PE_parse_boot_argn("pong_rootful", &rootful, sizeof(rootful));
-+	if (!root_mount || !cache_mount || root_mount == cache_mount ||
-+	    (!(vfs_flags(root_mount) & MNT_RDONLY) && rootful != 1) ||
-+	    !(vfs_flags(cache_mount) & MNT_RDONLY) ||
-+	    strcmp(vfs_statfs(root_mount)->f_fstypename, "apfs") ||
-+	    strcmp(vfs_statfs(cache_mount)->f_fstypename, "apfs")) return FALSE;
++	if (!root_mount || !cache_mount) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: null mount root_mount=%p cache_mount=%p\n",
++		    (void *)VM_KERNEL_ADDRPERM(root_mount), (void *)VM_KERNEL_ADDRPERM(cache_mount)));
++		return FALSE;
++	}
++	if (root_mount == cache_mount) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: root_mount == cache_mount (%p)\n",
++		    (void *)VM_KERNEL_ADDRPERM(root_mount)));
++		return FALSE;
++	}
++	if (!(vfs_flags(root_mount) & MNT_RDONLY) && rootful != 1) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: root_mount not ro (flags=0x%x)\n",
++		    vfs_flags(root_mount)));
++		return FALSE;
++	}
++	if (!(vfs_flags(cache_mount) & MNT_RDONLY)) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: cache_mount not ro (flags=0x%x)\n",
++		    vfs_flags(cache_mount)));
++		return FALSE;
++	}
++	if (strcmp(vfs_statfs(root_mount)->f_fstypename, "apfs") ||
++	    strcmp(vfs_statfs(cache_mount)->f_fstypename, "apfs")) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: not apfs (root=%s cache=%s)\n",
++		    vfs_statfs(root_mount)->f_fstypename, vfs_statfs(cache_mount)->f_fstypename));
++		return FALSE;
++	}
 +	/* Rootful may remount only the initially UUID-bound OS writable.
 +	 * SystemOS and its dyld cache stay read-only on their original device. */
 +	device_vnode = vfs_devvp(root_mount);
-+	if (!device_vnode) return FALSE;
++	if (!device_vnode) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: no devvp for root_mount\n"));
++		return FALSE;
++	}
 +	actual = vnode_specrdev(device_vnode);
 +	vnode_put(device_vnode);
-+	if (actual == NODEV || actual != native_owner_cache_bound_root_device) return FALSE;
++	if (actual == NODEV || actual != native_owner_cache_bound_root_device) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: bound_root_device mismatch actual=0x%x bound=0x%x\n",
++		    (int)actual, (int)native_owner_cache_bound_root_device));
++		return FALSE;
++	}
 +	device_vnode = vfs_devvp(cache_mount);
 +	if (device_vnode) {
 +		actual = vnode_specrdev(device_vnode);
 +		vnode_put(device_vnode);
 +	}
-+	if (actual != native_owner_cache_selected_device ||
-+	    vnode_lookup(directory, 0, &expected_parent, vfs_context_current())) return FALSE;
++	if (actual != native_owner_cache_selected_device) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: cache_mount dev mismatch actual=0x%x selected=0x%x\n",
++		    (int)actual, (int)native_owner_cache_selected_device));
++		return FALSE;
++	}
++	int lookup_err = vnode_lookup(directory, 0, &expected_parent, vfs_context_current());
++	if (lookup_err) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: lookup(%s) failed error=%d\n", directory, lookup_err));
++		return FALSE;
++	}
 +	authorized = vnode_vtype(expected_parent) == VDIR &&
 +	    vnode_mount(expected_parent) == cache_mount && vnode_parent(file) == expected_parent;
++	if (!authorized) {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: parent check failed type=%d (exp VDIR=%d) mount_match=%d parent_match=%d\n",
++		    vnode_vtype(expected_parent), VDIR,
++		    vnode_mount(expected_parent) == cache_mount,
++		    vnode_parent(file) == expected_parent));
++	} else {
++		SHARED_REGION_TRACE_ERROR(("pong_owner_cache: authorized PASS for '%s'\n",
++		    file->v_name ? file->v_name : "noname"));
++	}
 +	vnode_put(expected_parent);
 +	return authorized;
 +}
@@ -8968,7 +9147,62 @@ index 2620af5..b782b15 100644
  /*
   * Setup part of _shared_region_map_and_slide().
   * It had to be broken out of _shared_region_map_and_slide() to
-@@ -1402,15 +1513,34 @@ after_root_check:
+@@ -1105,16 +1315,28 @@ shared_region_map_and_slide_setup(
+ 		proc_getpid(p), p->p_comm));
+ 
+ 	if (files_count > _SR_FILE_MAPPINGS_MAX_FILES) {
++		SHARED_REGION_TRACE_ERROR(
++			("shared_region: %p [%d(%s)] setup: files_count %u > max %d\n",
++			(void *)VM_KERNEL_ADDRPERM(current_thread()),
++			proc_getpid(p), p->p_comm, files_count, _SR_FILE_MAPPINGS_MAX_FILES));
+ 		error = E2BIG;
+ 		goto done;
+ 	}
+ 	if (files_count == 0) {
++		SHARED_REGION_TRACE_ERROR(
++			("shared_region: %p [%d(%s)] setup: files_count == 0\n",
++			(void *)VM_KERNEL_ADDRPERM(current_thread()),
++			proc_getpid(p), p->p_comm));
+ 		error = EINVAL;
+ 		goto done;
+ 	}
+ 	*sr_file_mappings = kalloc_type(struct _sr_file_mappings, files_count,
+ 	    Z_WAITOK | Z_ZERO);
+ 	if (*sr_file_mappings == NULL) {
++		SHARED_REGION_TRACE_ERROR(
++			("shared_region: %p [%d(%s)] setup: kalloc_type failed\n",
++			(void *)VM_KERNEL_ADDRPERM(current_thread()),
++			proc_getpid(p), p->p_comm));
+ 		error = ENOMEM;
+ 		goto done;
+ 	}
+@@ -1126,6 +1348,10 @@ shared_region_map_and_slide_setup(
+ 		srfmp->mappings = &mappings[mappings_next];
+ 		mappings_next += srfmp->mappings_count;
+ 		if (mappings_next > mappings_count) {
++			SHARED_REGION_TRACE_ERROR(
++				("shared_region: %p [%d(%s)] setup: mappings_next %u > count %u\n",
++				(void *)VM_KERNEL_ADDRPERM(current_thread()),
++				proc_getpid(p), p->p_comm, mappings_next, mappings_count));
+ 			error = EINVAL;
+ 			goto done;
+ 		}
+@@ -1263,6 +1489,14 @@ shared_region_map_and_slide_setup(
+ 		error = mac_file_check_mmap(vfs_context_ucred(vfs_context_current()),
+ 		    srfmp->fp->fp_glob, VM_PROT_ALL, MAP_FILE | MAP_PRIVATE | MAP_FIXED, 0, &maxprot);
+ 		if (error) {
++			SHARED_REGION_TRACE_ERROR(
++				("shared_region: %p [%d(%s)] map(%p:'%s'): "
++				"mac_file_check_mmap failed error=%d\n",
++				(void *)VM_KERNEL_ADDRPERM(current_thread()),
++				proc_getpid(p), p->p_comm,
++				(void *)VM_KERNEL_ADDRPERM(srfmp->vp),
++				srfmp->vp->v_name ? srfmp->vp->v_name : "noname",
++				error));
+ 			goto done;
+ 		}
+ #endif /* MAC */
+@@ -1402,15 +1636,34 @@ after_root_check:
  		 * is either on the root volume or in the preboot cryptex volume.
  		 */
  		assert(rdir_vp != NULL);
@@ -9004,7 +9238,7 @@ index 2620af5..b782b15 100644
  				SHARED_REGION_TRACE_ERROR(
  					("shared_region: %p [%d(%s)] map(%p:'%s'): "
  					"not on process' root volume nor preboot volume\n",
-@@ -1429,7 +1559,11 @@ after_root_check:
+@@ -1429,7 +1682,11 @@ after_root_check:
  		}
  #endif /* CONFIG_CSR */
  
@@ -9017,6 +9251,181 @@ index 2620af5..b782b15 100644
  			char **expected_scdir_path = is_driverkit ? driverkit_scdir_path : scdir_path;
  			struct vnode *scdir_vp = NULL;
  			for (expected_scdir_path = is_driverkit ? driverkit_scdir_path : scdir_path;
+@@ -1570,6 +1827,10 @@ _shared_region_map_and_slide(
+ 	 * Get a reference to the current proc's root dir.
+ 	 * Need this to prevent racing with chroot.
+ 	 */
++	SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] _map_and_slide enter files=%u mappings=%u\n",
++	    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++	    proc_getpid(p), p->p_comm, files_count, mappings_count));
++
+ 	proc_fdlock(p);
+ 	rdir_vp = p->p_fd.fd_rdir;
+ 	if (rdir_vp == NULL) {
+@@ -1586,6 +1847,9 @@ _shared_region_map_and_slide(
+ 	    files, mappings_count, mappings,
+ 	    &sr_file_mappings, &shared_region, rdir_vp);
+ 	if (error != 0) {
++		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] setup failed error=%d\n",
++		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++		    proc_getpid(p), p->p_comm, error));
+ 		vnode_put(rdir_vp);
+ 		return error;
+ 	}
+@@ -1597,6 +1861,14 @@ _shared_region_map_and_slide(
+ 		    "vm_shared_region_map_file() failed kr=0x%x\n",
+ 		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		    proc_getpid(p), p->p_comm, kr));
++	} else {
++		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] map(): "
++		    "vm_shared_region_map_file() succeeded! (sr=%p base=0x%llx first=0x%llx)\n",
++		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
++		    proc_getpid(p), p->p_comm,
++		    (void *)VM_KERNEL_ADDRPERM(shared_region),
++		    (uint64_t)shared_region->sr_base_address,
++		    (uint64_t)shared_region->sr_first_mapping));
+ 	}
+ 
+ 	/* convert kern_return_t to errno */
+@@ -1760,6 +2032,7 @@ shared_region_map_and_slide_2_np_sanitize(
+ 			sizeof(shared_file_mapping_slide_np_ut),
+ 			&mapping_u);
+ 		if (__improbable(kr != KERN_SUCCESS)) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize copyin[%zu] failed kr=0x%x\n", i, kr));
+ 			return kr;
+ 		}
+ 
+@@ -1778,6 +2051,8 @@ shared_region_map_and_slide_2_np_sanitize(
+ 			&end,
+ 			&size);
+ 		if (__improbable(kr != KERN_SUCCESS)) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize addr_size[%zu] failed kr=0x%x (addr=0x%llx size=0x%llx)\n",
++			    i, kr, (uint64_t)mapping_u.sms_address_u, (uint64_t)mapping_u.sms_size_u));
+ 			return kr;
+ 		}
+ 
+@@ -1792,9 +2067,13 @@ shared_region_map_and_slide_2_np_sanitize(
+ 			&offset_end,
+ 			&offset_size);
+ 		if (__improbable(kr != KERN_SUCCESS)) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize file_offset[%zu] failed kr=0x%x (offset=0x%llx)\n",
++			    i, kr, (uint64_t)mapping_u.sms_file_offset_u));
+ 			return kr;
+ 		}
+ 		if (__improbable(0 != (offset & vm_map_page_mask(map)))) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize offset[%zu] not page aligned (0x%llx)\n",
++			    i, (uint64_t)offset));
+ 			return KERN_INVALID_ARGUMENT;
+ 		}
+ 
+@@ -1818,6 +2097,8 @@ shared_region_map_and_slide_2_np_sanitize(
+ 			&slide_end,
+ 			&slide_size);
+ 		if (__improbable(kr != KERN_SUCCESS)) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize slide_addr[%zu] failed kr=0x%x (start=0x%llx size=0x%llx)\n",
++			    i, kr, (uint64_t)mapping_u.sms_slide_start_u, (uint64_t)sms_slide_size_u));
+ 			return kr;
+ 		}
+ 
+@@ -1830,6 +2111,8 @@ shared_region_map_and_slide_2_np_sanitize(
+ 			&cur,
+ 			&max);
+ 		if (__improbable(kr != KERN_SUCCESS)) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize prots[%zu] failed kr=0x%x (init=0x%x max=0x%x)\n",
++			    i, kr, mapping_u.sms_init_prot_u, mapping_u.sms_max_prot_u));
+ 			return kr;
+ 		}
+ 
+@@ -1849,6 +2132,7 @@ shared_region_map_and_slide_2_np_sanitize(
+ 			    user_addr,
+ 			    sizeof(shared_file_mapping_slide_np_ut),
+ 			    &user_addr))) {
++			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize user_addr[%zu] overflow\n", i));
+ 			return KERN_INVALID_ARGUMENT;
+ 		}
+ 	}
+@@ -1871,6 +2155,12 @@ shared_region_map_and_slide_2_np(
+ 	files_count = uap->files_count;
+ 	mappings_count = uap->mappings_count;
+ 
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p [%d(%s)] map_and_slide_2_np enter (files=%u mappings=%u)\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
++		proc_getpid(p), p->p_comm,
++		files_count, mappings_count));
++
+ 	if (files_count == 0) {
+ 		SHARED_REGION_TRACE_INFO(
+ 			("shared_region: %p [%d(%s)] map(): "
+@@ -1927,6 +2217,10 @@ shared_region_map_and_slide_2_np(
+ 	 */
+ 	kr = shared_region_copyin(p, uap->files, files_count, sizeof(shared_files[0]), shared_files);
+ 	if (kr != KERN_SUCCESS) {
++		SHARED_REGION_TRACE_ERROR(
++			("shared_region: %p [%d(%s)] map_and_slide_2_np copyin files failed kr=0x%x\n",
++			(void *)VM_KERNEL_ADDRPERM(current_thread()),
++			proc_getpid(p), p->p_comm, kr));
+ 		goto done;
+ 	}
+ 
+@@ -1937,6 +2231,10 @@ shared_region_map_and_slide_2_np(
+ 		mappings);
+ 	if (__improbable(kr != KERN_SUCCESS)) {
+ 		kr = vm_sanitize_get_kr(kr);
++		SHARED_REGION_TRACE_ERROR(
++			("shared_region: %p [%d(%s)] map_and_slide_2_np sanitize failed kr=0x%x\n",
++			(void *)VM_KERNEL_ADDRPERM(current_thread()),
++			proc_getpid(p), p->p_comm, kr));
+ 		goto done;
+ 	}
+ 
+@@ -1957,6 +2255,11 @@ shared_region_map_and_slide_2_np(
+ 	}
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p [%d(%s)] map_and_slide_2_np slide_amount=0x%x max_slide=0x%x\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
++		proc_getpid(p), p->p_comm, slide_amount, max_slide));
++
+ 	/*
+ 	 * Fix up the mappings to reflect the desired slide.
+ 	 */
+@@ -1980,6 +2283,11 @@ shared_region_map_and_slide_2_np(
+ 					    mappings[m].sms_address,
+ 					    slide_amount,
+ 					    &mappings[m].sms_address))) {
++				SHARED_REGION_TRACE_ERROR(
++					("shared_region: %p [%d(%s)] map(): "
++					"mapping[%u] sms_address overflow\n",
++					(void *)VM_KERNEL_ADDRPERM(current_thread()),
++					proc_getpid(p), p->p_comm, m));
+ 				kr = KERN_INVALID_ARGUMENT;
+ 				goto done;
+ 			}
+@@ -1995,6 +2303,11 @@ shared_region_map_and_slide_2_np(
+ 						    mappings[m].sms_slide_start,
+ 						    mappings[m].sms_slide_size,
+ 						    &discard))) {
++					SHARED_REGION_TRACE_ERROR(
++						("shared_region: %p [%d(%s)] map(): "
++						"mapping[%u] slide_start/size overflow\n",
++						(void *)VM_KERNEL_ADDRPERM(current_thread()),
++						proc_getpid(p), p->p_comm, m));
+ 					kr = KERN_INVALID_ARGUMENT;
+ 					goto done;
+ 				}
+@@ -2004,6 +2317,10 @@ shared_region_map_and_slide_2_np(
+ 
+ 	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);
+ done:
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p [%d(%s)] map_and_slide_2_np exit (kr=0x%x)\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
++		proc_getpid(p), p->p_comm, kr));
+ 	kfree_data(shared_files, files_count * sizeof(shared_files[0]));
+ 	kfree_data(mappings, mappings_count * sizeof(mappings[0]));
+ 	return kr;
 diff --git a/config/MASTER b/config/MASTER
 index e9170fd..f7d1e8a 100644
 --- a/config/MASTER
@@ -18375,9 +18784,18 @@ index bd4bb7f..b18fe72 100644
  
  	for (; node && level > 0; level--) {
 diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
-index 39fe08a..523510e 100644
+index 39fe08a..55a8311 100644
 --- a/osfmk/vm/vm_shared_region.c
 +++ b/osfmk/vm/vm_shared_region.c
+@@ -139,7 +139,7 @@
+ int shared_region_version = 3;
+ 
+ /* trace level, output is sent to the system log file */
+-int shared_region_trace_level = SHARED_REGION_TRACE_ERROR_LVL;
++TUNABLE_WRITEABLE(int, shared_region_trace_level, "shared_region_trace_level", SHARED_REGION_TRACE_ERROR_LVL);
+ 
+ /* should local (non-chroot) shared regions persist when no task uses them ? */
+ int shared_region_persistence = 0;      /* no by default */
 @@ -787,11 +787,15 @@ vm_shared_region_create(
  			sub_map = vm_map_create_options(pmap_nested, 0,
  			    (vm_map_offset_t)size, VM_MAP_CREATE_PAGEABLE);
@@ -18394,6 +18812,96 @@ index 39fe08a..523510e 100644
  #if __ARM_MIXED_PAGE_SIZE__
  			if (cputype == CPU_TYPE_ARM64 &&
  			    target_page_shift == FOURK_PAGE_SHIFT) {
+@@ -1040,6 +1044,17 @@ vm_shared_region_start_address(
+ 		*start_address = sr_base_address + sr_first_mapping;
+ 	}
+ 
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p start_address(sr=%p base=0x%llx first=0x%llx in_prog=%p ref=%d) -> kr=0x%x start=0x%llx\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
++		(void *)VM_KERNEL_ADDRPERM(shared_region),
++		(uint64_t)sr_base_address,
++		(uint64_t)sr_first_mapping,
++		(void *)VM_KERNEL_ADDRPERM(shared_region->sr_mapping_in_progress),
++		shared_region->sr_ref_count,
++		kr,
++		(kr == KERN_SUCCESS) ? (uint64_t)*start_address : 0ULL));
++
+ 
+ 	uint32_t slide = shared_region->sr_slide;
+ 
+@@ -1509,9 +1524,13 @@ vm_shared_region_map_file_setup(
+ 	sr_map = sr_mem_entry->backing.map;
+ 	sr_base_address = shared_region->sr_base_address;
+ 
+-	SHARED_REGION_TRACE_DEBUG(
+-		("shared_region: -> map(%p)\n",
+-		(void *)VM_KERNEL_ADDRPERM(shared_region)));
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p map_file_setup(sr=%p nfiles=%d base=0x%llx first=0x%llx)\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
++		(void *)VM_KERNEL_ADDRPERM(shared_region),
++		sr_file_mappings_count,
++		(uint64_t)sr_base_address,
++		(uint64_t)shared_region->sr_first_mapping));
+ 
+ 	mappings_count = 0;
+ 	mappings = NULL;
+@@ -1713,7 +1732,7 @@ vm_shared_region_map_file_setup(
+ 
+ 		/* establish the mappings for that file */
+ 		for (i = 0; i < mappings_count; i++) {
+-			SHARED_REGION_TRACE_INFO(
++			SHARED_REGION_TRACE_ERROR(
+ 				("shared_region: mapping[%d]: "
+ 				"address:0x%016llx size:0x%016llx offset:0x%016llx "
+ 				"maxprot:0x%x prot:0x%x\n",
+@@ -1849,6 +1868,11 @@ vm_shared_region_map_file_setup(
+ 
+ 				if (shared_region->sr_first_mapping == (mach_vm_offset_t)-1) {
+ 					shared_region->sr_first_mapping = target_address;
++					SHARED_REGION_TRACE_ERROR(
++						("shared_region: %p sr_first_mapping set to 0x%llx (target=0x%llx)\n",
++						(void *)VM_KERNEL_ADDRPERM(current_thread()),
++						(uint64_t)shared_region->sr_first_mapping,
++						(uint64_t)target_address));
+ 				}
+ 
+ 				if (*mappings_to_slide_cnt > 0 &&
+@@ -2295,9 +2319,10 @@ vm_shared_region_enter(
+ 	vm_prot_t               cur_prot, max_prot;
+ 	vm_map_kernel_flags_t   vmk_flags;
+ 
+-	SHARED_REGION_TRACE_DEBUG(
+-		("shared_region: -> "
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p -> "
+ 		"enter(map=%p,task=%p,root=%p,cpu=<%d,%d>,64bit=%d,driverkit=%d)\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		(void *)VM_KERNEL_ADDRPERM(map),
+ 		(void *)VM_KERNEL_ADDRPERM(task),
+ 		(void *)VM_KERNEL_ADDRPERM(fsroot),
+@@ -2495,13 +2520,15 @@ done:
+ 		vm_shared_region_set(task, NULL);
+ 	}
+ 
+-	SHARED_REGION_TRACE_DEBUG(
+-		("shared_region: enter(%p,%p,%p,%d,%d,%d,%d,%d) <- 0x%x\n",
++	SHARED_REGION_TRACE_ERROR(
++		("shared_region: %p enter(map=%p,task=%p) done kr=0x%x sr=%p (base=0x%llx first=0x%llx)\n",
++		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		(void *)VM_KERNEL_ADDRPERM(map),
+ 		(void *)VM_KERNEL_ADDRPERM(task),
+-		(void *)VM_KERNEL_ADDRPERM(fsroot),
+-		cpu, cpu_subtype, is_64bit, reslide, is_driverkit,
+-		kr));
++		kr,
++		(void *)VM_KERNEL_ADDRPERM(shared_region),
++		shared_region ? (uint64_t)shared_region->sr_base_address : 0ULL,
++		shared_region ? (uint64_t)shared_region->sr_first_mapping : 0ULL));
+ 	return kr;
+ }
+ 
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
 index 666b87b..e3d2ee7 100644
 --- a/pexpert/arm/pe_init.c
