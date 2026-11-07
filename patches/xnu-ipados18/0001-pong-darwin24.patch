@@ -1775,12 +1775,14 @@ diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
 index 91969eb..b166f7d 100644
 --- a/bsd/kern/kern_descrip.c
 +++ b/bsd/kern/kern_descrip.c
-@@ -2753,8 +2753,60 @@ outdrop:
+@@ -2753,8 +2753,65 @@ outdrop:
  	return sys_fcntl_outdrop(p, fd, fp, vp, error);
  }
  
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +extern int pong_syscall_trace;
++extern uint64_t mach_absolute_time(void);
++extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +
 +static const char *
 +pong_fcntl_cmd_name(int cmd)
@@ -1822,7 +1824,10 @@ index 91969eb..b166f7d 100644
 +	int error = sys_fcntl_nocancel_internal(p, uap, retval);
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_FCNTL] [1(%s)] fd=%d cmd=%d(%s) arg=0x%llx -> err=%d retval=%d\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_FCNTL] +%llums [1(%s)] fd=%d cmd=%d(%s) arg=0x%llx -> err=%d retval=%d\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", uap->fd, uap->cmd,
 +		    pong_fcntl_cmd_name(uap->cmd), (uint64_t)uap->arg,
 +		    error, (retval ? *retval : 0));
@@ -1836,7 +1841,7 @@ index 91969eb..b166f7d 100644
  {
  	int fd = uap->fd;
  	int cmd = uap->cmd;
-@@ -5383,8 +5435,24 @@ sys_close_nocancel(proc_t p, struct close_nocancel_args *uap, __unused int32_t *
+@@ -5383,8 +5440,27 @@ sys_close_nocancel(proc_t p, struct close_nocancel_args *uap, __unused int32_t *
  	return close_nocancel(p, p_cred, uap->fd);
  }
  
@@ -1849,7 +1854,10 @@ index 91969eb..b166f7d 100644
 +	int error = close_nocancel_internal(p, p_cred, fd);
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_CLOSE] [1(%s)] fd=%d -> err=%d\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_CLOSE] +%llums [1(%s)] fd=%d -> err=%d\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", fd, error);
 +	}
 +#endif
@@ -3178,14 +3186,19 @@ diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
 index b23eb09..2cb594d 100644
 --- a/bsd/kern/kern_mman.c
 +++ b/bsd/kern/kern_mman.c
-@@ -983,6 +983,16 @@ bad:
+@@ -983,6 +983,21 @@ bad:
  	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO2, SYS_mmap) | DBG_FUNC_NONE), (uint32_t)(*retval >> 32), (uint32_t)(user_size >> 32),
  	    (uint32_t)(file_pos >> 32), (uint32_t)file_pos, 0);
  #endif /* XNU_TARGET_OS_OSX */
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
++	extern uint64_t mach_absolute_time(void);
++	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_MMAP] [1(%s)] fd=%d addr=0x%llx len=0x%llx prot=0x%x flags=0x%x pos=0x%llx -> err=%d ret=0x%llx\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_MMAP] +%llums [1(%s)] fd=%d addr=0x%llx len=0x%llx prot=0x%x flags=0x%x pos=0x%llx -> err=%d ret=0x%llx\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", fd,
 +		    (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(uap->addr),
 +		    (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(uap->len),
@@ -3344,7 +3357,7 @@ new file mode 100644
 index 0000000..952c4c2
 --- /dev/null
 +++ b/bsd/kern/pong_userland.c
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,193 @@
 +#include <pexpert/arm64/board_config.h>
 +/* Bounded kernel-side progress, without a private sysctl or user copy. */
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
@@ -3354,6 +3367,7 @@ index 0000000..952c4c2
 +#include <sys/user.h>
 +#include <kern/startup.h>
 +#include <kern/clock.h>
++#include <kern/timer_call.h>
 +#include <machine/machine_routines.h>
 +
 +volatile int pong_init_user_seen;
@@ -3361,11 +3375,49 @@ index 0000000..952c4c2
 +TUNABLE_WRITEABLE(int, pong_syscall_trace, "pong_syscall_trace", 0);
 +TUNABLE_WRITEABLE(int, pong_heartbeat, "pong_heartbeat", 0);
 +
++struct pong_state_data {
++	volatile uint32_t timer_ticks;
++	volatile uint32_t thread_hb;
++	volatile uint64_t last_timer_ms;
++	volatile uint32_t cs_slot;
++	volatile uint32_t cs_nslots;
++	volatile uint64_t cs_offset;
++	volatile uint64_t cs_limit;
++	volatile int32_t  pong_stage;
++	volatile int32_t  cpu;
++};
++extern struct pong_state_data pong_live_state;
++extern void pong_ramoops_update_state(void);
++extern int cpu_number(void);
++extern unsigned int real_ncpus;
++
 +extern thread_t pong_get_task_first_thread(task_t task, int *out_state, uint64_t *out_wait_event,
 +    uint64_t *out_continuation, uint64_t *frames, int max_frames, int *out_nframes);
 +extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
 +extern void thread_deallocate(thread_t thread);
 +extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++
++static timer_call_data_t pong_timer_call_entry;
++static volatile uint32_t pong_timer_ticks = 0;
++
++static void
++pong_timer_call_func(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
++{
++	uint64_t now_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	uint64_t boot_ms = now_ns / 1000000ULL;
++
++	uint32_t ticks = __atomic_add_fetch(&pong_timer_ticks, 1, __ATOMIC_RELAXED);
++	pong_live_state.timer_ticks = ticks;
++	pong_live_state.last_timer_ms = boot_ms;
++	pong_live_state.cpu = cpu_number();
++
++	pong_ramoops_update_state();
++
++	uint64_t interval_abs = 0;
++	clock_interval_to_absolutetime_interval(1, NSEC_PER_SEC, &interval_abs);
++	timer_call_enter(&pong_timer_call_entry, mach_absolute_time() + interval_abs, TIMER_CALL_SYS_CRITICAL);
++}
 +
 +void pong_init_note(const char *);
 +void
@@ -3377,77 +3429,86 @@ index 0000000..952c4c2
 +    proc_t p = current_proc();
 +    if (!p || proc_pid(p) != 1) return;
 +    ++count;
++    pong_live_state.pong_stage = (int)count;
++    pong_ramoops_update_state();
 +    printf("Pong init: %s\n", stage);
 +}
 +
 +static void
 +pong_heartbeat_thread(__unused void *param, __unused wait_result_t wr)
 +{
-+	uint64_t start_time = mach_absolute_time();
-+	while (1) {
-+		delay_for_interval((uint32_t)pong_heartbeat, NSEC_PER_SEC);
++	uint32_t hb_count = 0;
++	int interval = pong_heartbeat > 0 ? pong_heartbeat : 1;
 +
-+		uint64_t elapsed_ns = 0;
-+		absolutetime_to_nanoseconds(mach_absolute_time() - start_time, &elapsed_ns);
-+		uint64_t elapsed_sec = elapsed_ns / NSEC_PER_SEC;
++	while (1) {
++		uint64_t now_ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++		uint64_t boot_ms = now_ns / 1000000ULL;
++		int cur_cpu = cpu_number();
++
++		pong_live_state.thread_hb = hb_count;
++		pong_live_state.cpu = cur_cpu;
++		pong_ramoops_update_state();
 +
 +		proc_t p = proc_find(1);
 +		if (p == PROC_NULL) {
-+			printf("[PONG_HB] +%llus pid=1: not found\n", elapsed_sec);
-+			continue;
-+		}
-+
-+		task_t task = proc_task(p);
-+		const char *comm = p->p_comm ? p->p_comm : "unknown";
-+
-+		int th_state = 0;
-+		uint64_t wait_event = 0;
-+		uint64_t continuation = 0;
-+		uint64_t frames[8] = { 0 };
-+		int nframes = 0;
-+
-+		thread_t th = pong_get_task_first_thread(task, &th_state, &wait_event,
-+		    &continuation, frames, 8, &nframes);
-+		if (th == THREAD_NULL) {
-+			printf("[PONG_HB] +%llus [1(%s)] has no active threads\n", elapsed_sec, comm);
-+			proc_rele(p);
-+			continue;
-+		}
-+
-+		struct uthread *ut = get_bsdthread_info(th);
-+		const char *wmesg = (ut && ut->uu_wmesg) ? ut->uu_wmesg : "";
-+
-+		const char *state_str = "UNK";
-+		if (th_state & 0x01 /* TH_WAIT */) {
-+			state_str = "WAIT";
-+		} else if (th_state & 0x04 /* TH_RUN */) {
-+			state_str = "RUN";
-+		} else if (th_state & 0x02 /* TH_SUSP */) {
-+			state_str = "SUSP";
-+		}
-+
-+		if (th_state & 0x01 /* TH_WAIT */) {
-+			printf("[PONG_HB] +%llus [1(%s)] state=%s event=0x%llx wmesg='%s'",
-+			    elapsed_sec, comm, state_str, wait_event, wmesg);
++			printf("[PONG_HB] +%llums #%u cpu=%d pid=1: not found\n", boot_ms, hb_count, cur_cpu);
 +		} else {
-+			printf("[PONG_HB] +%llus [1(%s)] state=%s", elapsed_sec, comm, state_str);
-+		}
++			task_t task = proc_task(p);
++			const char *comm = p->p_comm ? p->p_comm : "unknown";
 +
-+		if (continuation != 0) {
-+			printf(" cont=0x%llx", continuation);
-+		}
++			int th_state = 0;
++			uint64_t wait_event = 0;
++			uint64_t continuation = 0;
++			uint64_t frames[8] = { 0 };
++			int nframes = 0;
 +
-+		if (nframes > 0) {
-+			printf(" bt=[");
-+			for (int i = 0; i < nframes; i++) {
-+				printf("%s0x%llx", (i > 0 ? "," : ""), frames[i]);
++			thread_t th = pong_get_task_first_thread(task, &th_state, &wait_event,
++			    &continuation, frames, 8, &nframes);
++			if (th == THREAD_NULL) {
++				printf("[PONG_HB] +%llums #%u cpu=%d [1(%s)] has no active threads\n",
++				    boot_ms, hb_count, cur_cpu, comm);
++			} else {
++				struct uthread *ut = get_bsdthread_info(th);
++				const char *wmesg = (ut && ut->uu_wmesg) ? ut->uu_wmesg : "";
++
++				const char *state_str = "UNK";
++				if (th_state & 0x01 /* TH_WAIT */) {
++					state_str = "WAIT";
++				} else if (th_state & 0x04 /* TH_RUN */) {
++					state_str = "RUN";
++				} else if (th_state & 0x02 /* TH_SUSP */) {
++					state_str = "SUSP";
++				}
++
++				if (th_state & 0x01 /* TH_WAIT */) {
++					printf("[PONG_HB] +%llums #%u cpu=%d [1(%s)] state=%s event=0x%llx wmesg='%s'",
++					    boot_ms, hb_count, cur_cpu, comm, state_str, wait_event, wmesg);
++				} else {
++					printf("[PONG_HB] +%llums #%u cpu=%d [1(%s)] state=%s",
++					    boot_ms, hb_count, cur_cpu, comm, state_str);
++				}
++
++				if (continuation != 0) {
++					printf(" cont=0x%llx", continuation);
++				}
++
++				if (nframes > 0) {
++					printf(" bt=[");
++					for (int i = 0; i < nframes; i++) {
++						printf("%s0x%llx", (i > 0 ? "," : ""), frames[i]);
++					}
++					printf("]");
++				}
++				printf("\n");
++
++				thread_deallocate(th);
 +			}
-+			printf("]");
++			proc_rele(p);
 +		}
-+		printf("\n");
 +
-+		thread_deallocate(th);
-+		proc_rele(p);
++		hb_count++;
++		delay_for_interval((uint32_t)interval, NSEC_PER_SEC);
 +	}
 +}
 +
@@ -3467,16 +3528,26 @@ index 0000000..952c4c2
 +	if (pong_heartbeat <= 0) {
 +		return;
 +	}
++
++	timer_call_setup(&pong_timer_call_entry, pong_timer_call_func, NULL);
++	uint64_t interval_abs = 0;
++	clock_interval_to_absolutetime_interval(1, NSEC_PER_SEC, &interval_abs);
++	timer_call_enter(&pong_timer_call_entry, mach_absolute_time() + interval_abs, TIMER_CALL_SYS_CRITICAL);
++
 +	thread_t thread = THREAD_NULL;
 +	kern_return_t kr = kernel_thread_start(
 +		(thread_continue_t)pong_heartbeat_thread,
 +		NULL,
 +		&thread);
++	uint64_t init_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &init_ns);
 +	if (kr == KERN_SUCCESS) {
-+		printf("[PONG_HB] heartbeat thread started (interval=%ds)\n", pong_heartbeat);
++		printf("[PONG_HB] +%llums heartbeat thread started (interval=%ds, cpus=%u, boot_cpu=%d)\n",
++		    init_ns / 1000000ULL, pong_heartbeat, real_ncpus, cpu_number());
 +		thread_deallocate(thread);
 +	} else {
-+		printf("[PONG_HB] failed to start heartbeat thread: kr=%d\n", kr);
++		printf("[PONG_HB] +%llums failed to start heartbeat thread: kr=%d\n",
++		    init_ns / 1000000ULL, kr);
 +	}
 +}
 +#endif
@@ -3513,7 +3584,7 @@ diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 index ab6a96b..f8b84fa 100644
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -364,7 +364,22 @@ read_internal(struct proc *p, int fd, user_addr_t buf, user_size_t nbyte,
+@@ -364,7 +364,28 @@ read_internal(struct proc *p, int fd, user_addr_t buf, user_size_t nbyte,
  		return EINVAL;
  	}
  
@@ -3521,13 +3592,19 @@ index ab6a96b..f8b84fa 100644
 +	int error = readv_internal(p, fd, uio, flags, retval);
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
++	extern uint64_t mach_absolute_time(void);
++	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
 +		if (flags & FOF_OFFSET) {
-+			printf("[PONG_PREAD] [1(%s)] fd=%d off=0x%llx nbyte=%zu -> err=%d nread=%lld\n",
++			printf("[PONG_PREAD] +%llums [1(%s)] fd=%d off=0x%llx nbyte=%zu -> err=%d nread=%lld\n",
++			    ms / 1000000ULL,
 +			    p->p_comm ? p->p_comm : "unknown", fd, (uint64_t)offset, (size_t)nbyte,
 +			    error, (long long)(retval ? *retval : 0));
 +		} else {
-+			printf("[PONG_READ] [1(%s)] fd=%d nbyte=%zu -> err=%d nread=%lld\n",
++			printf("[PONG_READ] +%llums [1(%s)] fd=%d nbyte=%zu -> err=%d nread=%lld\n",
++			    ms / 1000000ULL,
 +			    p->p_comm ? p->p_comm : "unknown", fd, (size_t)nbyte,
 +			    error, (long long)(retval ? *retval : 0));
 +		}
@@ -3648,26 +3725,30 @@ index 69b9d1f..5fc350d 100644
  	ret = amfi->OSEntitlements.adjustContextWithoutMonitor(
  		cs_blob->csb_entitlements,
  		cs_blob);
-@@ -4762,6 +4804,18 @@ ubc_cs_blob_add(
+@@ -4762,6 +4804,22 @@ ubc_cs_blob_add(
  		return error;
  	}
  
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
++	extern uint64_t mach_absolute_time(void);
++	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +	proc_t curp = current_proc();
 +	bool trace_cs = (pong_syscall_trace && curp && proc_pid(curp) == 1);
 +	uint64_t t0 = 0;
 +	if (trace_cs) {
 +		t0 = mach_absolute_time();
-+		printf("[PONG_CS] ubc_cs_blob_add enter vp=%p size=0x%lx base_offset=0x%llx\n",
-+		    (void *)vp, (unsigned long)size, (uint64_t)base_offset);
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(t0, &ms);
++		printf("[PONG_CS] +%llums ubc_cs_blob_add enter vp=%p size=0x%lx base_offset=0x%llx\n",
++		    ms / 1000000ULL, (void *)vp, (unsigned long)size, (uint64_t)base_offset);
 +	}
 +#endif
 +
  	tmp_blob.csb_cpu_type = cputype;
  	tmp_blob.csb_cpu_subtype = cpusubtype & ~CPU_SUBTYPE_MASK;
  	tmp_blob.csb_base_offset = base_offset;
-@@ -4945,6 +4999,14 @@ ubc_cs_blob_add(
+@@ -4945,6 +5003,14 @@ ubc_cs_blob_add(
  		goto out;
  	}
  
@@ -3682,7 +3763,7 @@ index 69b9d1f..5fc350d 100644
  	/*
  	 * The vnode_lock, linked list traversal, and marking of the memory object as
  	 * signed can all be blocking operations. Compute a PAC over the tmp_blob.
-@@ -5160,6 +5222,15 @@ out:
+@@ -5160,6 +5226,17 @@ out:
  		error = 0;
  	}
  
@@ -3690,15 +3771,17 @@ index 69b9d1f..5fc350d 100644
 +	if (trace_cs) {
 +		uint64_t elapsed_ns = 0;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &elapsed_ns);
-+		printf("[PONG_CS] ubc_cs_blob_add exit error=%d elapsed=%lluus\n",
-+		    error, elapsed_ns / 1000);
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_CS] +%llums ubc_cs_blob_add exit error=%d elapsed=%lluus\n",
++		    ms / 1000000ULL, error, elapsed_ns / 1000);
 +	}
 +#endif
 +
  	return error;
  }
  
-@@ -5812,6 +5883,148 @@ ubc_get_cs_mtime(
+@@ -5812,6 +5889,215 @@ ubc_get_cs_mtime(
  
  unsigned long cs_validate_page_no_hash = 0;
  unsigned long cs_validate_page_bad_hash = 0;
@@ -3715,7 +3798,7 @@ index 69b9d1f..5fc350d 100644
 + * derived array readonly before its owning RO cs_blob can become visible.
 + * VM fault validation consequently performs no vnode I/O under object locks.
 + */
-+__attribute__((noinline))
+++__attribute__((noinline))
 +static int
 +cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
 +{
@@ -3734,16 +3817,45 @@ index 69b9d1f..5fc350d 100644
 +
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
++	extern int get_preemption_level(void);
++	extern boolean_t ml_get_interrupts_enabled(void);
++	extern int cpu_number(void);
++	struct pong_state_data {
++		volatile uint32_t timer_ticks;
++		volatile uint32_t thread_hb;
++		volatile uint64_t last_timer_ms;
++		volatile uint32_t cs_slot;
++		volatile uint32_t cs_nslots;
++		volatile uint64_t cs_offset;
++		volatile uint64_t cs_limit;
++		volatile int32_t  pong_stage;
++		volatile int32_t  cpu;
++	};
++	extern struct pong_state_data pong_live_state;
++	extern void pong_ramoops_update_state(void);
++
 +	proc_t curp4k = current_proc();
 +	bool trace_cs4k = (pong_syscall_trace && curp4k && proc_pid(curp4k) == 1);
 +	uint64_t t4k = 0;
 +	if (trace_cs4k) {
 +		t4k = mach_absolute_time();
-+		printf("[PONG_CS_4K] enter limit=0x%llx (nslots=%u pageshift=%d)\n",
++		uint64_t now_ns = 0;
++		absolutetime_to_nanoseconds(t4k, &now_ns);
++		printf("[PONG_CS_4K] +%llums enter limit=0x%llx (nslots=%u pageshift=%d intr=%d preempt=%d cpu=%d)\n",
++		    now_ns / 1000000ULL,
 +		    (cd ? (uint64_t)ntohl(cd->codeLimit) : 0),
 +		    (cd ? ntohl(cd->nCodeSlots) : 0),
-+		    blob->csb_hash_pageshift);
++		    blob->csb_hash_pageshift,
++		    (int)ml_get_interrupts_enabled(),
++		    get_preemption_level(),
++		    cpu_number());
 +	}
++	pong_live_state.cs_slot = 0;
++	pong_live_state.cs_nslots = cd ? ntohl(cd->nCodeSlots) : 0;
++	pong_live_state.cs_limit = cd ? (uint64_t)ntohl(cd->codeLimit) : 0;
++	pong_live_state.cs_offset = 0;
++	pong_live_state.cpu = cpu_number();
++	pong_ramoops_update_state();
 +#endif
 +
 +	if (PAGE_SHIFT != 12 || blob->csb_hash_pageshift != 14 || cd == NULL || md == NULL ||
@@ -3787,9 +3899,42 @@ index 69b9d1f..5fc350d 100644
 +			error = EOVERFLOW;
 +			goto out;
 +		}
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		uint32_t block_idx = (uint32_t)(offset >> 14);
++		pong_live_state.cs_slot = block_idx;
++		pong_live_state.cs_offset = offset;
++		if (trace_cs4k && block_idx > 0 && (block_idx % 1024) == 0) {
++			uint64_t cur_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &cur_ns);
++			uint64_t el_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t4k, &el_ns);
++			printf("[PONG_CS_4K] +%llums progress block=%u/%u off=0x%llx/0x%llx (elapsed=%llums cpu=%d)\n",
++			    cur_ns / 1000000ULL, block_idx, (uint32_t)((limit + 16383) >> 14),
++			    (uint64_t)offset, (uint64_t)limit, el_ns / 1000000ULL, cpu_number());
++			pong_ramoops_update_state();
++		}
++		uint64_t t_io0 = mach_absolute_time();
++#endif
++
 +		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)length, position,
 +		    UIO_SYSSPACE, 0, vfs_context_ucred(vfs_context_current()),
 +		    &resid, current_proc());
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		uint64_t t_io1 = mach_absolute_time();
++		uint64_t io_ns = 0;
++		absolutetime_to_nanoseconds(t_io1 - t_io0, &io_ns);
++		uint64_t io_ms = io_ns / 1000000ULL;
++		if (trace_cs4k && io_ms >= 500) {
++			uint64_t cur_ns = 0;
++			absolutetime_to_nanoseconds(t_io1, &cur_ns);
++			printf("[PONG_CS_4K] +%llums slow vn_rdwr off=0x%llx pos=0x%llx took %llums (cpu=%d err=%d)\n",
++			    cur_ns / 1000000ULL, (uint64_t)offset, (uint64_t)position, io_ms, cpu_number(), error);
++			pong_ramoops_update_state();
++		}
++#endif
++
 +		if (error || resid) {
 +			error = error ? error : EIO;
 +			goto out;
@@ -3837,9 +3982,14 @@ index 69b9d1f..5fc350d 100644
 +	if (trace_cs4k) {
 +		uint64_t elapsed_ns = 0;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - t4k, &elapsed_ns);
-+		printf("[PONG_CS_4K] exit error=%d elapsed=%lluus\n",
-+		    error, elapsed_ns / 1000);
++		uint64_t now_ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++		printf("[PONG_CS_4K] +%llums exit error=%d elapsed=%lluus\n",
++		    now_ns / 1000000ULL, error, elapsed_ns / 1000);
 +	}
++	pong_live_state.cs_slot = (uint32_t)((limit + 16383) >> 14);
++	pong_live_state.cs_offset = limit;
++	pong_ramoops_update_state();
 +#endif
 +	return error;
 +}
@@ -3847,7 +3997,7 @@ index 69b9d1f..5fc350d 100644
  static boolean_t
  cs_validate_hash(
  	struct cs_blob          *blobs,
-@@ -5835,6 +6048,7 @@ cs_validate_hash(
+@@ -5835,6 +6121,7 @@ cs_validate_hash(
  	off_t                   codeLimit = 0;
  	const char              *lower_bound, *upper_bound;
  	vm_offset_t             kaddr, blob_addr;
@@ -3855,7 +4005,7 @@ index 69b9d1f..5fc350d 100644
  
  	/* retrieve the expected hash */
  	found_hash = FALSE;
-@@ -5870,15 +6084,31 @@ cs_validate_hash(
+@@ -5870,15 +6157,31 @@ cs_validate_hash(
  			if (hashtype->cs_digest_size > sizeof(actual_hash)) {
  				panic("hash size too large");
  			}
@@ -3895,7 +4045,7 @@ index 69b9d1f..5fc350d 100644
  			if (hash != NULL) {
  				bcopy(hash, expected_hash, hashtype->cs_size);
  				found_hash = TRUE;
-@@ -5908,7 +6138,7 @@ cs_validate_hash(
+@@ -5908,7 +6211,7 @@ cs_validate_hash(
  	} else {
  		*tainted = 0;
  
@@ -3904,7 +4054,7 @@ index 69b9d1f..5fc350d 100644
  		*bytes_processed = size;
  
  		const uint32_t *asha1, *esha1;
-@@ -5974,6 +6204,7 @@ cs_validate_hash(
+@@ -5974,6 +6277,7 @@ cs_validate_hash(
  	return validated;
  }
  
@@ -9083,7 +9233,7 @@ index fe34d1b..c3179e8 100644
  #include <sys/systm.h>
  #include <sys/syslimits.h> /* For MAXLONGPATHLEN */
  #include <sys/namei.h>
-@@ -4673,9 +4677,55 @@ fg_vn_data_free(void *fgvndata)
+@@ -4673,9 +4677,60 @@ fg_vn_data_free(void *fgvndata)
   *
   * XXX Need to implement uid, gid
   */
@@ -9124,7 +9274,12 @@ index fe34d1b..c3179e8 100644
 +
 +#if defined(PONG)
 +	if (pong_open_trace && pong_open_path[0] != '\0') {
-+		printf("PONG_OPEN: [%d(%s)] path='%s' flags=0x%x -> %s=%d\n",
++		extern uint64_t mach_absolute_time(void);
++		extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_OPEN] +%llums [%d(%s)] path='%s' flags=0x%x -> %s=%d\n",
++		    ms / 1000000ULL,
 +		    proc_getpid(p), p->p_comm ? p->p_comm : "unknown", pong_open_path, uflags,
 +		    error ? "error" : "fd", error ? error : (retval ? *retval : -1));
 +	}
@@ -9139,7 +9294,7 @@ index fe34d1b..c3179e8 100644
  {
  	proc_t p = vfs_context_proc(ctx);
  	kauth_cred_t p_cred = current_cached_proc_cred(PROC_NULL);
-@@ -4709,6 +4759,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -4709,6 +4764,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
  	if ((error = falloc_withinit(p, p_cred, ctx, &fp, &indx, fp_init, initarg)) != 0) {
  		return error;
  	}
@@ -9150,7 +9305,7 @@ index fe34d1b..c3179e8 100644
  	if (flags & O_CLOEXEC) {
  		fp->fp_flags |= FP_CLOEXEC;
  	}
-@@ -4735,6 +4789,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -4735,6 +4794,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
  		}
  	}
  
@@ -9161,7 +9316,7 @@ index fe34d1b..c3179e8 100644
  	if ((error = vn_open_auth(ndp, &flags, vap, authvp))) {
  		if (authvp != NULLVP) {
  			vnode_put(authvp);
-@@ -4756,6 +4814,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -4756,6 +4819,10 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
  		vnode_put(authvp);
  	}
  
@@ -9172,7 +9327,7 @@ index fe34d1b..c3179e8 100644
  	uu->uu_dupfd = 0;
  	vp = ndp->ni_vp;
  
-@@ -5201,7 +5263,15 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+@@ -5201,7 +5268,15 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
  	int cmode;
  	int error;
  
@@ -9188,7 +9343,7 @@ index fe34d1b..c3179e8 100644
  	vap = &__open_data->va;
  	ndp = &__open_data->nd;
  
-@@ -5223,7 +5293,14 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+@@ -5223,7 +5298,14 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
  int
  open(proc_t p, struct open_args *uap, int32_t *retval)
  {
@@ -9207,14 +9362,19 @@ diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
 index 2620af5..db00432 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -952,6 +952,14 @@ shared_region_check_np(
+@@ -952,6 +952,19 @@ shared_region_check_np(
  		proc_getpid(p), p->p_comm,
  		(uint64_t)uap->start_address));
  
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
++	extern uint64_t mach_absolute_time(void);
++	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_SR_CHECK] [1(%s)] enter uap->start_address=0x%llx\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_SR_CHECK] +%llums [1(%s)] enter uap->start_address=0x%llx\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", (uint64_t)uap->start_address);
 +	}
 +#endif
@@ -9222,7 +9382,7 @@ index 2620af5..db00432 100644
  	/*
  	 * Special value of start_address used to indicate that map_with_linking() should
  	 * no longer be allowed in this process
-@@ -963,6 +971,14 @@ shared_region_check_np(
+@@ -963,6 +976,14 @@ shared_region_check_np(
  
  	/* retrieve the current tasks's shared region */
  	shared_region = vm_shared_region_get(task);
@@ -9237,7 +9397,7 @@ index 2620af5..db00432 100644
  	if (shared_region != NULL) {
  		/*
  		 * A NULL argument is used by dyld to indicate the task
-@@ -970,6 +986,10 @@ shared_region_check_np(
+@@ -970,6 +991,10 @@ shared_region_check_np(
  		 */
  		if (uap->start_address == 0) {
  			/* unmap it first */
@@ -9248,7 +9408,7 @@ index 2620af5..db00432 100644
  			vm_shared_region_remove(task, shared_region);
  			vm_shared_region_set(task, NULL);
  		} else {
-@@ -978,10 +998,12 @@ shared_region_check_np(
+@@ -978,10 +1003,12 @@ shared_region_check_np(
  			if (kr != KERN_SUCCESS) {
  				SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] "
  				    "check_np(0x%llx) "
@@ -9263,7 +9423,7 @@ index 2620af5..db00432 100644
  				error = ENOMEM;
  			} else {
  #if __has_feature(ptrauth_calls)
-@@ -1014,6 +1036,11 @@ shared_region_check_np(
+@@ -1014,6 +1041,11 @@ shared_region_check_np(
  							proc_getpid(p), p->p_comm,
  							(uint64_t)uap->start_address, (uint64_t)start_address,
  							error));
@@ -9275,7 +9435,7 @@ index 2620af5..db00432 100644
  					}
  				}
  			}
-@@ -1021,6 +1048,10 @@ shared_region_check_np(
+@@ -1021,6 +1053,10 @@ shared_region_check_np(
  		vm_shared_region_deallocate(shared_region);
  	} else {
  		/* no shared region ! */
@@ -9286,13 +9446,16 @@ index 2620af5..db00432 100644
  		error = EINVAL;
  	}
  
-@@ -1030,6 +1061,13 @@ shared_region_check_np(
+@@ -1030,6 +1066,16 @@ shared_region_check_np(
  		proc_getpid(p), p->p_comm,
  		(uint64_t)uap->start_address, (uint64_t)start_address, error));
  
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_SR_CHECK] [1(%s)] exit error=%d\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_SR_CHECK] +%llums [1(%s)] exit error=%d\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", error);
 +	}
 +#endif
@@ -9300,7 +9463,7 @@ index 2620af5..db00432 100644
  	return error;
  }
  
-@@ -1070,6 +1108,193 @@ static void shared_region_map_and_slide_cleanup(
+@@ -1070,6 +1116,193 @@ static void shared_region_map_and_slide_cleanup(
  	struct _sr_file_mappings *sr_file_mappings,
  	struct vm_shared_region  *shared_region);
  
@@ -9494,7 +9657,7 @@ index 2620af5..db00432 100644
  /*
   * Setup part of _shared_region_map_and_slide().
   * It had to be broken out of _shared_region_map_and_slide() to
-@@ -1105,16 +1330,28 @@ shared_region_map_and_slide_setup(
+@@ -1105,16 +1338,28 @@ shared_region_map_and_slide_setup(
  		proc_getpid(p), p->p_comm));
  
  	if (files_count > _SR_FILE_MAPPINGS_MAX_FILES) {
@@ -9523,7 +9686,7 @@ index 2620af5..db00432 100644
  		error = ENOMEM;
  		goto done;
  	}
-@@ -1126,6 +1363,10 @@ shared_region_map_and_slide_setup(
+@@ -1126,6 +1371,10 @@ shared_region_map_and_slide_setup(
  		srfmp->mappings = &mappings[mappings_next];
  		mappings_next += srfmp->mappings_count;
  		if (mappings_next > mappings_count) {
@@ -9534,7 +9697,7 @@ index 2620af5..db00432 100644
  			error = EINVAL;
  			goto done;
  		}
-@@ -1263,6 +1504,14 @@ shared_region_map_and_slide_setup(
+@@ -1263,6 +1512,14 @@ shared_region_map_and_slide_setup(
  		error = mac_file_check_mmap(vfs_context_ucred(vfs_context_current()),
  		    srfmp->fp->fp_glob, VM_PROT_ALL, MAP_FILE | MAP_PRIVATE | MAP_FIXED, 0, &maxprot);
  		if (error) {
@@ -9549,7 +9712,7 @@ index 2620af5..db00432 100644
  			goto done;
  		}
  #endif /* MAC */
-@@ -1402,15 +1651,34 @@ after_root_check:
+@@ -1402,15 +1659,34 @@ after_root_check:
  		 * is either on the root volume or in the preboot cryptex volume.
  		 */
  		assert(rdir_vp != NULL);
@@ -9585,7 +9748,7 @@ index 2620af5..db00432 100644
  				SHARED_REGION_TRACE_ERROR(
  					("shared_region: %p [%d(%s)] map(%p:'%s'): "
  					"not on process' root volume nor preboot volume\n",
-@@ -1429,7 +1697,11 @@ after_root_check:
+@@ -1429,7 +1705,11 @@ after_root_check:
  		}
  #endif /* CONFIG_CSR */
  
@@ -9598,7 +9761,7 @@ index 2620af5..db00432 100644
  			char **expected_scdir_path = is_driverkit ? driverkit_scdir_path : scdir_path;
  			struct vnode *scdir_vp = NULL;
  			for (expected_scdir_path = is_driverkit ? driverkit_scdir_path : scdir_path;
-@@ -1570,6 +1842,10 @@ _shared_region_map_and_slide(
+@@ -1570,6 +1850,10 @@ _shared_region_map_and_slide(
  	 * Get a reference to the current proc's root dir.
  	 * Need this to prevent racing with chroot.
  	 */
@@ -9609,7 +9772,7 @@ index 2620af5..db00432 100644
  	proc_fdlock(p);
  	rdir_vp = p->p_fd.fd_rdir;
  	if (rdir_vp == NULL) {
-@@ -1586,6 +1862,9 @@ _shared_region_map_and_slide(
+@@ -1586,6 +1870,9 @@ _shared_region_map_and_slide(
  	    files, mappings_count, mappings,
  	    &sr_file_mappings, &shared_region, rdir_vp);
  	if (error != 0) {
@@ -9619,7 +9782,7 @@ index 2620af5..db00432 100644
  		vnode_put(rdir_vp);
  		return error;
  	}
-@@ -1597,6 +1876,14 @@ _shared_region_map_and_slide(
+@@ -1597,6 +1884,14 @@ _shared_region_map_and_slide(
  		    "vm_shared_region_map_file() failed kr=0x%x\n",
  		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
  		    proc_getpid(p), p->p_comm, kr));
@@ -9634,7 +9797,7 @@ index 2620af5..db00432 100644
  	}
  
  	/* convert kern_return_t to errno */
-@@ -1760,6 +2047,7 @@ shared_region_map_and_slide_2_np_sanitize(
+@@ -1760,6 +2055,7 @@ shared_region_map_and_slide_2_np_sanitize(
  			sizeof(shared_file_mapping_slide_np_ut),
  			&mapping_u);
  		if (__improbable(kr != KERN_SUCCESS)) {
@@ -9642,7 +9805,7 @@ index 2620af5..db00432 100644
  			return kr;
  		}
  
-@@ -1778,6 +2066,8 @@ shared_region_map_and_slide_2_np_sanitize(
+@@ -1778,6 +2074,8 @@ shared_region_map_and_slide_2_np_sanitize(
  			&end,
  			&size);
  		if (__improbable(kr != KERN_SUCCESS)) {
@@ -9651,7 +9814,7 @@ index 2620af5..db00432 100644
  			return kr;
  		}
  
-@@ -1792,9 +2082,13 @@ shared_region_map_and_slide_2_np_sanitize(
+@@ -1792,9 +2090,13 @@ shared_region_map_and_slide_2_np_sanitize(
  			&offset_end,
  			&offset_size);
  		if (__improbable(kr != KERN_SUCCESS)) {
@@ -9665,7 +9828,7 @@ index 2620af5..db00432 100644
  			return KERN_INVALID_ARGUMENT;
  		}
  
-@@ -1818,6 +2112,8 @@ shared_region_map_and_slide_2_np_sanitize(
+@@ -1818,6 +2120,8 @@ shared_region_map_and_slide_2_np_sanitize(
  			&slide_end,
  			&slide_size);
  		if (__improbable(kr != KERN_SUCCESS)) {
@@ -9674,7 +9837,7 @@ index 2620af5..db00432 100644
  			return kr;
  		}
  
-@@ -1830,6 +2126,8 @@ shared_region_map_and_slide_2_np_sanitize(
+@@ -1830,6 +2134,8 @@ shared_region_map_and_slide_2_np_sanitize(
  			&cur,
  			&max);
  		if (__improbable(kr != KERN_SUCCESS)) {
@@ -9683,7 +9846,7 @@ index 2620af5..db00432 100644
  			return kr;
  		}
  
-@@ -1849,6 +2147,7 @@ shared_region_map_and_slide_2_np_sanitize(
+@@ -1849,6 +2155,7 @@ shared_region_map_and_slide_2_np_sanitize(
  			    user_addr,
  			    sizeof(shared_file_mapping_slide_np_ut),
  			    &user_addr))) {
@@ -9691,14 +9854,19 @@ index 2620af5..db00432 100644
  			return KERN_INVALID_ARGUMENT;
  		}
  	}
-@@ -1871,6 +2170,20 @@ shared_region_map_and_slide_2_np(
+@@ -1871,6 +2178,25 @@ shared_region_map_and_slide_2_np(
  	files_count = uap->files_count;
  	mappings_count = uap->mappings_count;
  
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
++	extern uint64_t mach_absolute_time(void);
++	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_SR_MAP] [1(%s)] enter files=%u mappings=%u\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_SR_MAP] +%llums [1(%s)] enter files=%u mappings=%u\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", files_count, mappings_count);
 +	}
 +#endif
@@ -9712,7 +9880,7 @@ index 2620af5..db00432 100644
  	if (files_count == 0) {
  		SHARED_REGION_TRACE_INFO(
  			("shared_region: %p [%d(%s)] map(): "
-@@ -1927,6 +2240,10 @@ shared_region_map_and_slide_2_np(
+@@ -1927,6 +2253,10 @@ shared_region_map_and_slide_2_np(
  	 */
  	kr = shared_region_copyin(p, uap->files, files_count, sizeof(shared_files[0]), shared_files);
  	if (kr != KERN_SUCCESS) {
@@ -9723,7 +9891,7 @@ index 2620af5..db00432 100644
  		goto done;
  	}
  
-@@ -1937,6 +2254,10 @@ shared_region_map_and_slide_2_np(
+@@ -1937,6 +2267,10 @@ shared_region_map_and_slide_2_np(
  		mappings);
  	if (__improbable(kr != KERN_SUCCESS)) {
  		kr = vm_sanitize_get_kr(kr);
@@ -9734,7 +9902,7 @@ index 2620af5..db00432 100644
  		goto done;
  	}
  
-@@ -1957,6 +2278,11 @@ shared_region_map_and_slide_2_np(
+@@ -1957,6 +2291,11 @@ shared_region_map_and_slide_2_np(
  	}
  #endif /* DEVELOPMENT || DEBUG */
  
@@ -9746,7 +9914,7 @@ index 2620af5..db00432 100644
  	/*
  	 * Fix up the mappings to reflect the desired slide.
  	 */
-@@ -1980,6 +2306,11 @@ shared_region_map_and_slide_2_np(
+@@ -1980,6 +2319,11 @@ shared_region_map_and_slide_2_np(
  					    mappings[m].sms_address,
  					    slide_amount,
  					    &mappings[m].sms_address))) {
@@ -9758,7 +9926,7 @@ index 2620af5..db00432 100644
  				kr = KERN_INVALID_ARGUMENT;
  				goto done;
  			}
-@@ -1995,6 +2326,11 @@ shared_region_map_and_slide_2_np(
+@@ -1995,6 +2339,11 @@ shared_region_map_and_slide_2_np(
  						    mappings[m].sms_slide_start,
  						    mappings[m].sms_slide_size,
  						    &discard))) {
@@ -9770,7 +9938,7 @@ index 2620af5..db00432 100644
  					kr = KERN_INVALID_ARGUMENT;
  					goto done;
  				}
-@@ -2004,8 +2340,18 @@ shared_region_map_and_slide_2_np(
+@@ -2004,8 +2353,21 @@ shared_region_map_and_slide_2_np(
  
  	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);
  done:
@@ -9782,7 +9950,10 @@ index 2620af5..db00432 100644
  	kfree_data(mappings, mappings_count * sizeof(mappings[0]));
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	if (pong_syscall_trace && p && proc_pid(p) == 1) {
-+		printf("[PONG_SR_MAP] [1(%s)] exit kr=0x%x\n",
++		uint64_t ms = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++		printf("[PONG_SR_MAP] +%llums [1(%s)] exit kr=0x%x\n",
++		    ms / 1000000ULL,
 +		    p->p_comm ? p->p_comm : "unknown", kr);
 +	}
 +#endif
@@ -17583,7 +17754,7 @@ new file mode 100644
 index 0000000..3b96c89
 --- /dev/null
 +++ b/osfmk/arm64/pong_ramoops_console.h
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,280 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Minimal persistent console mirror for SM8250 / Pong. It does not touch VBAR, TTBR,
 + * the framebuffer, scheduler state, IOKit, or storage. */
@@ -17646,6 +17817,70 @@ index 0000000..3b96c89
 +		__asm__ volatile("dsb sy" ::: "memory");
 +	}
 +	__atomic_store_n(&pong_diagnostic_busy, 0, __ATOMIC_RELEASE);
++}
++
+++struct pong_state_data {
++	volatile uint32_t timer_ticks;
++	volatile uint32_t thread_hb;
++	volatile uint64_t last_timer_ms;
++	volatile uint32_t cs_slot;
++	volatile uint32_t cs_nslots;
++	volatile uint64_t cs_offset;
++	volatile uint64_t cs_limit;
++	volatile int32_t  pong_stage;
++	volatile int32_t  cpu;
++};
++
++struct pong_state_data pong_live_state;
++static volatile uint32_t pong_state_updating;
++
++void pong_ramoops_update_state(void);
++void
++pong_ramoops_update_state(void)
++{
++	if (!pong_diagnostic_base) {
++		return;
++	}
++	if (__atomic_exchange_n(&pong_state_updating, 1, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	char buf[128];
++	int len = snprintf(buf, sizeof(buf),
++	    "PONG_STAT: t_tick=%u t_ms=%llu th_hb=%u cs=%u/%u off=0x%llx/0x%llx stg=%d cpu=%d\n",
++	    pong_live_state.timer_ticks,
++	    pong_live_state.last_timer_ms,
++	    pong_live_state.thread_hb,
++	    pong_live_state.cs_slot,
++	    pong_live_state.cs_nslots,
++	    pong_live_state.cs_offset,
++	    pong_live_state.cs_limit,
++	    pong_live_state.pong_stage,
++	    pong_live_state.cpu);
++	if (len > 0) {
++		if (len > (int)sizeof(buf) - 1) {
++			len = (int)sizeof(buf) - 1;
++		}
++		volatile uint8_t *slot = (volatile uint8_t *)(uintptr_t)
++		    (pong_diagnostic_base + PONG_RAMOOPS_HEADER_BYTES + 64);
++		for (int i = 0; i < len; i++) {
++			slot[i] = (uint8_t)buf[i];
++		}
++		for (int i = len; i < 128; i++) {
++			slot[i] = (i == 127) ? '\n' : ' ';
++		}
++		FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)slot, 128);
++		__asm__ volatile("dsb sy" ::: "memory");
++		struct pong_ramoops_header *header =
++		    (struct pong_ramoops_header *)(uintptr_t)pong_diagnostic_base;
++		if (header->size < 192) {
++			header->size = 192;
++			header->start = 192;
++			header->sig = PONG_RAMOOPS_MAGIC;
++			FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)header, PONG_RAMOOPS_HEADER_BYTES);
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++	}
++	__atomic_store_n(&pong_state_updating, 0, __ATOMIC_RELEASE);
 +}
 +
 +void pong_ramoops_console_write(const char *, int);
@@ -17787,6 +18022,17 @@ index 0000000..3b96c89
 +	static const char ready[] = "XNU T970 RAMOOPS CONSOLE READY (0x9FA40000, 256K)\n";
 +	pong_ramoops_console_write(ready, (int)sizeof(ready)-1);
 +	pong_ramoops_diagnostic_write(ready, (int)sizeof(ready)-1);
++	if (pong_diagnostic_base) {
++		pong_diagnostic_size = 192;
++		struct pong_ramoops_header *header =
++		    (struct pong_ramoops_header *)(uintptr_t)pong_diagnostic_base;
++		header->size = 192;
++		header->start = 192;
++		header->sig = PONG_RAMOOPS_MAGIC;
++		FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)header, PONG_RAMOOPS_HEADER_BYTES);
++		__asm__ volatile("dsb sy" ::: "memory");
++		pong_ramoops_update_state();
++	}
 +	return 1;
 +}
 diff --git a/osfmk/arm64/pong_ui_exception.c b/osfmk/arm64/pong_ui_exception.c
