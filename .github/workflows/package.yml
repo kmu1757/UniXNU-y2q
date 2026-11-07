@@ -65,6 +65,10 @@ on:
         description: "Extra kernel boot-args appended to board.toml kernel_args (for example a device-specific pong_shngroot_4k=<lba>). Empty adds nothing."
         type: string
         default: ""
+      no_cache:
+        description: "Skip all caches (edk2 BaseTools, XNU tree/build, ccache) and build cleanly"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -81,6 +85,10 @@ env:
   IPSW_SHA256: ${{ inputs.ipsw_sha256 }}
   PRELINK: ${{ inputs.prelink }}
   PONG_STORAGE_BINDING: ${{ inputs.storage_binding || 'self' }}
+  NO_CACHE: ${{ inputs.no_cache }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,file_macro
   # Pinned: `release`, its steps and this repository's scripts/package.sh are one
   # interface. Move both together.
   UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
@@ -322,7 +330,7 @@ jobs:
           # cmake, ninja and llvm have no bottle on this Tier 3 runner, so nothing
           # installs them: the image's own copies are used, and the llvm keg is put
           # on PATH rather than linked.
-          brew install dtc lzfse mtools nasm acpica lld || brew install dtc lzfse mtools nasm acpica
+          brew install dtc lzfse mtools nasm acpica lld ccache || brew install dtc lzfse mtools nasm acpica ccache
           ok=1
           for t in dtc lzfse mformat mcopy nasm iasl cmake ninja make unifdef python3; do
             command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
@@ -453,6 +461,36 @@ jobs:
             printf 'PONG_VOLUME_LAYOUT=%s\n' "$PWD/ci-volume-layout.json"
             printf 'PATH=%s:%s:%s\n' "${LLVM_KEG}/bin" "${LLD_KEG}/bin" "$PATH"
           } >> "$GITHUB_ENV"
+      - name: edk2 BaseTools cache
+        if: ${{ !inputs.no_cache }}
+        uses: actions/cache@v4
+        with:
+          path: UniXNU/out/feeds
+          key: edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}
+      - name: XNU tree and build cache
+        if: ${{ !inputs.no_cache }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            tree/.cache
+            tree/build
+          key: xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/board.toml') }}-${{ hashFiles('device/patches/xnu-ipados18/*.patch') }}
+          restore-keys: |
+            xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/board.toml') }}-
+      - name: ccache
+        if: ${{ !inputs.no_cache }}
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-
+      - name: initialize ccache
+        if: ${{ !inputs.no_cache }}
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache -z || true
+          ccache -s || true
       - name: package
         working-directory: device
         env:
@@ -461,6 +499,7 @@ jobs:
           UNIXNU_DEVICE: ${{ github.workspace }}/device
           PONG_VOLUME_LAYOUT: ${{ github.workspace }}/ci-volume-layout.json
           PONG_LLVM: ${{ env.LLVM_KEG }}/bin
+          CCACHE_DIR: ${{ env.CCACHE_DIR }}
         run: |
           set -euo pipefail
           ncpu=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
@@ -472,6 +511,10 @@ jobs:
             args+=(--skip-prelink)
           fi
           ./scripts/package.sh "${args[@]}"
+      - name: ccache summary
+        if: always() && !inputs.no_cache
+        run: |
+          ccache -s || true
       - name: boot image for the firmware
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
