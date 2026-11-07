@@ -52,12 +52,3 @@ commit = "f62243e56a30472deed9112631b2480ab461df3e"
 # PongPlatform24 is not a feed source: the kit ships in this repository at
 # kits/PongPlatform24, so the resolver takes it from the device directories.
 
-# Precedent implementation for SM8250 / gts7xlwifi DRAM extension, holes, 3-cluster SMP, SPI IPI
-# Licensed under BSD-2-Clause-Patent.
-[[source]]
-name = "unixnu-gts7xlwifi"
-kind = "precedent"
-git = "https://github.com/rui12366B/UniXNU-gts7xlwifi.git"
-ref = "main"
-commit = "2fad008dc3f21d0ff9a60aaefbf47065fce4805b"
-
