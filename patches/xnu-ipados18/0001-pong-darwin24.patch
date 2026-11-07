@@ -17768,7 +17768,7 @@ new file mode 100644
 index 0000000..cf3892c
 --- /dev/null
 +++ b/osfmk/arm64/pong_ui_exception.c
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,144 @@
 +/* Bounded UI crash capture derived from the earlier user_exception_trace.c.
 + * Exception delivery is unchanged; no polling threads or periodic probes.
 + */
@@ -17779,7 +17779,6 @@ index 0000000..cf3892c
 +#include <kern/queue.h>
 +#include <kern/task.h>
 +#include <kern/thread.h>
-+#include <kern/thread_kernel_state.h>
 +#include <mach/exception_types.h>
 +#include <machine/machine_routines.h>
 +#include <string.h>
