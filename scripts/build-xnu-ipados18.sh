@@ -75,7 +75,8 @@ import hashlib, os
 from pathlib import Path
 h = hashlib.sha256()
 h.update(os.environ.get('XNU_COMMIT', '').encode('utf-8'))
-for p in sorted(Path('patches/xnu').glob('*.patch')):
+patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
+for p in sorted(p for p in patch_dir.glob('*.patch') if p.is_file()):
     h.update(b'\0')
     h.update(p.name.encode('utf-8'))
     h.update(b':')
@@ -106,6 +107,7 @@ if [ "$RESET_XNU_WORK" = "1" ]; then
   git -C .cache/xnu-work clean -fd
   rm -f "$ROOT/.cache/fakeroot/.xnu-$XNU_VERSION-headers" 2>/dev/null || true
   rm -f .cache/xnu-patch-times.json 2>/dev/null || true
+  rm -rf "$ROOT/build/xnu" 2>/dev/null || true
 fi
 if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
   if [ ! -d refer/AvailabilityVersions/.git ]; then
@@ -125,7 +127,8 @@ from pathlib import Path
 import hashlib, json
 work = Path('.cache/xnu-work')
 snapshot = {}
-for patch in Path('patches/xnu').glob('*.patch'):
+patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
+for patch in sorted(patch_dir.glob('*.patch')):
     for line in patch.read_text().splitlines():
         if line.startswith('+++ b/'):
             relative = line[6:].split('\t', 1)[0]
@@ -142,14 +145,21 @@ while IFS= read -r LATE_PATCH; do
   fi
 done < <(python3 - <<'PY_LATE_PATCHES'
 from pathlib import Path
-patches = [p.resolve() for p in Path('patches/xnu').glob('zz*pong*.patch')]
-patches += [Path('patches/xnu/zzz-boot-progress.patch').resolve(),
-            Path('patches/xnu/zzy-native-gpu-addon-mount.patch').resolve()]
+patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
+patches = [p.resolve() for p in patch_dir.glob('zz*pong*.patch')]
+for name in ('zzz-boot-progress.patch', 'zzy-native-gpu-addon-mount.patch'):
+    candidate = patch_dir / name
+    if candidate.is_file():
+        patches.append(candidate.resolve())
 for patch in sorted(set(patches), reverse=True):
     print(patch)
 PY_LATE_PATCHES
 )
-PATCHES=("$ROOT"/patches/xnu/*.patch)
+if [ -d "$ROOT/patches/xnu" ]; then
+  PATCHES=("$ROOT"/patches/xnu/*.patch)
+else
+  PATCHES=("$ROOT"/patches/xnu-ipados18/*.patch)
+fi
 if [ "$XNU_VERSION" = "10063.141.1" ]; then
   PATCHES+=("$ROOT"/kits/NativePrelink/patches/*.patch)
 fi
@@ -299,18 +309,17 @@ if [ "${XNU_NATIVE_UFS:-0}" = 1 ] && [ -n "${PONG_NATIVE_DRIVER_SOURCE:-}" ]; th
 fi
 if [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
   # The Wi-Fi stack needs inputs that are not part of any public restore.
-  # Point PONG_WIFI_SOURCE/PONG_WIFI_BUILD/PONG_WIFI_FIRMWARE (or the flags
-  # below) at them; refuse rather than silently building without a backend.
-  WIFI_SOURCE=${PONG_WIFI_SOURCE:-/Volumes/Untitled/Pong-iPadOS18/wifi-source-7.0.14}
-  WIFI_BUILD=${PONG_WIFI_BUILD:-/Volumes/Untitled/Pong-iPadOS18/wifi-ath11k-build}
+  # Flags/environment/local.toml resolve in pong_native_inputs. Keep the
+  # archive in this same tree; never link a previous branch's wireless stack.
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-ath11k.py" \
-    --linux "$WIFI_SOURCE" \
-    --output-dir "$WIFI_BUILD"
-  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-wifi-native.py" --tree "$ROOT" \
-    --ath11k "$WIFI_BUILD/libPongAth11k.a"
+    --output-dir "$ROOT/build/pong-ath11k" --jobs "${JOBS:-4}"
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-wifi-native.py" --tree "$ROOT"
 fi
-if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ]; then
+if [ "${XNU_PONG_POWER:-0}" = 1 ]; then
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-power-native.py" --tree "$ROOT"
+fi
+if [ "${XNU_PONG_POWER:-0}" = 1 ] || [ "${XNU_PONG_ADRENO_PLATFORM:-0}" = 1 ] || [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-smmu4k.py" --tree "$ROOT"
 fi
 if [ ! -f "$KERNEL_SDKROOT/usr/local/lib/kernel/libfirehose_kernel.a" ]; then
   bash scripts/build-firehose.sh
@@ -1042,11 +1051,17 @@ PY_RAM_BLOCK_BINDINGS
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
   fi
-  if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ]; then
+  if [ "${XNU_PONG_POWER:-0}" = 1 ]; then
     POWER_ARCHIVE=$ROOT/build/pong-power/libPongPower.a
     test -f "$POWER_ARCHIVE"
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$POWER_ARCHIVE"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $POWER_ARCHIVE"
+  fi
+  if [ "${XNU_PONG_POWER:-0}" = 1 ] || [ "$PONG_ADRENO_PLATFORM" = 1 ] || [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
+    SMMU4K_ARCHIVE=$ROOT/build/pong-smmu4k/libPongSmmu4K.a
+    test -f "$SMMU4K_ARCHIVE"
+    PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$SMMU4K_ARCHIVE"
+    PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $SMMU4K_ARCHIVE"
   fi
   if [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
     WIFI_ARCHIVE=$ROOT/build/pong-wifi/libPongWifiNative.a
@@ -1142,14 +1157,10 @@ for argument in sys.argv[1:]:
 PY_OBJECT_FLAGS
 if command -v ccache >/dev/null 2>&1; then
   CCACHE_BIN="$(command -v ccache)"
-  TARGET_CLANG="$(xcrun -sdk "${XNU_SDKROOT:-iphoneos}" -find clang 2>/dev/null || which clang)"
-  TARGET_CLANGXX="$(xcrun -sdk "${XNU_SDKROOT:-iphoneos}" -find clang++ 2>/dev/null || which clang++)"
   echo "ccache detected: $CCACHE_BIN"
-  echo "target clang: $TARGET_CLANG"
-  echo "target clang++: $TARGET_CLANGXX"
   echo "=== ccache statistics (before compilation) ==="
-  ccache -s || true
-  EXTRA_MAKE_ARGS+=("CC=$CCACHE_BIN $TARGET_CLANG" "CXX=$CCACHE_BIN $TARGET_CLANGXX")
+  "$CCACHE_BIN" -s || true
+  EXTRA_MAKE_ARGS+=("CCACHE=$CCACHE_BIN")
 fi
 make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
   MACHINE_CONFIGS=PONG KERNEL_CONFIGS=DEVELOPMENT \
@@ -1163,7 +1174,7 @@ make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iph
   OBJROOT="$ROOT/build/xnu/ios-obj" SYMROOT="$ROOT/build/xnu/ios-sym" DSTROOT="$ROOT/build/xnu/ios-dst"
 if command -v ccache >/dev/null 2>&1; then
   echo "=== ccache statistics (after compilation) ==="
-  ccache -s || true
+  "$CCACHE_BIN" -s || true
 fi
 if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$CRYPTO_BOOTSTRAP_MODE" = source ]; then
   python3 scripts/seal-source-crypto-kernel.py \

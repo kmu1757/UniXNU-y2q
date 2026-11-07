@@ -68,6 +68,47 @@ if [ "$(git -C .cache/xnu-work rev-parse HEAD)" != "$XNU_COMMIT" ]; then
   echo 'error: existing XNU work tree is another version; use a fresh output directory' >&2
   exit 1
 fi
+
+# Compute deterministic fingerprint of current XNU patches to detect changes and avoid double/stale application.
+CURRENT_PATCHES_HASH=$(python3 - <<'PY_PATCH_HASH'
+import hashlib, os
+from pathlib import Path
+h = hashlib.sha256()
+h.update(os.environ.get('XNU_COMMIT', '').encode('utf-8'))
+patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
+for p in sorted(p for p in patch_dir.glob('*.patch') if p.is_file()):
+    h.update(b'\0')
+    h.update(p.name.encode('utf-8'))
+    h.update(b':')
+    h.update(p.read_bytes())
+print(h.hexdigest())
+PY_PATCH_HASH
+)
+
+PATCH_STAMP=".cache/xnu-applied-patches.sha256"
+RESET_XNU_WORK=0
+
+if [ ! -f "$PATCH_STAMP" ]; then
+  echo "No applied patch record found ($PATCH_STAMP); preparing clean work tree."
+  RESET_XNU_WORK=1
+else
+  PREV_HASH="$(cat "$PATCH_STAMP" 2>/dev/null || true)"
+  if [ "$PREV_HASH" != "$CURRENT_PATCHES_HASH" ]; then
+    echo "Patch set changed (prev: ${PREV_HASH:0:12}, current: ${CURRENT_PATCHES_HASH:0:12}). Resetting work tree..."
+    RESET_XNU_WORK=1
+  else
+    echo "Patch set unchanged (${CURRENT_PATCHES_HASH:0:12}). Preserving cached work tree."
+  fi
+fi
+
+if [ "$RESET_XNU_WORK" = "1" ]; then
+  echo "Resetting .cache/xnu-work to clean upstream $XNU_COMMIT..."
+  git -C .cache/xnu-work reset --hard "$XNU_COMMIT"
+  git -C .cache/xnu-work clean -fd
+  rm -f "$ROOT/.cache/fakeroot/.xnu-$XNU_VERSION-headers" 2>/dev/null || true
+  rm -f .cache/xnu-patch-times.json 2>/dev/null || true
+  rm -rf "$ROOT/build/xnu" 2>/dev/null || true
+fi
 if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
   if [ ! -d refer/AvailabilityVersions/.git ]; then
     git clone --depth 1 --branch "$AVAILABILITY_TAG" https://github.com/apple-oss-distributions/AvailabilityVersions.git refer/AvailabilityVersions
@@ -86,7 +127,8 @@ from pathlib import Path
 import hashlib, json
 work = Path('.cache/xnu-work')
 snapshot = {}
-for patch in Path('patches/xnu').glob('*.patch'):
+patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
+for patch in sorted(patch_dir.glob('*.patch')):
     for line in patch.read_text().splitlines():
         if line.startswith('+++ b/'):
             relative = line[6:].split('\t', 1)[0]
@@ -103,14 +145,21 @@ while IFS= read -r LATE_PATCH; do
   fi
 done < <(python3 - <<'PY_LATE_PATCHES'
 from pathlib import Path
-patches = [p.resolve() for p in Path('patches/xnu').glob('zz*pong*.patch')]
-patches += [Path('patches/xnu/zzz-boot-progress.patch').resolve(),
-            Path('patches/xnu/zzy-native-gpu-addon-mount.patch').resolve()]
+patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
+patches = [p.resolve() for p in patch_dir.glob('zz*pong*.patch')]
+for name in ('zzz-boot-progress.patch', 'zzy-native-gpu-addon-mount.patch'):
+    candidate = patch_dir / name
+    if candidate.is_file():
+        patches.append(candidate.resolve())
 for patch in sorted(set(patches), reverse=True):
     print(patch)
 PY_LATE_PATCHES
 )
-PATCHES=("$ROOT"/patches/xnu/*.patch)
+if [ -d "$ROOT/patches/xnu" ]; then
+  PATCHES=("$ROOT"/patches/xnu/*.patch)
+else
+  PATCHES=("$ROOT"/patches/xnu-ipados18/*.patch)
+fi
 if [ "$XNU_VERSION" = "10063.141.1" ]; then
   PATCHES+=("$ROOT"/kits/NativePrelink/patches/*.patch)
 fi
@@ -174,6 +223,7 @@ for relative, (digest, atime, mtime) in json.loads(Path('.cache/xnu-patch-times.
     if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest:
         os.utime(path, ns=(atime, mtime))
 PY_PATCH_TIMES
+printf '%s\n' "$CURRENT_PATCHES_HASH" > "$PATCH_STAMP"
 export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
 python3 scripts/prepare-xnu-source.py
 BOOT_PROGRESS=${XNU_BOOT_PROGRESS:-0}
@@ -1105,6 +1155,13 @@ for argument in sys.argv[1:]:
             raise SystemExit('Conflicting per-object flag assignments: ' + key)
         seen.add(key)
 PY_OBJECT_FLAGS
+if command -v ccache >/dev/null 2>&1; then
+  CCACHE_BIN="$(command -v ccache)"
+  echo "ccache detected: $CCACHE_BIN"
+  echo "=== ccache statistics (before compilation) ==="
+  "$CCACHE_BIN" -s || true
+  EXTRA_MAKE_ARGS+=("CCACHE=$CCACHE_BIN")
+fi
 make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
   MACHINE_CONFIGS=PONG KERNEL_CONFIGS=DEVELOPMENT \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
@@ -1115,6 +1172,10 @@ make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iph
   BUILD_LTO=0 BUILD_STATIC_LINK=0 BUILD_DSYM="${XNU_BUILD_DSYM:-0}" BOUND_CHECKS=0 BUILD_WERROR="${XNU_BUILD_WERROR:-0}" MAKEJOBS=-j"${JOBS:-4}" \
   RC_NONARCH_CFLAGS="$EXTRA_CFLAGS" "${EXTRA_MAKE_ARGS[@]}" \
   OBJROOT="$ROOT/build/xnu/ios-obj" SYMROOT="$ROOT/build/xnu/ios-sym" DSTROOT="$ROOT/build/xnu/ios-dst"
+if command -v ccache >/dev/null 2>&1; then
+  echo "=== ccache statistics (after compilation) ==="
+  "$CCACHE_BIN" -s || true
+fi
 if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$CRYPTO_BOOTSTRAP_MODE" = source ]; then
   python3 scripts/seal-source-crypto-kernel.py \
     build/xnu/ios-obj/DEVELOPMENT_ARM64_PONG/mach.development.pong.unstripped.noctf

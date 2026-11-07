@@ -465,8 +465,10 @@ jobs:
         if: ${{ !inputs.no_cache }}
         uses: actions/cache@v4
         with:
-          path: UniXNU/out/feeds
-          key: edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}
+          path: UniXNU/out/feeds/mu_basecore-*/BaseTools/Source/C/bin
+          key: edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-v1
+          restore-keys: |
+            edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-
       - name: XNU tree and build cache
         if: ${{ !inputs.no_cache }}
         uses: actions/cache@v4
@@ -474,9 +476,9 @@ jobs:
           path: |
             tree/.cache
             tree/build
-          key: xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/board.toml') }}-${{ hashFiles('device/patches/xnu-ipados18/*.patch') }}
+          key: xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-${{ hashFiles('device/patches/xnu-ipados18/**') }}
           restore-keys: |
-            xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/board.toml') }}-
+            xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-
       - name: ccache
         if: ${{ !inputs.no_cache }}
         uses: actions/cache@v4
