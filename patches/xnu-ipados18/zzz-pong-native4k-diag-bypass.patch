@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
-index b9de7d6..622f3fb 100644
+index b9de7d6..aaee99b 100644
 --- a/bsd/kern/ubc_subr.c
 +++ b/bsd/kern/ubc_subr.c
 @@ -5901,6 +5901,38 @@ unsigned long cs_native4k_ready_blobs = 0;
@@ -41,11 +41,11 @@ index b9de7d6..622f3fb 100644
  /* One read covers 64 original blocks. Files above 32 MiB (the 3 GB dyld shared cache, read whole by launchd at every boot) are read
   * uncached: through the page cache they left almost no free memory when the first daemons started. */
  #define CS_NATIVE4K_CHUNK       (1024 * 1024)
-@@ -5923,6 +5955,47 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
- 		return 0;
+@@ -5924,17 +5956,44 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
  	}
  
-+#if defined(PONG) && (DEVELOPMENT || DEBUG)
+ #if defined(PONG) && (DEVELOPMENT || DEBUG)
+-	extern int pong_syscall_trace;
 +	if (pong_cs4k_trust) {
 +		proc_t curp = current_proc();
 +		if (curp && proc_pid(curp) == 1) {
@@ -60,17 +60,20 @@ index b9de7d6..622f3fb 100644
 +		}
 +	}
 +
-+	proc_t curp4k = current_proc();
-+	bool trace_cs4k = (pong_syscall_trace && curp4k && proc_pid(curp4k) == 1);
-+	uint64_t t4k = 0;
-+	if (trace_cs4k) {
-+		t4k = mach_absolute_time();
+ 	proc_t curp4k = current_proc();
+ 	bool trace_cs4k = (pong_syscall_trace && curp4k && proc_pid(curp4k) == 1);
+ 	uint64_t t4k = 0;
+ 	if (trace_cs4k) {
+ 		t4k = mach_absolute_time();
+-		printf("[PONG_CS_4K] enter limit=0x%llx (nslots=%u pageshift=%d)\n",
 +		uint64_t now_ns = 0;
 +		absolutetime_to_nanoseconds(t4k, &now_ns);
 +		printf("[PONG_CS_4K] +%llums enter limit=0x%llx (nslots=%u pageshift=%d free=%u/%u inact=%u spec=%u wire=%u memstat=%u cpu=%d)\n",
 +		    now_ns / 1000000ULL,
-+		    (cd ? (uint64_t)ntohl(cd->codeLimit) : 0),
-+		    (cd ? ntohl(cd->nCodeSlots) : 0),
+ 		    (cd ? (uint64_t)ntohl(cd->codeLimit) : 0),
+ 		    (cd ? ntohl(cd->nCodeSlots) : 0),
+-		    blob->csb_hash_pageshift);
+-	}
 +		    blob->csb_hash_pageshift,
 +		    vm_page_free_count, vm_page_free_target,
 +		    vm_page_inactive_count, vm_page_speculative_count, vm_page_wire_count, memorystatus_level,
@@ -84,23 +87,20 @@ index b9de7d6..622f3fb 100644
 +	pong_live_state.latch = 0;
 +	pong_live_state.cpu = cpu_number();
 +	pong_ramoops_update_state();
-+#endif
-+
- #if defined(PONG) && (DEVELOPMENT || DEBUG)
- 	extern int pong_syscall_trace;
- 	proc_t curp4k = current_proc();
-@@ -5958,7 +6031,9 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ #endif
+ 
+ 	if (PAGE_SHIFT != 12 || blob->csb_hash_pageshift != 14 || cd == NULL || md == NULL ||
+@@ -5958,7 +6017,8 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
  	kr = kmem_alloc(kernel_map, &storage, allocation,
  	    KMA_KOBJECT | KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_SECURITY);
  	if (kr != KERN_SUCCESS) {
 -		printf("Pong native4K: digest allocation failed bytes=%lu kr=%d\n", (unsigned long)allocation, kr);
-+		printf("Pong native4K: digest allocation failed bytes=%lu kr=%d free_pages=%u (kernel_map min=0x%lx max=0x%lx)\n",
-+		    (unsigned long)allocation, kr, vm_page_free_count,
-+		    (unsigned long)vm_map_min(kernel_map), (unsigned long)vm_map_max(kernel_map));
++		printf("Pong native4K: digest allocation failed bytes=%lu kr=%d free_pages=%u\n",
++		    (unsigned long)allocation, kr, vm_page_free_count);
  		return ENOMEM;
  	}
  	buffer = kalloc_data(CS_NATIVE4K_CHUNK, Z_WAITOK);
-@@ -5967,7 +6042,7 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+@@ -5967,7 +6027,7 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
  		goto out;
  	}
  	/* Executables are faulted in right after their signature is added and stay cached. */
@@ -109,7 +109,7 @@ index b9de7d6..622f3fb 100644
  	for (chunk = 0; chunk < limit; chunk += CS_NATIVE4K_CHUNK) {
  		size_t chunk_length = MIN((uint64_t)CS_NATIVE4K_CHUNK, limit - chunk);
  		int resid = 0;
-@@ -5976,6 +6051,34 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+@@ -5976,6 +6036,34 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
  			error = EOVERFLOW;
  			goto out;
  		}
@@ -144,7 +144,7 @@ index b9de7d6..622f3fb 100644
  		const uint64_t read_start = mach_absolute_time();
  		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)chunk_length, position,
  		    UIO_SYSSPACE, ioflags, vfs_context_ucred(vfs_context_current()),
-@@ -5983,10 +6086,34 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+@@ -5983,10 +6071,34 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
  		const uint64_t hash_start = mach_absolute_time();
  		os_atomic_add(&cs_native4k_read_ticks, hash_start - read_start, relaxed);
  		os_atomic_add(&cs_native4k_bytes, (uint64_t)chunk_length, relaxed);
@@ -179,7 +179,7 @@ index b9de7d6..622f3fb 100644
  		for (size_t block = 0; block < chunk_length; block += 16384) {
  			union cs_hash_union ctx;
  			uint8_t digest[CS_HASH_MAX_SIZE];
-@@ -6020,6 +6147,39 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+@@ -6020,6 +6132,39 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
  			}
  		}
  		os_atomic_add(&cs_native4k_hash_ticks, mach_absolute_time() - hash_start, relaxed);
@@ -219,7 +219,7 @@ index b9de7d6..622f3fb 100644
  	}
  	kr = mach_vm_protect(kernel_map, storage, allocation, TRUE, VM_PROT_READ);
  	if (kr != KERN_SUCCESS) {
-@@ -6039,11 +6199,15 @@ out:
+@@ -6039,11 +6184,15 @@ out:
  	}
  #if defined(PONG) && (DEVELOPMENT || DEBUG)
  	if (trace_cs4k) {
@@ -237,7 +237,7 @@ index b9de7d6..622f3fb 100644
  #endif
  	return error;
  }
-@@ -6110,6 +6274,14 @@ cs_validate_hash(
+@@ -6110,6 +6259,14 @@ cs_validate_hash(
  			codeLimit = ntohl(cd->codeLimit);
  #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
  			if (PAGE_SHIFT == 12 && blob->csb_hash_pageshift == 14) {
@@ -253,26 +253,26 @@ index b9de7d6..622f3fb 100644
  				if ((offset & PAGE_MASK) || offset >= codeLimit ||
  				    blob->csb_native4k_hashes == NULL ||
 diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-index 568a40c..a6d3a85 100644
+index c349a8d..b9e9bfd 100644
 --- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 +++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-@@ -1333,6 +1333,10 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
+@@ -1311,6 +1311,10 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
  void
  IOMobileFramebufferUserClient::armVSync(void)
  {
-+	extern int pong_mmio_quiet;
++	extern "C" int pong_mmio_quiet;
 +	if (pong_mmio_quiet) {
 +		return;
 +	}
  	uint64_t period, now = mach_absolute_time();
  
  	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
-@@ -1646,7 +1650,10 @@ MiniIOMobileFramebufferStart(IOService * provider)
+@@ -1624,7 +1628,10 @@ MiniIOMobileFramebufferStart(IOService * provider)
  	}
  #if XNU_PONG_BACKLIGHT
  	else {
 -		pong_backlight_start(fb);
-+		extern int pong_mmio_quiet;
++		extern "C" int pong_mmio_quiet;
 +		if (!pong_mmio_quiet) {
 +			pong_backlight_start(fb);
 +		}

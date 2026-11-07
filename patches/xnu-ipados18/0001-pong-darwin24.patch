@@ -3357,7 +3357,7 @@ new file mode 100644
 index 0000000..952c4c2
 --- /dev/null
 +++ b/bsd/kern/pong_userland.c
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,232 @@
 +#include <pexpert/arm64/board_config.h>
 +/* Bounded kernel-side progress, without a private sysctl or user copy. */
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
@@ -3407,6 +3407,7 @@ index 0000000..952c4c2
 +extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
 +extern void thread_deallocate(thread_t thread);
 +extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern struct uthread *get_bsdthread_info(thread_t);
 +
 +static timer_call_data_t pong_timer_call_entry;
 +static volatile uint32_t pong_timer_ticks = 0;
@@ -19308,7 +19309,7 @@ index 3ea3171..952e6af 100644
 +	uint32_t cluster_id = os_atomic_load(&clutch_bucket_group->scbg_preferred_cluster, relaxed);
 +#if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
 +	/* gts7xlwifi, as SM-T733 45e: early threads run before the secondary psets exist; until then the boot cluster. */
-+	if (cluster_id >= MAX_PSETS || pset_array[cluster_id] == PROCESSOR_SET_NULL || !sched_edge_pset_available(pset_array[cluster_id])) {
++	if (cluster_id >= MAX_PSETS || pset_array[cluster_id] == PROCESSOR_SET_NULL || !pset_is_recommended(pset_array[cluster_id])) {
 +		return pset0.pset_cluster_id;
 +	}
 +#endif
