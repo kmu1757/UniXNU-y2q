@@ -466,10 +466,10 @@ jobs:
         if: ${{ !inputs.no_cache }}
         uses: actions/cache@v4
         with:
-          path: UniXNU/out/feeds/mu_basecore-*/BaseTools/Source/C
-          key: edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-v2
+          path: UniXNU/out/feeds/mu_basecore-*/BaseTools/Source/C/bin
+          key: edk2-basetools-bin-${{ runner.os }}-${{ env.UNIXNU_REF }}-v1
           restore-keys: |
-            edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-
+            edk2-basetools-bin-${{ runner.os }}-${{ env.UNIXNU_REF }}-
       - name: XNU tree and build cache
         if: ${{ !inputs.no_cache }}
         uses: actions/cache@v4
