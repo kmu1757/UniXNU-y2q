@@ -3357,7 +3357,7 @@ new file mode 100644
 index 0000000..952c4c2
 --- /dev/null
 +++ b/bsd/kern/pong_userland.c
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,231 @@
 +#include <pexpert/arm64/board_config.h>
 +/* Bounded kernel-side progress, without a private sysctl or user copy. */
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
@@ -3375,6 +3375,12 @@ index 0000000..952c4c2
 +TUNABLE_WRITEABLE(int, pong_syscall_trace, "pong_syscall_trace", 0);
 +TUNABLE_WRITEABLE(int, pong_heartbeat, "pong_heartbeat", 0);
 +
++TUNABLE_WRITEABLE(int, pong_cs4k_yield, "pong_cs4k_yield", 0);
++TUNABLE_WRITEABLE(int, pong_cs4k_trust, "pong_cs4k_trust", 0);
++TUNABLE_WRITEABLE(int, pong_cs4k_drop, "pong_cs4k_drop", 0);
++TUNABLE_WRITEABLE(int, pong_mmio_quiet, "pong_mmio_quiet", 0);
++TUNABLE_WRITEABLE(uint32_t, pong_reset_after_chunk, "pong_reset_after_chunk", 0);
++
 +struct pong_state_data {
 +	volatile uint32_t timer_ticks;
 +	volatile uint32_t thread_hb;
@@ -3383,6 +3389,8 @@ index 0000000..952c4c2
 +	volatile uint32_t cs_nslots;
 +	volatile uint64_t cs_offset;
 +	volatile uint64_t cs_limit;
++	volatile uint32_t free_pages;
++	volatile uint32_t latch;
 +	volatile int32_t  pong_stage;
 +	volatile int32_t  cpu;
 +};
@@ -3390,6 +3398,9 @@ index 0000000..952c4c2
 +extern void pong_ramoops_update_state(void);
 +extern int cpu_number(void);
 +extern unsigned int real_ncpus;
++extern unsigned int vm_page_free_count;
++extern unsigned int vm_page_free_target;
++extern unsigned int memorystatus_level;
 +
 +extern thread_t pong_get_task_first_thread(task_t task, int *out_state, uint64_t *out_wait_event,
 +    uint64_t *out_continuation, uint64_t *frames, int max_frames, int *out_nframes);
@@ -3410,6 +3421,7 @@ index 0000000..952c4c2
 +	uint32_t ticks = __atomic_add_fetch(&pong_timer_ticks, 1, __ATOMIC_RELAXED);
 +	pong_live_state.timer_ticks = ticks;
 +	pong_live_state.last_timer_ms = boot_ms;
++	pong_live_state.free_pages = vm_page_free_count;
 +	pong_live_state.cpu = cpu_number();
 +
 +	pong_ramoops_update_state();
@@ -3430,6 +3442,7 @@ index 0000000..952c4c2
 +    if (!p || proc_pid(p) != 1) return;
 +    ++count;
 +    pong_live_state.pong_stage = (int)count;
++    pong_live_state.free_pages = vm_page_free_count;
 +    pong_ramoops_update_state();
 +    printf("Pong init: %s\n", stage);
 +}
@@ -3447,12 +3460,14 @@ index 0000000..952c4c2
 +		int cur_cpu = cpu_number();
 +
 +		pong_live_state.thread_hb = hb_count;
++		pong_live_state.free_pages = vm_page_free_count;
 +		pong_live_state.cpu = cur_cpu;
 +		pong_ramoops_update_state();
 +
 +		proc_t p = proc_find(1);
 +		if (p == PROC_NULL) {
-+			printf("[PONG_HB] +%llums #%u cpu=%d pid=1: not found\n", boot_ms, hb_count, cur_cpu);
++			printf("[PONG_HB] +%llums #%u cpu=%d free=%u/%u memstat=%u pid=1: not found\n",
++			    boot_ms, hb_count, cur_cpu, vm_page_free_count, vm_page_free_target, memorystatus_level);
 +		} else {
 +			task_t task = proc_task(p);
 +			const char *comm = p->p_comm ? p->p_comm : "unknown";
@@ -3466,8 +3481,8 @@ index 0000000..952c4c2
 +			thread_t th = pong_get_task_first_thread(task, &th_state, &wait_event,
 +			    &continuation, frames, 8, &nframes);
 +			if (th == THREAD_NULL) {
-+				printf("[PONG_HB] +%llums #%u cpu=%d [1(%s)] has no active threads\n",
-+				    boot_ms, hb_count, cur_cpu, comm);
++				printf("[PONG_HB] +%llums #%u cpu=%d free=%u/%u memstat=%u [1(%s)] has no active threads\n",
++				    boot_ms, hb_count, cur_cpu, vm_page_free_count, vm_page_free_target, memorystatus_level, comm);
 +			} else {
 +				struct uthread *ut = get_bsdthread_info(th);
 +				const char *wmesg = (ut && ut->uu_wmesg) ? ut->uu_wmesg : "";
@@ -3482,11 +3497,11 @@ index 0000000..952c4c2
 +				}
 +
 +				if (th_state & 0x01 /* TH_WAIT */) {
-+					printf("[PONG_HB] +%llums #%u cpu=%d [1(%s)] state=%s event=0x%llx wmesg='%s'",
-+					    boot_ms, hb_count, cur_cpu, comm, state_str, wait_event, wmesg);
++					printf("[PONG_HB] +%llums #%u cpu=%d free=%u/%u memstat=%u [1(%s)] state=%s event=0x%llx wmesg='%s'",
++					    boot_ms, hb_count, cur_cpu, vm_page_free_count, vm_page_free_target, memorystatus_level, comm, state_str, wait_event, wmesg);
 +				} else {
-+					printf("[PONG_HB] +%llums #%u cpu=%d [1(%s)] state=%s",
-+					    boot_ms, hb_count, cur_cpu, comm, state_str);
++					printf("[PONG_HB] +%llums #%u cpu=%d free=%u/%u memstat=%u [1(%s)] state=%s",
++					    boot_ms, hb_count, cur_cpu, vm_page_free_count, vm_page_free_target, memorystatus_level, comm, state_str);
 +				}
 +
 +				if (continuation != 0) {
@@ -3524,6 +3539,29 @@ index 0000000..952c4c2
 +	if (PE_parse_boot_argn("pong_syscall_trace", &st, sizeof(st))) {
 +		pong_syscall_trace = st;
 +	}
++	int y = 0;
++	if (PE_parse_boot_argn("pong_cs4k_yield", &y, sizeof(y))) {
++		pong_cs4k_yield = y;
++	}
++	int tr = 0;
++	if (PE_parse_boot_argn("pong_cs4k_trust", &tr, sizeof(tr))) {
++		pong_cs4k_trust = tr;
++	}
++	int dr = 0;
++	if (PE_parse_boot_argn("pong_cs4k_drop", &dr, sizeof(dr))) {
++		pong_cs4k_drop = dr;
++	}
++	int mq = 0;
++	if (PE_parse_boot_argn("pong_mmio_quiet", &mq, sizeof(mq))) {
++		pong_mmio_quiet = mq;
++	}
++	uint32_t rst = 0;
++	if (PE_parse_boot_argn("pong_reset_after_chunk", &rst, sizeof(rst))) {
++		pong_reset_after_chunk = rst;
++	}
++
++	printf("[PONG_CS4K_MODE] nocache=1 yield=%d trust=%d drop=%d mmio_quiet=%d reset_chunk=%u\n",
++	    pong_cs4k_yield, pong_cs4k_trust, pong_cs4k_drop, pong_mmio_quiet, pong_reset_after_chunk);
 +
 +	if (pong_heartbeat <= 0) {
 +		return;
@@ -3725,30 +3763,26 @@ index 69b9d1f..5fc350d 100644
  	ret = amfi->OSEntitlements.adjustContextWithoutMonitor(
  		cs_blob->csb_entitlements,
  		cs_blob);
-@@ -4762,6 +4804,22 @@ ubc_cs_blob_add(
+@@ -4762,6 +4804,18 @@ ubc_cs_blob_add(
  		return error;
  	}
  
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
-+	extern uint64_t mach_absolute_time(void);
-+	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +	proc_t curp = current_proc();
 +	bool trace_cs = (pong_syscall_trace && curp && proc_pid(curp) == 1);
 +	uint64_t t0 = 0;
 +	if (trace_cs) {
 +		t0 = mach_absolute_time();
-+		uint64_t ms = 0;
-+		absolutetime_to_nanoseconds(t0, &ms);
-+		printf("[PONG_CS] +%llums ubc_cs_blob_add enter vp=%p size=0x%lx base_offset=0x%llx\n",
-+		    ms / 1000000ULL, (void *)vp, (unsigned long)size, (uint64_t)base_offset);
++		printf("[PONG_CS] ubc_cs_blob_add enter vp=%p size=0x%lx base_offset=0x%llx\n",
++		    (void *)vp, (unsigned long)size, (uint64_t)base_offset);
 +	}
 +#endif
 +
  	tmp_blob.csb_cpu_type = cputype;
  	tmp_blob.csb_cpu_subtype = cpusubtype & ~CPU_SUBTYPE_MASK;
  	tmp_blob.csb_base_offset = base_offset;
-@@ -4945,6 +5003,14 @@ ubc_cs_blob_add(
+@@ -4945,6 +4999,14 @@ ubc_cs_blob_add(
  		goto out;
  	}
  
@@ -3763,7 +3797,7 @@ index 69b9d1f..5fc350d 100644
  	/*
  	 * The vnode_lock, linked list traversal, and marking of the memory object as
  	 * signed can all be blocking operations. Compute a PAC over the tmp_blob.
-@@ -5160,6 +5226,17 @@ out:
+@@ -5160,6 +5222,15 @@ out:
  		error = 0;
  	}
  
@@ -3771,17 +3805,15 @@ index 69b9d1f..5fc350d 100644
 +	if (trace_cs) {
 +		uint64_t elapsed_ns = 0;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &elapsed_ns);
-+		uint64_t ms = 0;
-+		absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
-+		printf("[PONG_CS] +%llums ubc_cs_blob_add exit error=%d elapsed=%lluus\n",
-+		    ms / 1000000ULL, error, elapsed_ns / 1000);
++		printf("[PONG_CS] ubc_cs_blob_add exit error=%d elapsed=%lluus\n",
++		    error, elapsed_ns / 1000);
 +	}
 +#endif
 +
  	return error;
  }
  
-@@ -5812,6 +5889,215 @@ ubc_get_cs_mtime(
+@@ -5812,6 +5883,148 @@ ubc_get_cs_mtime(
  
  unsigned long cs_validate_page_no_hash = 0;
  unsigned long cs_validate_page_bad_hash = 0;
@@ -3798,7 +3830,7 @@ index 69b9d1f..5fc350d 100644
 + * derived array readonly before its owning RO cs_blob can become visible.
 + * VM fault validation consequently performs no vnode I/O under object locks.
 + */
-++__attribute__((noinline))
++__attribute__((noinline))
 +static int
 +cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
 +{
@@ -3817,45 +3849,16 @@ index 69b9d1f..5fc350d 100644
 +
 +#if defined(PONG) && (DEVELOPMENT || DEBUG)
 +	extern int pong_syscall_trace;
-+	extern int get_preemption_level(void);
-+	extern boolean_t ml_get_interrupts_enabled(void);
-+	extern int cpu_number(void);
-+	struct pong_state_data {
-+		volatile uint32_t timer_ticks;
-+		volatile uint32_t thread_hb;
-+		volatile uint64_t last_timer_ms;
-+		volatile uint32_t cs_slot;
-+		volatile uint32_t cs_nslots;
-+		volatile uint64_t cs_offset;
-+		volatile uint64_t cs_limit;
-+		volatile int32_t  pong_stage;
-+		volatile int32_t  cpu;
-+	};
-+	extern struct pong_state_data pong_live_state;
-+	extern void pong_ramoops_update_state(void);
-+
 +	proc_t curp4k = current_proc();
 +	bool trace_cs4k = (pong_syscall_trace && curp4k && proc_pid(curp4k) == 1);
 +	uint64_t t4k = 0;
 +	if (trace_cs4k) {
 +		t4k = mach_absolute_time();
-+		uint64_t now_ns = 0;
-+		absolutetime_to_nanoseconds(t4k, &now_ns);
-+		printf("[PONG_CS_4K] +%llums enter limit=0x%llx (nslots=%u pageshift=%d intr=%d preempt=%d cpu=%d)\n",
-+		    now_ns / 1000000ULL,
++		printf("[PONG_CS_4K] enter limit=0x%llx (nslots=%u pageshift=%d)\n",
 +		    (cd ? (uint64_t)ntohl(cd->codeLimit) : 0),
 +		    (cd ? ntohl(cd->nCodeSlots) : 0),
-+		    blob->csb_hash_pageshift,
-+		    (int)ml_get_interrupts_enabled(),
-+		    get_preemption_level(),
-+		    cpu_number());
++		    blob->csb_hash_pageshift);
 +	}
-+	pong_live_state.cs_slot = 0;
-+	pong_live_state.cs_nslots = cd ? ntohl(cd->nCodeSlots) : 0;
-+	pong_live_state.cs_limit = cd ? (uint64_t)ntohl(cd->codeLimit) : 0;
-+	pong_live_state.cs_offset = 0;
-+	pong_live_state.cpu = cpu_number();
-+	pong_ramoops_update_state();
 +#endif
 +
 +	if (PAGE_SHIFT != 12 || blob->csb_hash_pageshift != 14 || cd == NULL || md == NULL ||
@@ -3899,42 +3902,9 @@ index 69b9d1f..5fc350d 100644
 +			error = EOVERFLOW;
 +			goto out;
 +		}
-+
-+#if defined(PONG) && (DEVELOPMENT || DEBUG)
-+		uint32_t block_idx = (uint32_t)(offset >> 14);
-+		pong_live_state.cs_slot = block_idx;
-+		pong_live_state.cs_offset = offset;
-+		if (trace_cs4k && block_idx > 0 && (block_idx % 1024) == 0) {
-+			uint64_t cur_ns = 0;
-+			absolutetime_to_nanoseconds(mach_absolute_time(), &cur_ns);
-+			uint64_t el_ns = 0;
-+			absolutetime_to_nanoseconds(mach_absolute_time() - t4k, &el_ns);
-+			printf("[PONG_CS_4K] +%llums progress block=%u/%u off=0x%llx/0x%llx (elapsed=%llums cpu=%d)\n",
-+			    cur_ns / 1000000ULL, block_idx, (uint32_t)((limit + 16383) >> 14),
-+			    (uint64_t)offset, (uint64_t)limit, el_ns / 1000000ULL, cpu_number());
-+			pong_ramoops_update_state();
-+		}
-+		uint64_t t_io0 = mach_absolute_time();
-+#endif
-+
 +		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)length, position,
 +		    UIO_SYSSPACE, 0, vfs_context_ucred(vfs_context_current()),
 +		    &resid, current_proc());
-+
-+#if defined(PONG) && (DEVELOPMENT || DEBUG)
-+		uint64_t t_io1 = mach_absolute_time();
-+		uint64_t io_ns = 0;
-+		absolutetime_to_nanoseconds(t_io1 - t_io0, &io_ns);
-+		uint64_t io_ms = io_ns / 1000000ULL;
-+		if (trace_cs4k && io_ms >= 500) {
-+			uint64_t cur_ns = 0;
-+			absolutetime_to_nanoseconds(t_io1, &cur_ns);
-+			printf("[PONG_CS_4K] +%llums slow vn_rdwr off=0x%llx pos=0x%llx took %llums (cpu=%d err=%d)\n",
-+			    cur_ns / 1000000ULL, (uint64_t)offset, (uint64_t)position, io_ms, cpu_number(), error);
-+			pong_ramoops_update_state();
-+		}
-+#endif
-+
 +		if (error || resid) {
 +			error = error ? error : EIO;
 +			goto out;
@@ -3982,14 +3952,9 @@ index 69b9d1f..5fc350d 100644
 +	if (trace_cs4k) {
 +		uint64_t elapsed_ns = 0;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - t4k, &elapsed_ns);
-+		uint64_t now_ns = 0;
-+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
-+		printf("[PONG_CS_4K] +%llums exit error=%d elapsed=%lluus\n",
-+		    now_ns / 1000000ULL, error, elapsed_ns / 1000);
++		printf("[PONG_CS_4K] exit error=%d elapsed=%lluus\n",
++		    error, elapsed_ns / 1000);
 +	}
-+	pong_live_state.cs_slot = (uint32_t)((limit + 16383) >> 14);
-+	pong_live_state.cs_offset = limit;
-+	pong_ramoops_update_state();
 +#endif
 +	return error;
 +}
@@ -3997,7 +3962,7 @@ index 69b9d1f..5fc350d 100644
  static boolean_t
  cs_validate_hash(
  	struct cs_blob          *blobs,
-@@ -5835,6 +6121,7 @@ cs_validate_hash(
+@@ -5835,6 +6048,7 @@ cs_validate_hash(
  	off_t                   codeLimit = 0;
  	const char              *lower_bound, *upper_bound;
  	vm_offset_t             kaddr, blob_addr;
@@ -4005,7 +3970,7 @@ index 69b9d1f..5fc350d 100644
  
  	/* retrieve the expected hash */
  	found_hash = FALSE;
-@@ -5870,15 +6157,31 @@ cs_validate_hash(
+@@ -5870,15 +6084,31 @@ cs_validate_hash(
  			if (hashtype->cs_digest_size > sizeof(actual_hash)) {
  				panic("hash size too large");
  			}
@@ -4045,7 +4010,7 @@ index 69b9d1f..5fc350d 100644
  			if (hash != NULL) {
  				bcopy(hash, expected_hash, hashtype->cs_size);
  				found_hash = TRUE;
-@@ -5908,7 +6211,7 @@ cs_validate_hash(
+@@ -5908,7 +6138,7 @@ cs_validate_hash(
  	} else {
  		*tainted = 0;
  
@@ -4054,7 +4019,7 @@ index 69b9d1f..5fc350d 100644
  		*bytes_processed = size;
  
  		const uint32_t *asha1, *esha1;
-@@ -5974,6 +6277,7 @@ cs_validate_hash(
+@@ -5974,6 +6204,7 @@ cs_validate_hash(
  	return validated;
  }
  
@@ -17885,7 +17850,7 @@ new file mode 100644
 index 0000000..3b96c89
 --- /dev/null
 +++ b/osfmk/arm64/pong_ramoops_console.h
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,283 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Minimal persistent console mirror for SM8250 / Pong. It does not touch VBAR, TTBR,
 + * the framebuffer, scheduler state, IOKit, or storage. */
@@ -17950,7 +17915,7 @@ index 0000000..3b96c89
 +	__atomic_store_n(&pong_diagnostic_busy, 0, __ATOMIC_RELEASE);
 +}
 +
-++struct pong_state_data {
++struct pong_state_data {
 +	volatile uint32_t timer_ticks;
 +	volatile uint32_t thread_hb;
 +	volatile uint64_t last_timer_ms;
@@ -17958,6 +17923,8 @@ index 0000000..3b96c89
 +	volatile uint32_t cs_nslots;
 +	volatile uint64_t cs_offset;
 +	volatile uint64_t cs_limit;
++	volatile uint32_t free_pages;
++	volatile uint32_t latch;
 +	volatile int32_t  pong_stage;
 +	volatile int32_t  cpu;
 +};
@@ -17977,14 +17944,15 @@ index 0000000..3b96c89
 +	}
 +	char buf[128];
 +	int len = snprintf(buf, sizeof(buf),
-+	    "PONG_STAT: t_tick=%u t_ms=%llu th_hb=%u cs=%u/%u off=0x%llx/0x%llx stg=%d cpu=%d\n",
++	    "PONG_STAT: t=%u th=%u cs=%u/%u off=0x%llx/0x%llx free=%u L=%u stg=%d cpu=%d\n",
 +	    pong_live_state.timer_ticks,
-+	    pong_live_state.last_timer_ms,
 +	    pong_live_state.thread_hb,
 +	    pong_live_state.cs_slot,
 +	    pong_live_state.cs_nslots,
 +	    pong_live_state.cs_offset,
 +	    pong_live_state.cs_limit,
++	    pong_live_state.free_pages,
++	    pong_live_state.latch,
 +	    pong_live_state.pong_stage,
 +	    pong_live_state.cpu);
 +	if (len > 0) {

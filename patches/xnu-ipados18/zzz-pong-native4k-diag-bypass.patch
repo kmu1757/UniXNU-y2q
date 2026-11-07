@@ -1,0 +1,281 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index b9de7d6..622f3fb 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -5901,6 +5901,38 @@ unsigned long cs_native4k_ready_blobs = 0;
+ uint64_t cs_native4k_read_ticks = 0, cs_native4k_hash_ticks = 0, cs_native4k_bytes = 0;
+ extern uint64_t mach_absolute_time(void);
+ 
++extern unsigned int vm_page_free_count;
++extern unsigned int vm_page_free_target;
++extern unsigned int vm_page_inactive_count;
++extern unsigned int vm_page_speculative_count;
++extern unsigned int vm_page_wire_count;
++extern unsigned int memorystatus_level;
++extern int pong_syscall_trace;
++extern int pong_cs4k_yield;
++extern int pong_cs4k_trust;
++extern int pong_cs4k_drop;
++extern uint32_t pong_reset_after_chunk;
++extern int cpu_number(void);
++extern void thread_yield_to_preemption(void);
++extern wait_result_t thread_block(thread_continue_t);
++extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
++
++struct pong_state_data {
++	volatile uint32_t timer_ticks;
++	volatile uint32_t thread_hb;
++	volatile uint64_t last_timer_ms;
++	volatile uint32_t cs_slot;
++	volatile uint32_t cs_nslots;
++	volatile uint64_t cs_offset;
++	volatile uint64_t cs_limit;
++	volatile uint32_t free_pages;
++	volatile uint32_t latch;
++	volatile int32_t  pong_stage;
++	volatile int32_t  cpu;
++};
++extern struct pong_state_data pong_live_state;
++extern void pong_ramoops_update_state(void);
++
+ /* One read covers 64 original blocks. Files above 32 MiB (the 3 GB dyld shared cache, read whole by launchd at every boot) are read
+  * uncached: through the page cache they left almost no free memory when the first daemons started. */
+ #define CS_NATIVE4K_CHUNK       (1024 * 1024)
+@@ -5923,6 +5955,47 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 		return 0;
+ 	}
+ 
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++	if (pong_cs4k_trust) {
++		proc_t curp = current_proc();
++		if (curp && proc_pid(curp) == 1) {
++			uint64_t now_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++			printf("[PONG_CS_4K] +%llums bypass trust=1 for blob limit=0x%llx (nslots=%u cpu=%d)\n",
++			    now_ns / 1000000ULL,
++			    (cd ? (uint64_t)ntohl(cd->codeLimit) : 0),
++			    (cd ? ntohl(cd->nCodeSlots) : 0),
++			    cpu_number());
++			return 0;
++		}
++	}
++
++	proc_t curp4k = current_proc();
++	bool trace_cs4k = (pong_syscall_trace && curp4k && proc_pid(curp4k) == 1);
++	uint64_t t4k = 0;
++	if (trace_cs4k) {
++		t4k = mach_absolute_time();
++		uint64_t now_ns = 0;
++		absolutetime_to_nanoseconds(t4k, &now_ns);
++		printf("[PONG_CS_4K] +%llums enter limit=0x%llx (nslots=%u pageshift=%d free=%u/%u inact=%u spec=%u wire=%u memstat=%u cpu=%d)\n",
++		    now_ns / 1000000ULL,
++		    (cd ? (uint64_t)ntohl(cd->codeLimit) : 0),
++		    (cd ? ntohl(cd->nCodeSlots) : 0),
++		    blob->csb_hash_pageshift,
++		    vm_page_free_count, vm_page_free_target,
++		    vm_page_inactive_count, vm_page_speculative_count, vm_page_wire_count, memorystatus_level,
++		    cpu_number());
++	}
++	pong_live_state.cs_slot = 0;
++	pong_live_state.cs_nslots = cd ? ntohl(cd->nCodeSlots) : 0;
++	pong_live_state.cs_limit = cd ? (uint64_t)ntohl(cd->codeLimit) : 0;
++	pong_live_state.cs_offset = 0;
++	pong_live_state.free_pages = vm_page_free_count;
++	pong_live_state.latch = 0;
++	pong_live_state.cpu = cpu_number();
++	pong_ramoops_update_state();
++#endif
++
+ #if defined(PONG) && (DEVELOPMENT || DEBUG)
+ 	extern int pong_syscall_trace;
+ 	proc_t curp4k = current_proc();
+@@ -5958,7 +6031,9 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 	kr = kmem_alloc(kernel_map, &storage, allocation,
+ 	    KMA_KOBJECT | KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_SECURITY);
+ 	if (kr != KERN_SUCCESS) {
+-		printf("Pong native4K: digest allocation failed bytes=%lu kr=%d\n", (unsigned long)allocation, kr);
++		printf("Pong native4K: digest allocation failed bytes=%lu kr=%d free_pages=%u (kernel_map min=0x%lx max=0x%lx)\n",
++		    (unsigned long)allocation, kr, vm_page_free_count,
++		    (unsigned long)vm_map_min(kernel_map), (unsigned long)vm_map_max(kernel_map));
+ 		return ENOMEM;
+ 	}
+ 	buffer = kalloc_data(CS_NATIVE4K_CHUNK, Z_WAITOK);
+@@ -5967,7 +6042,7 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 		goto out;
+ 	}
+ 	/* Executables are faulted in right after their signature is added and stay cached. */
+-	ioflags = limit > CS_NATIVE4K_UNCACHED ? IO_NOCACHE : 0;
++	ioflags = limit > CS_NATIVE4K_UNCACHED ? (IO_NOCACHE | IO_RAOFF) : 0;
+ 	for (chunk = 0; chunk < limit; chunk += CS_NATIVE4K_CHUNK) {
+ 		size_t chunk_length = MIN((uint64_t)CS_NATIVE4K_CHUNK, limit - chunk);
+ 		int resid = 0;
+@@ -5976,6 +6051,34 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 			error = EOVERFLOW;
+ 			goto out;
+ 		}
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		uint32_t chunk_idx = (uint32_t)(chunk / CS_NATIVE4K_CHUNK);
++		uint32_t total_chunks = (uint32_t)((limit + CS_NATIVE4K_CHUNK - 1) / CS_NATIVE4K_CHUNK);
++
++		pong_live_state.cs_slot = chunk_idx;
++		pong_live_state.cs_offset = chunk;
++		pong_live_state.free_pages = vm_page_free_count;
++		pong_live_state.latch = 1; /* latch 1: vn_rdwr start */
++		pong_live_state.cpu = cpu_number();
++		pong_ramoops_update_state();
++
++		if (trace_cs4k) {
++			uint64_t cur_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &cur_ns);
++			uint64_t el_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t4k, &el_ns);
++			printf("[PONG_CS_4K] +%llums progress chunk=%u/%u off=0x%llx/0x%llx free=%u/%u (inact=%u spec=%u wire=%u memstat=%u) bytes=%llu rd_ticks=%llu hash_ticks=%llu (elapsed=%llums cpu=%d)\n",
++			    cur_ns / 1000000ULL, chunk_idx, total_chunks,
++			    (uint64_t)chunk, (uint64_t)limit,
++			    vm_page_free_count, vm_page_free_target,
++			    vm_page_inactive_count, vm_page_speculative_count, vm_page_wire_count, memorystatus_level,
++			    (unsigned long long)cs_native4k_bytes, (unsigned long long)cs_native4k_read_ticks, (unsigned long long)cs_native4k_hash_ticks,
++			    el_ns / 1000000ULL, cpu_number());
++		}
++		uint64_t t_io0 = mach_absolute_time();
++#endif
++
+ 		const uint64_t read_start = mach_absolute_time();
+ 		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)chunk_length, position,
+ 		    UIO_SYSSPACE, ioflags, vfs_context_ucred(vfs_context_current()),
+@@ -5983,10 +6086,34 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 		const uint64_t hash_start = mach_absolute_time();
+ 		os_atomic_add(&cs_native4k_read_ticks, hash_start - read_start, relaxed);
+ 		os_atomic_add(&cs_native4k_bytes, (uint64_t)chunk_length, relaxed);
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		uint64_t t_io1 = mach_absolute_time();
++		uint64_t io_ns = 0;
++		absolutetime_to_nanoseconds(t_io1 - t_io0, &io_ns);
++		uint64_t io_ms = io_ns / 1000000ULL;
++		pong_live_state.latch = 2; /* latch 2: vn_rdwr done */
++		pong_live_state.free_pages = vm_page_free_count;
++		pong_ramoops_update_state();
++
++		if (trace_cs4k && io_ms >= 500) {
++			uint64_t cur_ns = 0;
++			absolutetime_to_nanoseconds(t_io1, &cur_ns);
++			printf("[PONG_CS_4K] +%llums slow vn_rdwr chunk=%u off=0x%llx took %llums (free=%u cpu=%d err=%d)\n",
++			    cur_ns / 1000000ULL, chunk_idx, (uint64_t)chunk, io_ms, vm_page_free_count, cpu_number(), error);
++		}
++#endif
++
+ 		if (error || resid) {
+ 			error = error ? error : EIO;
+ 			goto out;
+ 		}
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		pong_live_state.latch = 3; /* latch 3: hash start */
++		pong_ramoops_update_state();
++#endif
++
+ 		for (size_t block = 0; block < chunk_length; block += 16384) {
+ 			union cs_hash_union ctx;
+ 			uint8_t digest[CS_HASH_MAX_SIZE];
+@@ -6020,6 +6147,39 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 			}
+ 		}
+ 		os_atomic_add(&cs_native4k_hash_ticks, mach_absolute_time() - hash_start, relaxed);
++
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		pong_live_state.latch = 4; /* latch 4: hash done */
++		pong_live_state.free_pages = vm_page_free_count;
++		pong_ramoops_update_state();
++
++		/* 우회 B: 루프 청크마다 명시적 선점 */
++		if (pong_cs4k_yield) {
++			thread_yield_to_preemption();
++			thread_block(THREAD_CONTINUE_NULL);
++			pong_live_state.latch = 5; /* latch 5: yield done */
++			pong_ramoops_update_state();
++		}
++
++		/* 청크 뒤 범위 버리기 (UBC 무효화) */
++		if (pong_cs4k_drop) {
++			(void)ubc_msync(vp, position, position + chunk_length, NULL, UBC_INVALIDATE);
++			pong_live_state.latch = 6; /* latch 6: drop done */
++			pong_live_state.free_pages = vm_page_free_count;
++			pong_ramoops_update_state();
++		}
++
++		/* PSCI SYSTEM_RESET 프로브 (N번째 청크 뒤) */
++		if (pong_reset_after_chunk > 0 && (chunk_idx + 1) == pong_reset_after_chunk) {
++			printf("[PONG_RESET] PSCI SYSTEM_RESET triggered after chunk %u/%u (off=0x%llx/0x%llx free=%u)\n",
++			    chunk_idx + 1, total_chunks, (uint64_t)chunk, (uint64_t)limit, vm_page_free_count);
++			pong_live_state.latch = 7; /* latch 7: reset triggered */
++			pong_ramoops_update_state();
++			register uint64_t r0 __asm__("x0") = 0x84000009; /* PSCI SYSTEM_RESET */
++			__asm__ volatile("smc #0" : "+r"(r0) : : "memory");
++			for (;;) { __asm__ volatile("wfi"); }
++		}
++#endif
+ 	}
+ 	kr = mach_vm_protect(kernel_map, storage, allocation, TRUE, VM_PROT_READ);
+ 	if (kr != KERN_SUCCESS) {
+@@ -6039,11 +6199,15 @@ out:
+ 	}
+ #if defined(PONG) && (DEVELOPMENT || DEBUG)
+ 	if (trace_cs4k) {
++		uint64_t now_ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 		uint64_t elapsed_ns = 0;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - t4k, &elapsed_ns);
+-		printf("[PONG_CS_4K] exit error=%d elapsed=%lluus\n",
+-		    error, elapsed_ns / 1000);
++		printf("[PONG_CS_4K] +%llums exit error=%d elapsed=%lluus free=%u\n",
++		    now_ns / 1000000ULL, error, elapsed_ns / 1000, vm_page_free_count);
+ 	}
++	pong_live_state.free_pages = vm_page_free_count;
++	pong_ramoops_update_state();
+ #endif
+ 	return error;
+ }
+@@ -6110,6 +6274,14 @@ cs_validate_hash(
+ 			codeLimit = ntohl(cd->codeLimit);
+ #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
+ 			if (PAGE_SHIFT == 12 && blob->csb_hash_pageshift == 14) {
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++				extern int pong_cs4k_trust;
++				if (pong_cs4k_trust) {
++					*bytes_processed = PAGE_SIZE;
++					*tainted = 0;
++					return TRUE;
++				}
++#endif
+ 				vm_size_t index = (vm_size_t)offset >> PAGE_SHIFT;
+ 				if ((offset & PAGE_MASK) || offset >= codeLimit ||
+ 				    blob->csb_native4k_hashes == NULL ||
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 568a40c..a6d3a85 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -1333,6 +1333,10 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
+ void
+ IOMobileFramebufferUserClient::armVSync(void)
+ {
++	extern int pong_mmio_quiet;
++	if (pong_mmio_quiet) {
++		return;
++	}
+ 	uint64_t period, now = mach_absolute_time();
+ 
+ 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
+@@ -1646,7 +1650,10 @@ MiniIOMobileFramebufferStart(IOService * provider)
+ 	}
+ #if XNU_PONG_BACKLIGHT
+ 	else {
+-		pong_backlight_start(fb);
++		extern int pong_mmio_quiet;
++		if (!pong_mmio_quiet) {
++			pong_backlight_start(fb);
++		}
+ 	}
+ #endif
+ 	fb->release();

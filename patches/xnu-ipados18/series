@@ -1,5 +1,6 @@
 0001-pong-darwin24.patch
 zz-pong-main-native4k-cache-io.patch
+zzz-pong-native4k-diag-bypass.patch
 zzzz-pong-scanout-idle.patch
 zzzzz-pong-wake-scanout-alpha.patch
 zzzzzz-pong-runtime-rule-capacity.patch
