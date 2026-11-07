@@ -118,10 +118,10 @@ def main():
                         help='compiled board DTS (default: board.toml [bootimg] dtb under the work tree)')
     parser.add_argument('--dram-size', type=lambda value: int(value, 0), default=0x200000000,
                         help='physical DRAM the boot chain reports; 8 GiB for T970')
-    parser.add_argument('--window-size', type=lambda value: int(value, 0), default=0x40000000,
-                        help="DarwinBoot's allocation window; 1 GiB for T970")
-    parser.add_argument('--cpus', type=int, choices=range(1, 9), default=1,
-                        help='CPU nodes in the ADT; a local bring-up run passes 1')
+    parser.add_argument('--window-size', type=lambda value: int(value, 0), default=0x28000000,
+                        help="DarwinBoot's allocation window; 640 MiB for T970")
+    parser.add_argument('--cpus', type=int, choices=range(1, 9), default=8,
+                        help='CPU nodes in the ADT; default 8 cores for T970')
     parser.add_argument('--chip-id', default=None, help='BuildIdentity chip ID (default: board.toml [payload.adt])')
     parser.add_argument('--ufs-probe', action='store_true',
                         help='publish the UFS nub; a local bring-up image leaves it out')

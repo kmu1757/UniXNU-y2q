@@ -107,7 +107,11 @@ size_mib = 48
 # 1024-byte buffer and refuses more than 1000 bytes; keep the final assembled line within1023 bytes.
 kernel_args = [
   "keepsyms=1",
-  "cpus=1",
+  "sheng-smp=1",
+  "armcpu-spi-ipi=1",
+  "armcpu-spi-ipi-base=544",
+  "armcpu-self-ipi=1",
+  "t970-dram-end=0x280000000",
   "pong_allow_unauthenticated_root=1",
   "cs_enforcement_disable=1",
   "cs_library_val_enable=0",
@@ -133,9 +137,9 @@ kernel_args = [
 
 [payload.adt]
 # schema_version 2 builds the ADT from the hardware DTS through devicetree.generate(); these keys
-# are the ones that function reads from [payload.adt]. The DarwinBoot allocation window is 4 GiB,
-# the window the first bring-up boot used.
-owned_memory_size = "0x40000000"
+# are the ones that function reads from [payload.adt]. 640 MiB fits inside UEFI conventional memory
+# (0xD0000000..0xFFC00000), leaving space below 4 GiB for UEFI heap. t970-dram-end extends RAM to 0x280000000.
+owned_memory_size = "0x28000000"
 # The restore's own disk images are used unmodified, so /chosen/RAMDisk holds only the seed; the
 # three volumes come from the userdata image and XNU mounts them through the UFS root driver.
 packed_data_ramdisk = false

@@ -117,7 +117,7 @@ def empty_nvram_proxy():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--cpus', type=int, choices=range(1, 9), default=1,
+    parser.add_argument('--cpus', type=int, choices=range(1, 9), default=8,
                         help='SM8475 CPU nodes, MPIDR 0x000 through 0x700')
     parser.add_argument('--output', type=Path, default=ROOT / 'build/pong/boot/kernel.macho.adt')
     parser.add_argument(
@@ -231,15 +231,37 @@ def main():
         ('pong,ramoops-phys', struct.pack('<QQ', 0x9FA00000, 0x100000)),
         ('pong,ramoops-layout', struct.pack('<4I', 0x40000, 0x40000, 0xC0000, 0x40000)),
         ('embedded-panic-log-size', struct.pack('<I', 0x40000)),
+        ('t970-dram-holes', struct.pack('<QQ', 0xFFC00000, 0x0B100000) + bytes(15 * 16)),
     ]
     chosen.append(('psci-method', b'smc\0'))
-    cpus = [node(f'cpu{i}', [
-        ('state', b'running\0' if i == 0 else b'stopped\0'),
-        ('reg', struct.pack('<I', CPU_AFFINITIES[i])),
-        ('device_type', b'cpu\0'),
-        ('compatible', b'qcom,kryo\0'),
-        ('timebase-frequency', struct.pack('<I', TIMEBASE)),
-    ]) for i in range(args.cpus)]
+    def make_cpu(i):
+        props = [
+            ('state', b'running\0' if i == 0 else b'stopped\0'),
+            ('reg', struct.pack('<I', CPU_AFFINITIES[i])),
+            ('device_type', b'cpu\0'),
+            ('compatible', b'qcom,kryo\0'),
+            ('timebase-frequency', struct.pack('<I', TIMEBASE)),
+        ]
+        # Cluster topology: 4 Silver (Cluster 0, E) + 3 Gold (Cluster 1, P) + 1 Prime (Cluster 2, P)
+        top = [
+            (ord('E'), 0, 0),
+            (ord('E'), 0, 1),
+            (ord('E'), 0, 2),
+            (ord('E'), 0, 3),
+            (ord('P'), 1, 0),
+            (ord('P'), 1, 1),
+            (ord('P'), 1, 2),
+            (ord('P'), 2, 0),
+        ]
+        ct, dc, cc = top[i] if i < len(top) else (ord('E'), 0, i)
+        props.extend([
+            ('cluster-type', struct.pack('<I', ct)),
+            ('die-cluster-id', struct.pack('<I', dc)),
+            ('cluster-core-id', struct.pack('<I', cc)),
+        ])
+        return node(f'cpu{i}', props)
+
+    cpus = [make_cpu(i) for i in range(args.cpus)]
     gic = node('intc', [
         ('compatible', b'arm,gic-v3\0'),
         ('reg', struct.pack('<4Q', GIC_DIST - APSS_BASE, GIC_DIST_SIZE,

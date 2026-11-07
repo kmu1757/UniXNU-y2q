@@ -600,7 +600,7 @@ jobs:
           if spec[4096:4104] == b'PONGFAT1':
               raise SystemExit('boot.img should be the spec image, not the flashable one')
           parameters = report['parameters']
-          if parameters['dram_size'] != '0x200000000' or parameters['window_size'] != '0x40000000' or parameters['cpus'] != 1:
+          if parameters['dram_size'] != '0x200000000' or parameters['window_size'] != '0x28000000' or parameters['cpus'] != 8:
               raise SystemExit('the ADT parameters differ from a local run: %r' % (parameters,))
           package = json.loads(found['package.manifest.json'].read_text())
           print('kernel command line', package['kernel_command_line_bytes'], 'bytes')

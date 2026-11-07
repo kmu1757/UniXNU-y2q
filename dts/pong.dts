@@ -16,8 +16,20 @@
         ramoops@9fa00000 { reg = <0x0 0x9fa00000 0x0 0x100000>; no-map; };
         rkp@b0200000 { reg = <0x0 0xb0200000 0x0 0x200000>; no-map; };
         uh_heap@b0400000 { reg = <0x0 0xb0400000 0x0 0x1800000>; no-map; };
+        sec_debug@ffc00000 { reg = <0x0 0xffc00000 0x0 0x0b100000>; no-map; };
     };
 };
+// All eight cores: 4 Silver (Cluster 0, E) + 3 Gold (Cluster 1, P) + 1 Prime (Cluster 2, P).
+// Kryo 585 Silver cpu0-3 (Cortex-A55), Gold cpu4-6 (Cortex-A77), Prime cpu7 (Cortex-A77).
+&cpu0 { unixnu,cluster-type = "E"; unixnu,die-cluster-id = <0>; unixnu,cluster-core-id = <0>; };
+&cpu1 { unixnu,cluster-type = "E"; unixnu,die-cluster-id = <0>; unixnu,cluster-core-id = <1>; };
+&cpu2 { unixnu,cluster-type = "E"; unixnu,die-cluster-id = <0>; unixnu,cluster-core-id = <2>; };
+&cpu3 { unixnu,cluster-type = "E"; unixnu,die-cluster-id = <0>; unixnu,cluster-core-id = <3>; };
+&cpu4 { unixnu,cluster-type = "P"; unixnu,die-cluster-id = <1>; unixnu,cluster-core-id = <0>; };
+&cpu5 { unixnu,cluster-type = "P"; unixnu,die-cluster-id = <1>; unixnu,cluster-core-id = <1>; };
+&cpu6 { unixnu,cluster-type = "P"; unixnu,die-cluster-id = <1>; unixnu,cluster-core-id = <2>; };
+&cpu7 { unixnu,cluster-type = "P"; unixnu,die-cluster-id = <2>; unixnu,cluster-core-id = <0>; };
+
 &gic {
     reg = <0 0x17a00000 0 0x10000>, <0 0x17a60000 0 0x100000>;
     redistributor-stride = /bits/ 64 <0x20000>;

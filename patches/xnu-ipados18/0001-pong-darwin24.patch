@@ -16857,7 +16857,7 @@ index 3290dd5..b9dcb0d 100644
  P_RULE_2=
  
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 02ab93c..77b178c 100644
+index 02ab93c..44d9fd5 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -91,6 +91,10 @@
@@ -16914,8 +16914,25 @@ index 02ab93c..77b178c 100644
  
  
  	/*
-@@ -553,6 +577,10 @@ arm_init(
+@@ -551,8 +575,27 @@ arm_init(
+ 	gDramSize = *dram_size;
+ 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
  
++	/*
++	 * gts7xlwifi: DarwinBoot hands over only its first-fit window inside the firmware's
++	 * conventional run, and every byte it loaded lies below TopOfKernelData. The DRAM above
++	 * the window up to t970-dram-end is plain RAM. Extend args->memSize here before arm_vm_init.
++	 */
++	{
++		uint64_t dram_end = 0;
++		if (PE_parse_boot_argn("t970-dram-end", &dram_end, sizeof(dram_end)) &&
++		    dram_end <= 0x280000000ULL && !(dram_end & 0x1fffffULL) &&
++		    dram_end > args->physBase + args->memSize) {
++			args->memSize = dram_end - args->physBase;
++			args->memSizeActual = args->memSize;
++		}
++	}
++
  	arm_vm_init(xmaxmem, args);
  
 +#if defined(PONG) && defined(XNU_PONG_RAMOOPS_CONSOLE) && XNU_PONG_RAMOOPS_CONSOLE
@@ -16925,18 +16942,24 @@ index 02ab93c..77b178c 100644
  	if (debug_boot_arg) {
  		patch_low_glo();
  	}
-@@ -567,6 +595,10 @@ arm_init(
+@@ -567,6 +610,16 @@ arm_init(
  	const unsigned int serial_exists = serial_init();
  	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
  	kprintf("kprintf initialized\n");
 +#if defined(PONG)
++	const ml_topology_info_t *top = ml_get_topology_info();
++	printf("Pong bring-up: managed RAM %llu MiB, %u active CPUs, %u clusters (%u Silver/E, %u Gold/P, %u Prime/P)\n",
++	    pong_ram_bytes >> 20, top->num_cpus, top->num_clusters,
++	    top->num_clusters > 0 ? top->clusters[0].num_cpus : 0,
++	    top->num_clusters > 1 ? top->clusters[1].num_cpus : 0,
++	    top->num_clusters > 2 ? top->clusters[2].num_cpus : 0);
 +    printf("Pong RAM: %u owned banks, %llu MiB managed before kernel reservations, 4 KiB pages\n",
 +        pong_ram_range_count, pong_ram_bytes >> 20);
 +#endif
  
  	serialmode = 0;
  	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
-@@ -702,6 +734,11 @@ arm_init_cpu(
+@@ -702,6 +755,11 @@ arm_init_cpu(
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
  
@@ -16989,7 +17012,7 @@ index 223d5b1..74fb15b 100644
 +__END_DECLS
 +#endif
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index a5de704..c7ca70f 100644
+index a5de704..eb0b601 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -84,8 +84,12 @@
@@ -17069,7 +17092,101 @@ index a5de704..c7ca70f 100644
  
  
  /**
-@@ -2730,7 +2750,10 @@ initialize_ram_ranges(void)
+@@ -2721,6 +2741,93 @@ pmap_is_bad_ram(__unused ppnum_t ppn)
+  * Initialize the count of available pages. No lock needed here,
+  * as this code is called while kernel boot up is single threaded.
+  */
++/*
++ * gts7xlwifi: DRAM ranges inside [first_avail, avail_end) that the VM must never hand out, from the ADT's
++ * /chosen/t970-dram-holes (pairs of u64 base, size; page aligned). XNU keeps every managed page in one linear
++ * vm_pages array (a page's address is its index plus vm_pages_first_pnum), so pmap_next_page() still returns the hole's
++ * pages in order; vm_page_startup() and vm_get_delayed_page() mark them vmp_error, the bit of retired pages, and never
++ * free them (osfmk/vm/vm_resident.c).
++ */
++#define T970_DRAM_HOLES_MAX 16
++static pmap_paddr_t t970_hole_base[T970_DRAM_HOLES_MAX], t970_hole_end[T970_DRAM_HOLES_MAX];
++static unsigned int t970_hole_count;
++
++static void
++t970_read_dram_holes(void)
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "t970-dram-holes", &prop, &size) != kSuccess || !prop || (size % 16)) {
++		return;
++	}
++	for (unsigned int i = 0; i < size / 16 && t970_hole_count < T970_DRAM_HOLES_MAX; i++) {
++		uint64_t base, len;
++		memcpy(&base, (const uint8_t *)prop + 16 * i, 8);
++		memcpy(&len, (const uint8_t *)prop + 16 * i + 8, 8);
++		if (!len || (base & PAGE_MASK) || (len & PAGE_MASK) || base + len < base) {
++			continue;
++		}
++		t970_hole_base[t970_hole_count] = base;
++		t970_hole_end[t970_hole_count] = base + len;
++		t970_hole_count++;
++	}
++}
++
++bool t970_pmap_page_in_hole(ppnum_t pn);
++bool
++t970_pmap_page_in_hole(ppnum_t pn)
++{
++	const pmap_paddr_t pa = ptoa(pn);
++	for (unsigned int i = 0; i < t970_hole_count; i++) {
++		if (pa >= t970_hole_base[i] && pa < t970_hole_end[i]) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * gts7xlwifi: boot-arg t970-memtest=1 writes and reads back every managed page at or above 0x200000000 before the VM
++ * owns any of it (CPU only, no device DMA), to tell protected or bad DRAM from a device writing to a wrong address.
++ */
++uint64_t t970_memtest_result[6];   /* low, high, pages, bad words, first bad PA, done */
++
++static void
++t970_memtest(void)
++{
++	uint64_t enable = 0;
++	if (!PE_parse_boot_argn("t970-memtest", &enable, sizeof(enable)) || !enable) {
++		return;
++	}
++	const pmap_paddr_t lo = first_avail > 0x200000000ULL ? first_avail : 0x200000000ULL, hi = avail_end;
++	uint64_t pages = 0, bad = 0, first_bad = 0;
++	t970_memtest_result[0] = lo;
++	t970_memtest_result[1] = hi;
++	for (int pass = 0; pass < 2; pass++) {
++		for (pmap_paddr_t pa = lo; pa < hi; pa += PAGE_SIZE) {
++			if (t970_pmap_page_in_hole((ppnum_t)atop(pa))) {
++				continue;
++			}
++			volatile uint64_t *w = (volatile uint64_t *)phystokv(pa);
++			for (unsigned int i = 0; i < PAGE_SIZE / 8; i++) {
++				const uint64_t want = (pa + 8 * i) ^ 0xa5c35a3cf00f0ff0ULL;
++				if (pass == 0) {
++					w[i] = want;
++				} else if (w[i] != want && !bad++) {
++					first_bad = pa + 8 * i;
++				}
++			}
++			pages += pass;
++		}
++	}
++	t970_memtest_result[2] = pages;
++	t970_memtest_result[3] = bad;
++	t970_memtest_result[4] = first_bad;
++	t970_memtest_result[5] = 1;
++}
++
+ static void
+ initialize_ram_ranges(void)
+ {
+@@ -2730,8 +2837,13 @@ initialize_ram_ranges(void)
  	assert(first <= end);
  	assert(first == (first & ~PAGE_MASK));
  	assert(end == (end & ~PAGE_MASK));
@@ -17079,9 +17196,12 @@ index a5de704..c7ca70f 100644
 +    avail_page_count += (unsigned)atop(pong_ram_bytes - gPhysSize);
 +#endif
  
++	t970_read_dram_holes();
++	t970_memtest();
  	need_ram_ranges_init = false;
  }
-@@ -2752,7 +2775,11 @@ pmap_free_pages_span(
+ 
+@@ -2752,7 +2864,11 @@ pmap_free_pages_span(
  	if (need_ram_ranges_init) {
  		initialize_ram_ranges();
  	}
@@ -17094,7 +17214,7 @@ index a5de704..c7ca70f 100644
  }
  
  
-@@ -2781,8 +2808,23 @@ pmap_next_page(
+@@ -2781,8 +2897,23 @@ pmap_next_page(
  		--avail_page_count;
  		return TRUE;
  	}
@@ -17120,7 +17240,7 @@ index a5de704..c7ca70f 100644
  }
  
  
-@@ -4087,7 +4129,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t
+@@ -4087,7 +4218,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t
  {
  #if __ARM_PTE_PHYSMAP__
  	pvh_assert_locked(pai);
@@ -17129,7 +17249,7 @@ index a5de704..c7ca70f 100644
  	pt_entry_t *pte_p = pmap_pte(kernel_pmap, kva);
  
  	pt_entry_t tmplate = *pte_p;
-@@ -4915,13 +4957,13 @@ pmap_page_protect_options_with_flush_range(
+@@ -4915,13 +5046,13 @@ pmap_page_protect_options_with_flush_range(
  		if (pvh_ptep_is_iommu(pte_p)) {
  #if XNU_MONITOR
  			if (__improbable(pvh_flags & PVH_FLAG_LOCKDOWN_MASK)) {
@@ -17147,7 +17267,7 @@ index a5de704..c7ca70f 100644
  			}
  			goto protect_skip_pve_pass1;
  		}
-@@ -7163,7 +7205,8 @@ void
+@@ -7163,7 +7294,8 @@ void
  pmap_sync_page_attributes_phys(
  	ppnum_t pp)
  {
@@ -17157,7 +17277,7 @@ index a5de704..c7ca70f 100644
  }
  
  #if CONFIG_COREDUMP
-@@ -7732,6 +7775,11 @@ pmap_disconnect(
+@@ -7732,6 +7864,11 @@ pmap_disconnect(
  boolean_t
  pmap_has_managed_page(ppnum_t first, ppnum_t last)
  {
@@ -17169,7 +17289,7 @@ index a5de704..c7ca70f 100644
  	if (ptoa(first) >= vm_last_phys) {
  		return FALSE;
  	}
-@@ -7740,6 +7788,7 @@ pmap_has_managed_page(ppnum_t first, ppnum_t last)
+@@ -7740,6 +7877,7 @@ pmap_has_managed_page(ppnum_t first, ppnum_t last)
  	}
  
  	return TRUE;
@@ -17177,7 +17297,7 @@ index a5de704..c7ca70f 100644
  }
  
  /*
-@@ -12186,6 +12235,7 @@ pmap_unpin_kernel_pages(vm_offset_t kva __unused, size_t nbytes __unused)
+@@ -12186,6 +12324,7 @@ pmap_unpin_kernel_pages(vm_offset_t kva __unused, size_t nbytes __unused)
  #endif /* !XNU_MONITOR */
  
  
@@ -17185,7 +17305,7 @@ index a5de704..c7ca70f 100644
  MARK_AS_PMAP_TEXT static inline void
  pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
  {
-@@ -12206,6 +12256,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+@@ -12206,6 +12345,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
  #endif
  }
  
@@ -17696,10 +17816,21 @@ index 4f8404f..287ac88 100644
  
  	DECLARE("VM_MIN_KERNEL_ADDRESS", VM_MIN_KERNEL_ADDRESS);
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index cbb494a..63cc4b9 100644
+index cbb494a..deec382 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -1712,12 +1712,38 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1219,6 +1219,10 @@ ml_parse_cpu_topology(void)
+ 		 */
+ #if HAS_CLUSTER
+ 		uint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);
++#elif defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++		/* gts7xlwifi: SM8250's MPIDR AFF1 numbers single cores (one DynamIQ cluster), so the scheduling cluster is the cpu node's
++		 * die-cluster-id (0 Silver, 1 Gold, 2 Prime); without it, the E/P split as before. */
++		uint32_t phys_cluster_id = (uint32_t)ml_readprop(child, "die-cluster-id", (cpu->cluster_type == CLUSTER_TYPE_P));
+ #else
+ 		uint32_t phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P);
+ #endif
+@@ -1712,12 +1716,38 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	 * It needs to be booted here for the boot processor to finish the
  	 * subsequent registerInterrupt operations and unblock the other cores.
  	 */
@@ -17738,7 +17869,7 @@ index cbb494a..63cc4b9 100644
  void
  ml_init_arm_debug_interface(
  	void * in_cpu_datap,
-@@ -2579,8 +2605,10 @@ _enable_virtual_timer(void)
+@@ -2579,8 +2609,10 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, cntvctl);
@@ -19146,7 +19277,7 @@ index c5c6da5..9854c4f 100644
  	}
  }
 diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
-index 3133708..ab29523 100644
+index 3133708..ecacc73 100644
 --- a/osfmk/kern/processor.c
 +++ b/osfmk/kern/processor.c
 @@ -164,7 +164,9 @@ processor_set_t         pset_array[MAX_PSETS] = { 0 };
@@ -19159,6 +19290,20 @@ index 3133708..ab29523 100644
  };
  static_assert(sizeof(running_timer_funcs) / sizeof(running_timer_funcs[0])
      == RUNNING_TIMER_MAX, "missing running timer function");
+@@ -442,6 +444,13 @@ processor_pset(
+ cluster_type_t
+ pset_type_for_id(uint32_t cluster_id)
+ {
++#if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++	/* gts7xlwifi, as SM-T733: the topology exists before ArmCpu registers the secondary psets. */
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	if (cluster_id < topology->num_clusters) {
++		return topology->clusters[cluster_id].cluster_type;
++	}
++#endif
+ 	return pset_array[cluster_id]->pset_type;
+ }
+ 
 diff --git a/osfmk/kern/recount.c b/osfmk/kern/recount.c
 index a7f4322..abcb5d4 100644
 --- a/osfmk/kern/recount.c
@@ -19183,6 +19328,42 @@ index a7f4322..abcb5d4 100644
 +    return idle;
 +}
 +#endif
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 3ea3171..952e6af 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -1451,7 +1451,14 @@ sched_clutch_destroy(
+ static uint32_t
+ sched_edge_clutch_bucket_group_preferred_cluster(sched_clutch_bucket_group_t clutch_bucket_group)
+ {
+-	return os_atomic_load(&clutch_bucket_group->scbg_preferred_cluster, relaxed);
++	uint32_t cluster_id = os_atomic_load(&clutch_bucket_group->scbg_preferred_cluster, relaxed);
++#if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++	/* gts7xlwifi, as SM-T733 45e: early threads run before the secondary psets exist; until then the boot cluster. */
++	if (cluster_id >= MAX_PSETS || pset_array[cluster_id] == PROCESSOR_SET_NULL || !sched_edge_pset_available(pset_array[cluster_id])) {
++		return pset0.pset_cluster_id;
++	}
++#endif
++	return cluster_id;
+ }
+ 
+ static uint32_t
+@@ -5222,7 +5229,14 @@ sched_edge_cpu_init_completed(void)
+ 				/* P->P/E->E edge config */
+ 				bitmap_clear(src_pset->foreign_psets, dst_cluster_id);
+ 				bitmap_set(src_pset->native_psets, dst_cluster_id);
+-				sched_edge_config_set(src_cluster_id, dst_cluster_id, (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 1, .sce_steal_allowed = 1});
++				uint32_t migration_weight = 0;
++#if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++				/* gts7xlwifi, as SM-T733: Gold -> Prime only for a larger latency gain while Prime is busy; idle Prime stays usable. */
++				if (ml_get_die_cluster_id(src_cluster_id) == 1 && ml_get_die_cluster_id(dst_cluster_id) == 2) {
++					migration_weight = 16;
++				}
++#endif
++				sched_edge_config_set(src_cluster_id, dst_cluster_id, (sched_clutch_edge){.sce_migration_weight = migration_weight, .sce_migration_allowed = 1, .sce_steal_allowed = 1});
+ 			} else if ((src_pset->pset_type == CLUSTER_TYPE_P) && (dst_pset->pset_type == CLUSTER_TYPE_E)) {
+ 				/* P->E edge config */
+ 				bitmap_set(src_pset->foreign_psets, dst_cluster_id);
 diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
 index e48077a..1b508e0 100644
 --- a/osfmk/kern/sched_prim.c
@@ -19469,20 +19650,42 @@ index 632e50e..ea284d5 100644
  #endif /* XNU_VM_HAS_LINEAR_PAGES_ARRAY */
  	return ((const struct vm_page_with_ppnum *)m)->vmp_phys_page;
 diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
-index bd4bb7f..b18fe72 100644
+index bd4bb7f..4f894fa 100644
 --- a/osfmk/vm/vm_resident.c
 +++ b/osfmk/vm/vm_resident.c
-@@ -381,6 +381,9 @@ SECURITY_READ_ONLY_LATE(uint32_t)  vm_pages_count;
+@@ -381,6 +381,11 @@ SECURITY_READ_ONLY_LATE(uint32_t)  vm_pages_count;
  #endif /* XNU_VM_HAS_DELAYED_PAGES */
  #if XNU_VM_HAS_LINEAR_PAGES_ARRAY
  SECURITY_READ_ONLY_LATE(ppnum_t)   vm_pages_first_pnum;
 +#if defined(PONG)
 +SECURITY_READ_ONLY_LATE(unsigned) vm_pages_first_pong_index = UINT32_MAX;
++/* gts7xlwifi: pages of a /chosen/t970-dram-holes range, kept in vm_pages but never freed. */
++extern bool t970_pmap_page_in_hole(ppnum_t pn);
 +#endif
  #endif /* XNU_VM_HAS_LINEAR_PAGES_ARRAY */
  #if CONFIG_SPTM
  /*
-@@ -2463,6 +2466,9 @@ pmap_startup(
+@@ -1615,6 +1620,7 @@ vm_get_delayed_page(vm_grab_options_t grab_options)
+ 	 * Get a new page if we have one.
+ 	 */
+ 	vm_free_page_lock();
++t970_next:
+ 	if (vm_delayed_count == 0) {
+ 		vm_free_page_unlock();
+ 		return NULL;
+@@ -1641,6 +1647,11 @@ vm_get_delayed_page(vm_grab_options_t grab_options)
+ 	vm_page_init(p, pnum);
+ 	++vm_pages_count;
+ 	++vm_page_pages;
++	if (t970_pmap_page_in_hole(pnum)) {
++		/* gts7xlwifi: keep the array linear but never hand the page out; take the next one. */
++		p->vmp_error = TRUE;
++		goto t970_next;   /* still holding the free page lock */
++	}
+ 	vm_free_page_unlock();
+ 
+ 	/*
+@@ -2463,6 +2474,9 @@ pmap_startup(
  #if XNU_VM_HAS_LINEAR_PAGES_ARRAY
  		if (i == 0) {
  			vm_pages_first_pnum = phys_page;
@@ -19492,7 +19695,19 @@ index bd4bb7f..b18fe72 100644
  			patch_low_glo_vm_page_info(vm_pages, vm_pages_end,
  			    vm_pages_first_pnum);
  		}
-@@ -2818,7 +2824,7 @@ vm_pages_radix_insert(ppnum_t pnum, vm_page_t page)
+@@ -2475,6 +2489,11 @@ pmap_startup(
+ 
+ 		++vm_pages_count;
+ 		vm_page_init(vm_page_get(i), phys_page);
++		if (t970_pmap_page_in_hole(phys_page)) {
++			/* gts7xlwifi: in vm_pages, never freed (the release loop below skips vmp_error pages). */
++			vm_page_get(i)->vmp_error = TRUE;
++			continue;
++		}
+ 		if (fillval) {
+ 			fillPage(phys_page, fillval);
+ 		}
+@@ -2818,7 +2837,7 @@ vm_pages_radix_insert(ppnum_t pnum, vm_page_t page)
  }
  
  __abortlike
@@ -19501,7 +19716,7 @@ index bd4bb7f..b18fe72 100644
  vm_page_for_ppnum_panic(ppnum_t pnum)
  {
  	if (pnum < pmap_first_pnum) {
-@@ -2837,11 +2843,18 @@ vm_page_find_canonical(ppnum_t pnum)
+@@ -2837,11 +2856,18 @@ vm_page_find_canonical(ppnum_t pnum)
  	vm_page_radix_ptr_t  ptr;
  	uint32_t level, index;
  
@@ -19524,7 +19739,7 @@ index bd4bb7f..b18fe72 100644
  		/*
  		 * We could receive requests for pages which are beyond the xnu's managed space. (eg: ECC errors)
  		 * These need to be handled gracefully, so we return VM_PAGE_NULL here.
-@@ -2850,10 +2863,11 @@ vm_page_find_canonical(ppnum_t pnum)
+@@ -2850,10 +2876,11 @@ vm_page_find_canonical(ppnum_t pnum)
  	}
  
  	if (__probable(pnum >= vm_pages_first_pnum)) {
@@ -19894,10 +20109,10 @@ index f76d5c8..3722562 100644
 -#endif /* !defined(__ASSEMBLER__) */
 +#endif /* !defined(__ASSEMBLER__) && defined(APPLE_ARM64_ARCH_FAMILY) */
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
-index ba15ae4..6bf82a9 100644
+index ba15ae4..e88047c 100644
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
-@@ -270,6 +270,14 @@
+@@ -270,6 +270,15 @@
  
  #endif  /* ARM64_BOARD_CONFIG_T6041 */
  
@@ -19905,7 +20120,8 @@ index ba15ae4..6bf82a9 100644
 +#include <pexpert/arm64/PONG.h>
 +#define MAX_L2_CLINE                   6
 +#define MAX_CPUS                       8
-+#define MAX_CPU_CLUSTERS               1
++#define MAX_CPU_CLUSTERS               3
++#define __ARM_AMP__                    1
 +#define CORE_NCTRS                     8 /* Unused placeholder: KPC disabled */
 +#endif /* ARM64_BOARD_CONFIG_PONG */
 +

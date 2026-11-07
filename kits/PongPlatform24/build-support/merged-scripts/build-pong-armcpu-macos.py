@@ -17,6 +17,17 @@ DEFAULT_TREE = pong_paths.build_tree(name='Pong-iPadOS18-native')
 DEVELOPER = pong_paths.developer_dir()
 
 
+def patch_armcpu_for_t970(armcpu_source: Path):
+    try:
+        import patch_armcpu_t970
+    except ImportError:
+        for p in [Path(__file__).resolve().parent, Path(__file__).resolve().parents[1] / 'scripts', Path(__file__).resolve().parents[3] / 'scripts']:
+            if p.exists() and str(p) not in sys.path:
+                sys.path.insert(0, str(p))
+        import patch_armcpu_t970
+    patch_armcpu_t970.patch_armcpu(armcpu_source)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tree', type=Path, default=DEFAULT_TREE,
@@ -29,6 +40,7 @@ def main():
         raise SystemExit('This continuation uses the Intel macOS toolchain')
     out = tree / 'build/armcpu'
     out.mkdir(parents=True, exist_ok=True)
+    patch_armcpu_for_t970(DEVICE / 'drivers/ArmCpu')
     source = DEVICE / 'drivers/ArmCpu/ArmCpu.cpp'
     framework = tree / '.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A'
     if not (framework / 'PrivateHeaders/IOKit/IOPlatformExpert.h').exists():
