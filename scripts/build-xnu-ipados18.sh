@@ -1159,7 +1159,7 @@ if command -v ccache >/dev/null 2>&1; then
   CCACHE_BIN="$(command -v ccache)"
   echo "ccache detected: $CCACHE_BIN"
   echo "=== ccache statistics (before compilation) ==="
-  "$CCACHE_BIN" -s || true
+  "$CCACHE_BIN" -s -v || true
   EXTRA_MAKE_ARGS+=("CCACHE=$CCACHE_BIN")
 fi
 make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
@@ -1174,7 +1174,8 @@ make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iph
   OBJROOT="$ROOT/build/xnu/ios-obj" SYMROOT="$ROOT/build/xnu/ios-sym" DSTROOT="$ROOT/build/xnu/ios-dst"
 if command -v ccache >/dev/null 2>&1; then
   echo "=== ccache statistics (after compilation) ==="
-  "$CCACHE_BIN" -s || true
+  "$CCACHE_BIN" -s -v || true
+  "$CCACHE_BIN" --print-stats || true
 fi
 if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$CRYPTO_BOOTSTRAP_MODE" = source ]; then
   python3 scripts/seal-source-crypto-kernel.py \

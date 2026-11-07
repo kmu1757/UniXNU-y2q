@@ -89,6 +89,7 @@ env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 5G
   CCACHE_SLOPPINESS: time_macros,include_file_mtime,file_macro
+  CCACHE_BASEDIR: ${{ github.workspace }}
   # Pinned: `release`, its steps and this repository's scripts/package.sh are one
   # interface. Move both together.
   UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
@@ -465,8 +466,8 @@ jobs:
         if: ${{ !inputs.no_cache }}
         uses: actions/cache@v4
         with:
-          path: UniXNU/out/feeds/mu_basecore-*/BaseTools/Source/C/bin
-          key: edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-v1
+          path: UniXNU/out/feeds/mu_basecore-*/BaseTools/Source/C
+          key: edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-v2
           restore-keys: |
             edk2-basetools-${{ runner.os }}-${{ env.UNIXNU_REF }}-
       - name: XNU tree and build cache
@@ -492,7 +493,7 @@ jobs:
         run: |
           mkdir -p "$CCACHE_DIR"
           ccache -z || true
-          ccache -s || true
+          ccache -s -v || true
       - name: package
         working-directory: device
         env:
@@ -516,7 +517,8 @@ jobs:
       - name: ccache summary
         if: always() && !inputs.no_cache
         run: |
-          ccache -s || true
+          ccache -s -v || true
+          ccache --print-stats || true
       - name: boot image for the firmware
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}

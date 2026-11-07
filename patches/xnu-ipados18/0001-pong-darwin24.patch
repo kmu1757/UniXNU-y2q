@@ -16221,6 +16221,15 @@ index 8830671..a980552 100644
  
  
  #
+@@ -750,7 +751,7 @@ CXXFLAGS      = $(CXXFLAGS_GEN) \
+ # Assembler command
+ #
+ AS	= $(CCACHE) $(CC)
+-S_KCC	= $(CC)
++S_KCC	= $(CCACHE) $(CC)
+ 
+ #
+ # Default SFLAGS
 @@ -813,7 +814,8 @@ LDFLAGS_KERNEL_GEN = \
  	-Wl,-headerpad,152
  
@@ -16256,6 +16265,37 @@ index 3939409..7eb090d 100644
  ifeq ($(PRE_LTO),1)
  	@$(LOG_LTO) "$(@F)"
  	$(_v)$(RM) ltolink.filelist
+diff --git a/makedefs/MakeInc.rule b/makedefs/MakeInc.rule
+index 3290dd5..b9dcb0d 100644
+--- a/makedefs/MakeInc.rule
++++ b/makedefs/MakeInc.rule
+@@ -512,7 +512,7 @@ do_exporthdrs_md: $(EXPORT_MD_GEN_INC_FILES)  $(EXPORT_MD_INC_FILES) | $(EXP_MD_
+ #
+ 
+ S_RULE_0=@$(LOG_AS) "$@"
+-S_RULE_1A=$(_v)$(S_KCC) -c $(SFLAGS) -MD -MF $(@:o=d) -MJ $(@:o=o.json) -MP $($@_SFLAGS_ADD) $(INCFLAGS) $($@_INCFLAGS)
++S_RULE_1A=$(_v)$(S_KCC) -c $(SFLAGS) -MD -MF $(@:o=d) -MP $($@_SFLAGS_ADD) $(INCFLAGS) $($@_INCFLAGS)
+ S_RULE_1B=$(<F)
+ S_RULE_2=
+ 
+@@ -520,7 +520,7 @@ S_RULE_2=
+ # Compilation rules to generate .o from .c for normal files
+ #
+ C_RULE_0=@$(LOG_CC) "$@"
+-C_RULE_1A=$(_v)$(KCC) -c $(filter-out $($@_CFLAGS_RM), $(CFLAGS) $(CWARNFLAGS)) -MD -MF $(@:o=d) -MJ $(@:o=o.json) -MP $($@_CFLAGS_ADD) $($@_CWARNFLAGS_ADD) $(INCFLAGS) $($@_INCFLAGS)
++C_RULE_1A=$(_v)$(KCC) -c $(filter-out $($@_CFLAGS_RM), $(CFLAGS) $(CWARNFLAGS)) -MD -MF $(@:o=d) -MP $($@_CFLAGS_ADD) $($@_CWARNFLAGS_ADD) $(INCFLAGS) $($@_INCFLAGS)
+ C_RULE_1B=$(<F)
+ C_RULE_2=
+ C_RULE_3=
+@@ -542,7 +542,7 @@ C_RULE_4_D=$(C_RULE_4)
+ #   The config tool slickly changes the last source filename char to 'o'
+ #   for the object filename.
+ P_RULE_0=@$(LOG_CXX) "$@"
+-P_RULE_1A=$(_v)$(KC++) -o $@ -c $(CXXFLAGS) $(filter-out $($@_CFLAGS_RM), $(CFLAGS) $(CXXWARNFLAGS)) -MD -MF $(@:o=d) -MJ $(@:o=o.json) -MP $($@_CFLAGS_ADD) $($@_CXXWARNFLAGS_ADD) $(INCFLAGS) $($@_INCFLAGS)
++P_RULE_1A=$(_v)$(KC++) -o $@ -c $(CXXFLAGS) $(filter-out $($@_CFLAGS_RM), $(CFLAGS) $(CXXWARNFLAGS)) -MD -MF $(@:o=d) -MJ $(@:o=o.json) -MP $($@_CFLAGS_ADD) $($@_CXXWARNFLAGS_ADD) $(INCFLAGS) $($@_INCFLAGS)
+ P_RULE_1B=$(<F)
+ P_RULE_2=
+ 
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
 index 02ab93c..77b178c 100644
 --- a/osfmk/arm/arm_init.c
