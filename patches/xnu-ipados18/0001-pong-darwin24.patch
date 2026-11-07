@@ -16616,10 +16616,20 @@ index 8830671..a980552 100644
  INCFLAGS_SDK   += -I$(KDKROOT)/$(KPINCDIR)
  INCFLAGS_PLATFORM += -I$(KDKROOT)/$(KINCDIR)/platform -I$(KDKROOT)/$(KPINCDIR)/platform
 diff --git a/makedefs/MakeInc.kernel b/makedefs/MakeInc.kernel
-index 3939409..7eb090d 100644
+index 3939409..c1dd832 100644
 --- a/makedefs/MakeInc.kernel
 +++ b/makedefs/MakeInc.kernel
-@@ -187,7 +187,7 @@ $(TARGET)/lib$(KERNEL_FILE_NAME).a: $(addprefix $(TARGET)/,$(foreach component,$
+@@ -99,7 +99,9 @@ do_build_kernel_dSYM: $(TARGET)/$(KERNEL_FILE_NAME).dSYM
+ 
+ endif
+ 
++ifeq ($(BUILD_COMPILE_COMMANDS),1)
+ do_build_all:: do_build_compile_commands_json
++endif
+ 
+ .PHONY: do_build_compile_commands_json
+ 
+@@ -187,7 +189,7 @@ $(TARGET)/lib$(KERNEL_FILE_NAME).a: $(addprefix $(TARGET)/,$(foreach component,$
  	$(_v)$(LN) $(call function_convert_build_config_to_objdir,$(CURRENT_BUILD_CONFIG))/lib$(KERNEL_FILE_NAME).a $(OBJROOT)/lib$(KERNEL_FILE_NAME).a
  endif
  
@@ -16628,6 +16638,22 @@ index 3939409..7eb090d 100644
  ifeq ($(PRE_LTO),1)
  	@$(LOG_LTO) "$(@F)"
  	$(_v)$(RM) ltolink.filelist
+@@ -236,8 +238,13 @@ else
+ endif
+ 
+ $(TARGET)/compile_commands.json: $(addprefix $(TARGET)/,$(foreach component,$(COMPONENT_LIST),$(component)/$(CURRENT_KERNEL_CONFIG)/$(component).filelist))
+-	$(_v)files="$$(sed -e 's/$$/.json/' $(filter %.filelist,$+))"; \
+-	sed -e '1s/^/[\'$$'\n''/' -e '$$s/,$$/\'$$'\n'']/' $$files > compile_commands.json
++	$(_v)files="$$(sed -e 's/$$/.json/' $(filter %.filelist,$+) 2>/dev/null | while read -r f; do [ -f "$$f" ] && echo "$$f"; done)"; \
++	if [ -n "$$files" ]; then \
++		sed -e '1s/^/[\'$$'\n''/' -e '$$s/,$$/\'$$'\n'']/' $$files > compile_commands.json; \
++	else \
++		echo "[]" > compile_commands.json; \
++	fi; \
++	[ -f compile_commands.json ] && cp -f compile_commands.json $@ 2>/dev/null || true
+ 
+ # for now, rename LASTDATA_CONST to LAST on static kernel cache builds
+ EXTRA_KC_LINKARGS = -Wl,-rename_segment,__LASTDATA_CONST,__LAST
 diff --git a/makedefs/MakeInc.rule b/makedefs/MakeInc.rule
 index 3290dd5..b9dcb0d 100644
 --- a/makedefs/MakeInc.rule

@@ -480,12 +480,12 @@ jobs:
           key: xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-${{ hashFiles('device/patches/xnu-ipados18/**') }}
           restore-keys: |
             xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-
-      - name: ccache
+      - name: restore ccache
         if: ${{ !inputs.no_cache }}
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}
+          key: ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-
       - name: initialize ccache
@@ -517,8 +517,15 @@ jobs:
       - name: ccache summary
         if: always() && !inputs.no_cache
         run: |
+          mkdir -p "$CCACHE_DIR"
           ccache -s -v || true
           ccache --print-stats || true
+      - name: save ccache
+        if: always() && !inputs.no_cache
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: boot image for the firmware
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
