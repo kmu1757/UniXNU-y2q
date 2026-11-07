@@ -5,13 +5,21 @@
 	<!-- /private/var starts empty on every boot; without this record of the build that last ran the
 	     data migration, backboardd runs all the migrators (the progress bar under the logo) each time -->
 	<key>LastSystemVersion</key>
-	<string>20F66</string>
+	<string>22H374</string>
 	<key>DMLastMigrationResults</key>
 	<dict>
 		<key>success</key>
 		<true/>
 		<key>buildVersion</key>
-		<string>20F66</string>
+		<string>22H374</string>
+	</dict>
+	<!-- Suppress full data migration and synthetic upgrade loops (ios-sweet MIT) -->
+	<key>DMUserDataDisposition</key>
+	<dict>
+		<key>SyntheticDidUpgrade</key>
+		<false/>
+		<key>buildVersion</key>
+		<string>22H374</string>
 	</dict>
 </dict>
 </plist>

@@ -41,6 +41,24 @@ com.apple.runningboardd com.apple.backboardd com.apple.mobile.usermanagerd
 com.apple.mobilegestalt.xpc com.apple.lsd com.apple.powerd com.apple.analyticsd
 com.apple.logd_helper com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 com.apple.SpringBoard com.apple.configd com.apple.audiomxd com.apple.wifid'''.split()
+
+# Daemons excluded at build time for lightweight bring-up on SM-T970 (gts7xlwifi).
+# Reference: rui UniXNU-gts7xlwifi BootWatchdogPolicy.c (lite_jobs, MIT License).
+# Added for 5-test15: liveactivitiesd, cryptexd, routined.
+# Note: com.apple.iconservices.iconservicesagent is intentionally retained in CORE (required for icons).
+LITE_EXCLUDED_JOBS = {
+    'com.apple.liveactivitiesd',
+    'com.apple.cryptexd',
+    'com.apple.routined',
+    'com.apple.watchdogd',
+    'com.apple.locationd',
+    'com.apple.identityservicesd',
+    'com.apple.passd',
+    'com.apple.thermalmonitord',
+    'com.apple.coreduetd',
+    'com.apple.suggestd',
+    'com.apple.contextstored',
+}
 # Restore the actual 22H374 service catalog. Earlier bring-up recipes removed
 # hardware consumers, PerfPowerServices and prediction daemons, and then also
 # dropped event-only jobs. The user now requests those software components
@@ -487,6 +505,8 @@ def jobs(root, cryptex, overlay, out, app_cryptex=None):
             reason = None
             if not mapped or not mapped.is_file(): reason = 'program absent from supplied 22H374 OS/SystemOS/AppOS'
             elif job.get('_LimitLoadToVariant') == 'IsDarwinOS': reason = 'DarwinOS variant; this source is iOS'
+            elif not core and (label in LITE_EXCLUDED_JOBS or any(k in label.lower() for k in ('liveactivitiesd', 'cryptexd', 'routined'))):
+                reason = 'excluded by lite_jobs policy (rui BootWatchdogPolicy.c MIT + 5-test15)'
             record = dict(source=f.relative_to(root).as_posix(), label=label, program=program,
                           action='excluded' if reason else ('boot' if core or job.get('RunAtLoad') or job.get('KeepAlive') is True else 'on-demand'), reason=reason)
             records.append(record)
@@ -758,7 +778,8 @@ def data_seed(image, root, overlay, out):
             # mode with setdefault. Preserve metadata from the restore.
             metadata.setdefault(p, [stat.S_IFDIR | (mode if i == len(parts) else 0o755), uid, gid])
     for name in ('com.apple.purplebuddy.plist', 'com.apple.purplebuddy.notbackedup.plist',
-                 'com.apple.springboard.plist', 'com.apple.migration.plist'):
+                 'com.apple.springboard.plist', 'com.apple.migration.plist',
+                 'com.apple.managedconfiguration.notbackedup.plist'):
         rel = 'mobile/Library/Preferences/' + name
         source = plistlib.loads((PROJECT / 'userland/var' / rel).read_bytes())
         target = data / rel
@@ -769,6 +790,20 @@ def data_seed(image, root, overlay, out):
         if name == 'com.apple.migration.plist':
             value['LastSystemVersion'] = '22H374'
             value['DMLastMigrationResults']['buildVersion'] = '22H374'
+            value['DMUserDataDisposition'] = {
+                'SyntheticDidUpgrade': False,
+                'buildVersion': '22H374',
+            }
+        if name == 'com.apple.managedconfiguration.notbackedup.plist':
+            value.setdefault('LockdownActivationIndicatesCloudConfigurationAvailable', False)
+        if name == 'com.apple.springboard.plist':
+            value.update(
+                SBDisableAutoDim=True,
+                SBDontDimOrLockOnAC=True,
+                SBDisableIdleSleep=True,
+                FBLaunchWatchdogExceptions={'com.apple.purplebuddy': 100},
+                MCForceShowCloudConfigurationUI=False,
+            )
         if name == 'com.apple.purplebuddy.plist':
             value.pop('SetupState', None)
             value.update(SetupDone=True, SetupFinishedAllSteps=True, SetupVersion=11,
@@ -779,7 +814,7 @@ def data_seed(image, root, overlay, out):
         rel = owner + '/Library/Preferences/.GlobalPreferences.plist'
         path = data / rel
         value = plistlib.loads(path.read_bytes()) if path.exists() else {}
-        value.update(AppleLanguages=['zh-Hans-CN'], AppleLocale='zh_CN')
+        value.update(AppleLanguages=['ko-KR'], AppleLocale='ko_KR')
         path.parent.mkdir(parents=True, exist_ok=True)
         put_plist(path, value)
         metadata[rel] = [stat.S_IFREG | 0o644, uid, gid]

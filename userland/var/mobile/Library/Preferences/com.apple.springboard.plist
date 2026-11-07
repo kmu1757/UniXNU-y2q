@@ -17,5 +17,19 @@
 	     Percentage, which an iPhone X has off at first) -->
 	<key>SBShowBatteryPercentage</key>
 	<true/>
+	<!-- Keep display active and prevent idle sleep / auto dim on early boot (CakeAL v68, skip-setup BSD-2-Clause-Patent) -->
+	<key>SBDisableAutoDim</key>
+	<true/>
+	<key>SBDontDimOrLockOnAC</key>
+	<true/>
+	<key>SBDisableIdleSleep</key>
+	<true/>
+	<key>FBLaunchWatchdogExceptions</key>
+	<dict>
+		<key>com.apple.purplebuddy</key>
+		<integer>100</integer>
+	</dict>
+	<key>MCForceShowCloudConfigurationUI</key>
+	<false/>
 </dict>
 </plist>

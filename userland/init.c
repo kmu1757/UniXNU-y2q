@@ -116,10 +116,14 @@ copy_replace(const char *source, const char *dest, const char *temporary,
 static void
 prepare_setup_bypass(void)
 {
-    static const char marker[] = "/private/var/.pong-setup-bypass-22H374";
+    static const char marker[] = "/private/var/.pong-setup-bypass-22H374-v2";
     static const char buddy_source[] = "/pong/var-seed/mobile/Library/Preferences/com.apple.purplebuddy.plist";
     static const char mini_source[] = "/pong/var-seed/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist";
     static const char springboard_source[] = "/pong/var-seed/mobile/Library/Preferences/com.apple.springboard.plist";
+    static const char mc_source[] = "/pong/var-seed/mobile/Library/Preferences/com.apple.managedconfiguration.notbackedup.plist";
+    static const char mig_source[] = "/pong/var-seed/mobile/Library/Preferences/com.apple.migration.plist";
+    static const char gpref_mobile[] = "/pong/var-seed/mobile/Library/Preferences/.GlobalPreferences.plist";
+    static const char gpref_root[] = "/pong/var-seed/root/Library/Preferences/.GlobalPreferences.plist";
     struct stat st;
     if (lstat(marker, &st) == 0) return;
     if (copy_replace(buddy_source,
@@ -133,21 +137,43 @@ prepare_setup_bypass(void)
         puts("Pong init: setup bypass preference update failed; retain current Data preferences");
         return;
     }
-    /* Add development watchdog defaults only if this Data has no domain
-     * yet. Never replace a populated SpringBoard preference file. */
-    if (copy_new(springboard_source,
+    /* Update SpringBoard development watchdog and auto-dim/sleep suppression defaults.
+     * Use copy_replace so updated power/watchdog seeds reach existing Data volumes. */
+    if (copy_replace(springboard_source,
             "/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
+            "/private/var/mobile/Library/Preferences/.com.apple.springboard.plist.pong-tmp",
             0600, 501, 501) != 0)
-        puts("Pong init: SpringBoard default preference seed skipped");
+        puts("Pong init: SpringBoard preference update failed");
+
+    /* Cloud configuration suppression and migration disposition */
+    copy_replace(mc_source,
+        "/private/var/mobile/Library/Preferences/com.apple.managedconfiguration.notbackedup.plist",
+        "/private/var/mobile/Library/Preferences/.com.apple.managedconfiguration.notbackedup.plist.pong-tmp",
+        0600, 501, 501);
+    copy_replace(mig_source,
+        "/private/var/mobile/Library/Preferences/com.apple.migration.plist",
+        "/private/var/mobile/Library/Preferences/.com.apple.migration.plist.pong-tmp",
+        0600, 501, 501);
+
+    /* Locale and language preferences (ko-KR / ko_KR) */
+    copy_replace(gpref_mobile,
+        "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist",
+        "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist.pong-tmp",
+        0644, 501, 501);
+    copy_replace(gpref_root,
+        "/private/var/root/Library/Preferences/.GlobalPreferences.plist",
+        "/private/var/root/Library/Preferences/.GlobalPreferences.plist.pong-tmp",
+        0644, 0, 0);
+
     int fd = open(marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd >= 0) {
-        static const char version[] = "22H374 setup bypass applied\n";
+        static const char version[] = "22H374-v2 setup bypass, power, migration and locale seed applied\n";
         (void)write(fd, version, sizeof(version) - 1);
         (void)fsync(fd);
         (void)close(fd);
         (void)chown(marker, 0, 0);
         (void)chmod(marker, 0600);
-        puts("Pong init: applied native 22H374 setup-complete preferences once");
+        puts("Pong init: applied native 22H374-v2 setup-complete and power preferences once");
     } else {
         printf("Pong init: setup bypass marker unavailable errno=%d\n", errno);
     }

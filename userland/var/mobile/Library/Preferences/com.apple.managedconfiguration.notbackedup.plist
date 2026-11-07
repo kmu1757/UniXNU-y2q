@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Suppress cloud configuration / MDM check on initial boot (skip-setup BSD-2-Clause-Patent) -->
+	<key>LockdownActivationIndicatesCloudConfigurationAvailable</key>
+	<false/>
+</dict>
+</plist>
