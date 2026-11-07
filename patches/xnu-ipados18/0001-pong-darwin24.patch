@@ -8898,9 +8898,9 @@ index 2620af5..d6c5731 100644
 +	    proc_getpid(p), p->p_comm,
 +	    (uint64_t)uap->start_address,
 +	    (void *)VM_KERNEL_ADDRPERM(shared_region),
-+	    shared_region ? shared_region->sr_ref_count : 0,
-+	    (uint64_t)(shared_region ? shared_region->sr_first_mapping : 0),
-+	    (uint64_t)(shared_region ? shared_region->sr_base_address : 0)));
++	    vm_shared_region_ref_count(shared_region),
++	    (uint64_t)vm_shared_region_first_mapping(shared_region),
++	    (uint64_t)vm_shared_region_base_address(shared_region)));
  	if (shared_region != NULL) {
  		/*
  		 * A NULL argument is used by dyld to indicate the task
@@ -8926,7 +8926,7 @@ index 2620af5..d6c5731 100644
 -				    (uint64_t)uap->start_address));
 +				    (uint64_t)uap->start_address,
 +				    kr,
-+				    (uint64_t)shared_region->sr_first_mapping));
++				    (uint64_t)vm_shared_region_first_mapping(shared_region)));
  				error = ENOMEM;
  			} else {
  #if __has_feature(ptrauth_calls)
@@ -9282,8 +9282,8 @@ index 2620af5..d6c5731 100644
 +		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
 +		    proc_getpid(p), p->p_comm,
 +		    (void *)VM_KERNEL_ADDRPERM(shared_region),
-+		    (uint64_t)shared_region->sr_base_address,
-+		    (uint64_t)shared_region->sr_first_mapping));
++		    (uint64_t)vm_shared_region_base_address(shared_region),
++		    (uint64_t)vm_shared_region_first_mapping(shared_region)));
  	}
  
  	/* convert kern_return_t to errno */
@@ -9300,7 +9300,7 @@ index 2620af5..d6c5731 100644
  			&size);
  		if (__improbable(kr != KERN_SUCCESS)) {
 +			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize addr_size[%zu] failed kr=0x%x (addr=0x%llx size=0x%llx)\n",
-+			    i, kr, (uint64_t)mapping_u.sms_address_u, (uint64_t)mapping_u.sms_size_u));
++			    i, kr, (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(mapping_u.sms_address_u), (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(mapping_u.sms_size_u)));
  			return kr;
  		}
  
@@ -9309,7 +9309,7 @@ index 2620af5..d6c5731 100644
  			&offset_size);
  		if (__improbable(kr != KERN_SUCCESS)) {
 +			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize file_offset[%zu] failed kr=0x%x (offset=0x%llx)\n",
-+			    i, kr, (uint64_t)mapping_u.sms_file_offset_u));
++			    i, kr, (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(mapping_u.sms_file_offset_u)));
  			return kr;
  		}
  		if (__improbable(0 != (offset & vm_map_page_mask(map)))) {
@@ -9323,7 +9323,7 @@ index 2620af5..d6c5731 100644
  			&slide_size);
  		if (__improbable(kr != KERN_SUCCESS)) {
 +			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize slide_addr[%zu] failed kr=0x%x (start=0x%llx size=0x%llx)\n",
-+			    i, kr, (uint64_t)mapping_u.sms_slide_start_u, (uint64_t)sms_slide_size_u));
++			    i, kr, (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(mapping_u.sms_slide_start_u), (uint64_t)VM_SANITIZE_UNSAFE_UNWRAP(sms_slide_size_u)));
  			return kr;
  		}
  
@@ -9332,7 +9332,7 @@ index 2620af5..d6c5731 100644
  			&max);
  		if (__improbable(kr != KERN_SUCCESS)) {
 +			SHARED_REGION_TRACE_ERROR(("shared_region: sanitize prots[%zu] failed kr=0x%x (init=0x%x max=0x%x)\n",
-+			    i, kr, mapping_u.sms_init_prot_u, mapping_u.sms_max_prot_u));
++			    i, kr, (unsigned int)VM_SANITIZE_UNSAFE_UNWRAP(mapping_u.sms_init_prot_u), (unsigned int)VM_SANITIZE_UNSAFE_UNWRAP(mapping_u.sms_max_prot_u)));
  			return kr;
  		}
  
@@ -18902,6 +18902,48 @@ index 39fe08a..55a8311 100644
  	return kr;
  }
  
+@@ -4049,3 +4076,24 @@ vm_shared_region_root_dir(
+ 	vm_shared_region_unlock();
+ 	return vnode;
+ }
++
++uint32_t
++vm_shared_region_ref_count(
++	struct vm_shared_region *sr)
++{
++	return sr ? sr->sr_ref_count : 0;
++}
++
++mach_vm_offset_t
++vm_shared_region_first_mapping(
++	struct vm_shared_region *sr)
++{
++	return sr ? sr->sr_first_mapping : 0;
++}
++
++mach_vm_offset_t
++vm_shared_region_base_address(
++	struct vm_shared_region *sr)
++{
++	return sr ? sr->sr_base_address : 0;
++}
+diff --git a/osfmk/vm/vm_shared_region_internal.h b/osfmk/vm/vm_shared_region_internal.h
+index 8f6dcf6..b7c6e70 100644
+--- a/osfmk/vm/vm_shared_region_internal.h
++++ b/osfmk/vm/vm_shared_region_internal.h
+@@ -86,6 +86,12 @@ extern kern_return_t vm_shared_region_map_file(
+ 	struct _sr_file_mappings *sr_mappings);
+ extern void *vm_shared_region_root_dir(
+ 	struct vm_shared_region *shared_region);
++extern uint32_t vm_shared_region_ref_count(
++	struct vm_shared_region *shared_region);
++extern mach_vm_offset_t vm_shared_region_first_mapping(
++	struct vm_shared_region *shared_region);
++extern mach_vm_offset_t vm_shared_region_base_address(
++	struct vm_shared_region *shared_region);
+ extern kern_return_t vm_commpage_enter(
+ 	struct _vm_map          *map,
+ 	struct task             *task,
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
 index 666b87b..e3d2ee7 100644
 --- a/pexpert/arm/pe_init.c
