@@ -256,23 +256,29 @@ diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobil
 index c349a8d..b9e9bfd 100644
 --- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 +++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-@@ -1311,6 +1311,10 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
+@@ -51,6 +51,7 @@
+ #if XNU_PONG_BACKLIGHT
+ extern "C" void pong_backlight_start(IOService *display);
+ #endif
++extern "C" int pong_mmio_quiet;
+ 
+ 
+ /* Framebuffer user-client selectors checked against the 22H374 framework. */
+@@ -1311,6 +1312,9 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
  void
  IOMobileFramebufferUserClient::armVSync(void)
  {
-+	extern "C" int pong_mmio_quiet;
 +	if (pong_mmio_quiet) {
 +		return;
 +	}
  	uint64_t period, now = mach_absolute_time();
  
  	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
-@@ -1624,7 +1628,10 @@ MiniIOMobileFramebufferStart(IOService * provider)
+@@ -1624,7 +1628,9 @@ MiniIOMobileFramebufferStart(IOService * provider)
  	}
  #if XNU_PONG_BACKLIGHT
  	else {
 -		pong_backlight_start(fb);
-+		extern "C" int pong_mmio_quiet;
 +		if (!pong_mmio_quiet) {
 +			pong_backlight_start(fb);
 +		}
