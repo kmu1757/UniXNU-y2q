@@ -96,6 +96,10 @@ env:
   # The Homebrew kegs the Tier 3 Intel runner has but does not link.
   LLVM_KEG: /usr/local/opt/llvm@18
   LLD_KEG: /usr/local/opt/lld
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
 
 jobs:
   userdata:
@@ -136,7 +140,7 @@ jobs:
       - name: tools
         run: |
           set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1
           ok=1
           for t in hdiutil diskutil aea python3; do
             command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
@@ -334,11 +338,31 @@ jobs:
       - name: tools
         run: |
           set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1
+          # Skip packages whose binaries or kegs already exist on the runner
+          needed=()
+          command -v dtc >/dev/null 2>&1 || needed+=(dtc)
+          command -v lzfse >/dev/null 2>&1 || needed+=(lzfse)
+          command -v mcopy >/dev/null 2>&1 || needed+=(mtools)
+          command -v nasm >/dev/null 2>&1 || needed+=(nasm)
+          command -v iasl >/dev/null 2>&1 || needed+=(acpica)
+          command -v ccache >/dev/null 2>&1 || needed+=(ccache)
+          if [ ! -x "${LLD_KEG}/bin/lld-link" ] && [ ! -x "${LLVM_KEG}/bin/lld-link" ] && ! command -v lld-link >/dev/null 2>&1; then
+            needed+=(lld)
+          fi
           # cmake, ninja and llvm have no bottle on this Tier 3 runner, so nothing
           # installs them: the image's own copies are used, and the llvm keg is put
           # on PATH rather than linked.
-          brew install dtc lzfse mtools nasm acpica lld ccache || brew install dtc lzfse mtools nasm acpica ccache
+          if [ ${#needed[@]} -gt 0 ]; then
+            echo "Installing missing packages via brew: ${needed[*]}"
+            brew install "${needed[@]}" || {
+              fallback=()
+              for p in "${needed[@]}"; do [ "$p" != "lld" ] && fallback+=("$p"); done
+              [ ${#fallback[@]} -gt 0 ] && brew install "${fallback[@]}"
+            }
+          else
+            echo "All required brew packages are already present."
+          fi
           ok=1
           for t in dtc lzfse mformat mcopy nasm iasl cmake ninja make unifdef python3; do
             command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
