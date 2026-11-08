@@ -307,10 +307,12 @@ jobs:
       - name: uefi-pong submodules
         run: |
           set -euo pipefail
-          # Fetch only the submodules referenced by board.toml [firmware] packages.
-          # Mu_Basecore, Binaries and OpenSSL are unused by this board (0 references in firmware build),
-          # and their recursive trees accounted for >230s of checkout time.
-          git -C uefi-pong submodule update --init --depth 1 Common/Mu Common/Mu_OEM_Sample Silicium-ACPI
+          # Fetch submodules required by pongPkg (pong.dsc, pong.fdf and included files).
+          # Binaries: 143 references in DXE/APRIORI/RAW (48 driver INFs and XML configs).
+          # Common/Mu, Common/Mu_OEM_Sample, Silicium-ACPI: core modules and ACPI tables.
+          # Mu_Basecore is provided separately by UniXNU feeds (out/feeds/mu_basecore-*),
+          # and OpenSSL is unused (ENABLE_SECUREBOOT = "0").
+          git -C uefi-pong submodule update --init --recursive --depth 1 Binaries Common/Mu Common/Mu_OEM_Sample Silicium-ACPI
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
