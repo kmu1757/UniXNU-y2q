@@ -146,6 +146,8 @@ def main():
                         help='publish a DarwinBoot PackedRAMDisk range for an ephemeral APFS Data seed')
     parser.add_argument('--skip-image-verification', action='store_true',
                         help='emit the DT without an additional output audit')
+    parser.add_argument('--no-fake-mac', dest='fake_mac', action='store_false', default=True,
+                        help='do not publish locally administered fake MAC addresses in /chosen')
     args = parser.parse_args()
     if os.environ.get('PONG_HARDWARE_DTB'):
         load_format2_hardware(os.environ['PONG_HARDWARE_DTB'])
@@ -233,6 +235,12 @@ def main():
         ('embedded-panic-log-size', struct.pack('<I', 0x40000)),
         ('t970-dram-holes', struct.pack('<QQ', 0xFFC00000, 0x0B100000) + bytes(15 * 16)),
     ]
+    if args.fake_mac and os.environ.get('PONG_FAKE_MAC', '1') != '0':
+        # Locally administered unicast MAC addresses for fake Wi-Fi and Bluetooth interfaces.
+        # IEEE 802: Byte 0 bit 1 = 1 (locally administered), bit 0 = 0 (unicast).
+        # Satisfies early MobileGestalt / lsd queries without hardware dependency or real MAC leakage.
+        chosen.append(('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x70, 0x00, 0x01])))
+        chosen.append(('mac-address-bluetooth0', bytes([0x02, 0x00, 0x5e, 0x70, 0x00, 0x02])))
     chosen.append(('psci-method', b'smc\0'))
     def make_cpu(i):
         props = [

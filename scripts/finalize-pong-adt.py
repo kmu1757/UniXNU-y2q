@@ -127,6 +127,8 @@ def main():
                         help='publish the UFS nub; a local bring-up image leaves it out')
     parser.add_argument('--no-development-debug', dest='development_debug', action='store_false',
                         help='leave the DT debugger gate off; a local run turns it on')
+    parser.add_argument('--no-fake-mac', dest='fake_mac', action='store_false', default=True,
+                        help='do not publish locally administered fake MAC addresses in /chosen')
     parser.add_argument('--extra-kernel-args', action='append', default=[], metavar='ARGS',
                         help='extra boot-args appended after board.toml kernel_args; whitespace separated, '
                              'repeatable. Keeps device-specific values (for example a physical LBA) out of '
@@ -198,6 +200,8 @@ def main():
                '--skip-image-verification']
     if args.development_debug:
         command.append('--development-debug')
+    if not args.fake_mac:
+        command.append('--no-fake-mac')
     if args.ufs_probe:
         command.append('--ufs-probe')
     if root_uuid:
@@ -233,6 +237,7 @@ def main():
                              'cpus': args.cpus, 'unique_chip_id': args.unique_chip_id, 'chip_id': chip_id,
                              'ufs_probe': bool(args.ufs_probe),
                              'development_debug': bool(args.development_debug),
+                             'fake_mac': bool(args.fake_mac),
                              'skip_image_verification': True,
                              'root_match_volume_uuid': root_uuid},
               'hardware_dtb': {'path': str(dtb), 'bytes': dtb.stat().st_size, 'sha256': sha256(dtb)},
