@@ -1,0 +1,236 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 10e8b8f..80f02d0 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7660,6 +7660,213 @@ done:
+ 	native_owner_data_status = error;
+ 	return error;
+ }
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++/* 22H374 preference seeds from bf61d12 / build-ipados18.py */
++static const char pong_seed_springboard[] =
++	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	"<plist version=\"1.0\">\n"
++	"<dict>\n"
++	"\t<key>BKNoWatchdogs</key>\n"
++	"\t<true/>\n"
++	"\t<key>FBLaunchWatchdogExceptions</key>\n"
++	"\t<dict>\n"
++	"\t\t<key>com.apple.purplebuddy</key>\n"
++	"\t\t<integer>100</integer>\n"
++	"\t</dict>\n"
++	"\t<key>FBLaunchWatchdogScale</key>\n"
++	"\t<real>20.0</real>\n"
++	"\t<key>MCForceShowCloudConfigurationUI</key>\n"
++	"\t<false/>\n"
++	"\t<key>SBDisableAutoDim</key>\n"
++	"\t<true/>\n"
++	"\t<key>SBDisableIdleSleep</key>\n"
++	"\t<true/>\n"
++	"\t<key>SBDontDimOrLockOnAC</key>\n"
++	"\t<true/>\n"
++	"\t<key>SBShowBatteryPercentage</key>\n"
++	"\t<true/>\n"
++	"</dict>\n"
++	"</plist>\n";
++
++static const char pong_seed_migration[] =
++	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	"<plist version=\"1.0\">\n"
++	"<dict>\n"
++	"\t<key>DMLastMigrationResults</key>\n"
++	"\t<dict>\n"
++	"\t\t<key>buildVersion</key>\n"
++	"\t\t<string>22H374</string>\n"
++	"\t\t<key>success</key>\n"
++	"\t\t<true/>\n"
++	"\t</dict>\n"
++	"\t<key>DMUserDataDisposition</key>\n"
++	"\t<dict>\n"
++	"\t\t<key>SyntheticDidUpgrade</key>\n"
++	"\t\t<false/>\n"
++	"\t\t<key>buildVersion</key>\n"
++	"\t\t<string>22H374</string>\n"
++	"\t</dict>\n"
++	"\t<key>LastSystemVersion</key>\n"
++	"\t<string>22H374</string>\n"
++	"</dict>\n"
++	"</plist>\n";
++
++static const char pong_seed_managedconfig[] =
++	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	"<plist version=\"1.0\">\n"
++	"<dict>\n"
++	"\t<key>LockdownActivationIndicatesCloudConfigurationAvailable</key>\n"
++	"\t<false/>\n"
++	"</dict>\n"
++	"</plist>\n";
++
++struct pong_var_file {
++	const char *dst;
++	const char *tmp;
++	const char *content;
++	size_t len;
++};
++
++static void
++pong_var_ensure_dir(proc_t p, user_addr_t scratch, const char *path)
++{
++	size_t len = strlen(path) + 1;
++	if (copyout(path, scratch + 0x300, len) == 0) {
++		struct mkdir_args margs = {
++			.path = scratch + 0x300,
++			.mode = 0755,
++		};
++		int32_t retval = 0;
++		extern int mkdir(proc_t, struct mkdir_args *, int32_t *);
++		(void)mkdir(p, &margs, &retval);
++
++		vnode_t vp = NULLVP;
++		vfs_context_t ctx = vfs_context_current();
++		if (vnode_lookup(path, 0, &vp, ctx) == 0) {
++			struct vnode_attr va;
++			VATTR_INIT(&va);
++			VATTR_SET(&va, va_uid, (kauth_uid_t)501);
++			VATTR_SET(&va, va_gid, (kauth_gid_t)501);
++			VATTR_SET(&va, va_mode, (mode_t)0755);
++			vnode_setattr(vp, &va, ctx);
++			vnode_put(vp);
++		}
++	}
++}
++
++static void
++pong_var_seed_apply(proc_t p, user_addr_t scratch)
++{
++	uint32_t seed_arg = 0;
++	if (!PE_parse_boot_argn("pong_var_seed", &seed_arg, sizeof(seed_arg)) || seed_arg != 1) {
++		return;
++	}
++
++	extern void pong_ramoops_diagnostic_write(const char *, int);
++
++	pong_var_ensure_dir(p, scratch, "/private/var/mobile");
++	pong_var_ensure_dir(p, scratch, "/private/var/mobile/Library");
++	pong_var_ensure_dir(p, scratch, "/private/var/mobile/Library/Preferences");
++
++	const struct pong_var_file files[] = {
++		{
++			"/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
++			"/private/var/mobile/Library/Preferences/.com.apple.springboard.plist.pong-tmp",
++			pong_seed_springboard,
++			sizeof(pong_seed_springboard) - 1,
++		},
++		{
++			"/private/var/mobile/Library/Preferences/com.apple.migration.plist",
++			"/private/var/mobile/Library/Preferences/.com.apple.migration.plist.pong-tmp",
++			pong_seed_migration,
++			sizeof(pong_seed_migration) - 1,
++		},
++		{
++			"/private/var/mobile/Library/Preferences/com.apple.managedconfiguration.notbackedup.plist",
++			"/private/var/mobile/Library/Preferences/.com.apple.managedconfiguration.notbackedup.plist.pong-tmp",
++			pong_seed_managedconfig,
++			sizeof(pong_seed_managedconfig) - 1,
++		},
++	};
++
++	vfs_context_t ctx = vfs_context_current();
++	int ok_count = 0;
++	int fail_count = 0;
++	int last_err = 0;
++
++	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		const struct pong_var_file *pf = &files[i];
++		vnode_t vp = NULLVP;
++
++		int err = vnode_open(pf->tmp, O_CREAT | O_TRUNC | FWRITE, 0600, 0, &vp, ctx);
++		if (err) {
++			fail_count++;
++			last_err = err;
++			printf("Pong var seed: vnode_open failed tmp=%s err=%d\n", pf->tmp, err);
++			continue;
++		}
++
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)pf->content, (int)pf->len, 0,
++		    UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid, p);
++		if (err) {
++			vnode_close(vp, FWRITE, ctx);
++			fail_count++;
++			last_err = err;
++			printf("Pong var seed: vn_rdwr failed tmp=%s err=%d\n", pf->tmp, err);
++			continue;
++		}
++
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, (kauth_uid_t)501);
++		VATTR_SET(&va, va_gid, (kauth_gid_t)501);
++		VATTR_SET(&va, va_mode, (mode_t)0600);
++		vnode_setattr(vp, &va, ctx);
++
++		vnode_close(vp, FWRITE, ctx);
++
++		user_addr_t u_tmp = scratch + 0x300;
++		user_addr_t u_dst = scratch + 0x400;
++		size_t tmp_len = strlen(pf->tmp) + 1;
++		size_t dst_len = strlen(pf->dst) + 1;
++
++		if (copyout(pf->tmp, u_tmp, tmp_len) || copyout(pf->dst, u_dst, dst_len)) {
++			fail_count++;
++			last_err = EFAULT;
++			printf("Pong var seed: copyout failed for rename\n");
++			continue;
++		}
++
++		struct rename_args rargs = {
++			.from = u_tmp,
++			.to = u_dst,
++		};
++		int32_t retval = 0;
++		extern int rename(proc_t, struct rename_args *, int32_t *);
++		err = rename(p, &rargs, &retval);
++		if (err) {
++			fail_count++;
++			last_err = err;
++			printf("Pong var seed: rename failed %s -> %s err=%d\n", pf->tmp, pf->dst, err);
++		} else {
++			ok_count++;
++		}
++	}
++
++	char pmsg_line[128];
++	int plen = snprintf(pmsg_line, sizeof(pmsg_line),
++	    "Pong var seed: ok=%d fail=%d last_err=%d\n", ok_count, fail_count, last_err);
++	if (plen > 0) {
++		pong_ramoops_diagnostic_write(pmsg_line, plen < (int)sizeof(pmsg_line) ? plen : (int)sizeof(pmsg_line) - 1);
++	}
++	printf("Pong var seed: completed ok=%d fail=%d last_err=%d\n", ok_count, fail_count, last_err);
++}
++#endif
++
+ #endif
+ 
+ static int
+@@ -7827,9 +8034,14 @@ load_init_program(proc_t p)
+ 	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
+ 	if (data_error) printf("PONG DEVELOPMENT: scratch Data mount SKIP error=%d stage=%d\n",
+ 	    data_error, native_owner_data_stage);
+-	else printf("PONG APFS: Data mount PASS path=/private/var device=%s rw=%d bytes=%llu\n",
+-	    native_owner_data_device_path, !native_owner_data_readonly,
+-	    (unsigned long long)native_owner_data_seed_size);
++	else {
++		printf("PONG APFS: Data mount PASS path=/private/var device=%s rw=%d bytes=%llu\n",
++		    native_owner_data_device_path, !native_owner_data_readonly,
++		    (unsigned long long)native_owner_data_seed_size);
++#if defined(PONG) && (DEVELOPMENT || DEBUG)
++		pong_var_seed_apply(p, (user_addr_t)scratch_addr);
++#endif
++	}
+ #endif
+ 	}
+ #if CONFIG_MEMORYSTATUS

@@ -133,6 +133,7 @@ kernel_args = [
   "pong_init_path=/pong/init",
   "pong_build=ipados18-22H374",
   "pong_ram_banks=0",
+  "pong_var_seed=1",
 ]
 
 [payload.adt]
