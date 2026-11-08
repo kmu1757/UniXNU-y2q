@@ -1,0 +1,312 @@
+diff --git a/bsd/kern/pong_userland.c b/bsd/kern/pong_userland.c
+index 988f01c..1a2b3c4 100644
+--- a/bsd/kern/pong_userland.c
++++ b/bsd/kern/pong_userland.c
+@@ -16,6 +16,7 @@
+ TUNABLE_WRITEABLE(int, pong_heartbeat, "pong_heartbeat", 0);
+ TUNABLE_WRITEABLE(int, pong_pmsg_exec, "pong_pmsg_exec", 0);
+ TUNABLE_WRITEABLE(int, pong_boot_snapshot, "pong_boot_snapshot", 0);
++TUNABLE_WRITEABLE(int, pong_msg_trace, "pong_msg_trace", 0);
+ 
+ TUNABLE_WRITEABLE(int, pong_cs4k_yield, "pong_cs4k_yield", 0);
+ TUNABLE_WRITEABLE(int, pong_cs4k_trust, "pong_cs4k_trust", 0);
+@@ -146,7 +147,7 @@
+ 		pong_live_state.cpu = cur_cpu;
+ 		pong_ramoops_update_state();
+ 
+-		if (pong_boot_snapshot) {
++		if (pong_boot_snapshot || pong_msg_trace) {
+ 			for (int s = 0; s < 4; s++) {
+ 				if (!snap_done[s] && boot_sec >= snap_targets[s]) {
+ 					snap_done[s] = true;
+@@ -234,6 +235,10 @@
+ 	if (PE_parse_boot_argn("pong_boot_snapshot", &bs, sizeof(bs))) {
+ 		pong_boot_snapshot = bs;
+ 	}
++	int mt = 0;
++	if (PE_parse_boot_argn("pong_msg_trace", &mt, sizeof(mt))) {
++		pong_msg_trace = mt;
++	}
+ 	int st = 0;
+ 	if (PE_parse_boot_argn("pong_syscall_trace", &st, sizeof(st))) {
+ 		pong_syscall_trace = st;
+@@ -262,7 +267,7 @@
+ 	printf("[PONG_CS4K_MODE] nocache=1 yield=%d trust=%d drop=%d mmio_quiet=%d reset_chunk=%u\n",
+ 	    pong_cs4k_yield, pong_cs4k_trust, pong_cs4k_drop, pong_mmio_quiet, pong_reset_after_chunk);
+ 
+-	if (pong_heartbeat <= 0 && pong_boot_snapshot <= 0) {
++	if (pong_heartbeat <= 0 && pong_boot_snapshot <= 0 && pong_msg_trace <= 0) {
+ 		return;
+ 	}
+ 
+diff --git a/osfmk/arm64/pong_ui_exception.c b/osfmk/arm64/pong_ui_exception.c
+index d4a1b02..8e9f0a1 100644
+--- a/osfmk/arm64/pong_ui_exception.c
++++ b/osfmk/arm64/pong_ui_exception.c
+@@ -15,5 +15,9 @@
+ #include <vm/vm_map.h>
+ #include <vm/vm_shared_region_xnu.h>
++#include <kern/clock.h>
++#include <ipc/ipc_port.h>
++#include <ipc/ipc_object.h>
++#include <ipc/ipc_space.h>
+ 
+ extern char *proc_name_address(struct proc *p);
+ extern int proc_pid(struct proc *p);
+@@ -142,6 +146,131 @@
+ 	return th;
+ }
+ 
++extern int pong_msg_trace;
++extern void *get_bsdtask_info(task_t);
++
++#define PONG_MSG_TRACE_MAX_SLOTS 64
++
++struct pong_msg_trace_slot {
++	thread_t            thread;
++	uint64_t            tid;
++	mach_msg_id_t       msgh_id;
++	uint32_t            timestamp_ms;
++	int                 dst_pid;
++	uint16_t            kobject_type;
++	uint8_t             has_reply;
++	uint8_t             is_kobject;
++	char                dst_comm[16];
++};
++
++static struct pong_msg_trace_slot pong_msg_slots[PONG_MSG_TRACE_MAX_SLOTS];
++
++static const char *
++pong_kobject_type_name(uint16_t type)
++{
++	switch (type) {
++	case 1:  return "thread_ctrl";
++	case 2:  return "task_ctrl";
++	case 3:  return "host";
++	case 4:  return "host_priv";
++	case 8:  return "timer";
++	case 20: return "task_name";
++	case 23: return "semaphore";
++	case 25: return "clock";
++	case 27: return "iokit_ident";
++	case 28: return "named_entry";
++	case 29: return "iokit_conn";
++	case 30: return "iokit_obj";
++	case 34: return "fileport";
++	case 43: return "eventlink";
++	case 44: return "task_inspect";
++	default: return "kobj";
++	}
++}
++
++void pong_msg_trace_send(thread_t th, mach_msg_header_t *hdr, ipc_port_t port);
++void
++pong_msg_trace_send(thread_t th, mach_msg_header_t *hdr, ipc_port_t port)
++{
++	if (!pong_msg_trace) {
++		return;
++	}
++	if (th == THREAD_NULL || hdr == NULL || !IP_VALID(port)) {
++		return;
++	}
++	task_t task = get_threadtask(th);
++	if (task == TASK_NULL || task == kernel_task) {
++		return;
++	}
++	void *bsd_info = get_bsdtask_info(task);
++	if (!bsd_info) {
++		return;
++	}
++	const char *comm = proc_name_address(bsd_info);
++	if (!comm || (comm[0] != 'S' && comm[0] != 'b')) {
++		return;
++	}
++	if (strcmp(comm, "SpringBoard") != 0 && strcmp(comm, "backboardd") != 0) {
++		return;
++	}
++
++	int slot_idx = -1;
++	for (int i = 0; i < PONG_MSG_TRACE_MAX_SLOTS; i++) {
++		if (pong_msg_slots[i].thread == th) {
++			slot_idx = i;
++			break;
++		}
++	}
++	if (slot_idx < 0) {
++		for (int i = 0; i < PONG_MSG_TRACE_MAX_SLOTS; i++) {
++			if (os_atomic_cmpxchg(&pong_msg_slots[i].thread, THREAD_NULL, th, seq_cst)) {
++				slot_idx = i;
++				break;
++			}
++		}
++	}
++	if (slot_idx < 0) {
++		slot_idx = (int)(((uintptr_t)th >> 4) % PONG_MSG_TRACE_MAX_SLOTS);
++		pong_msg_slots[slot_idx].thread = th;
++	}
++
++	struct pong_msg_trace_slot *s = &pong_msg_slots[slot_idx];
++	s->tid = th->thread_id;
++	s->msgh_id = hdr->msgh_id;
++
++	uint64_t now_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	s->timestamp_ms = (uint32_t)(now_ns / 1000000ULL);
++
++	s->has_reply = (hdr->msgh_local_port != MACH_PORT_NULL && MACH_PORT_VALID(hdr->msgh_local_port)) ? 1 : 0;
++
++	if (ip_is_kobject(port)) {
++		s->is_kobject = 1;
++		s->kobject_type = (uint16_t)ip_kotype(port);
++		s->dst_pid = 0;
++		s->dst_comm[0] = '\0';
++	} else {
++		s->is_kobject = 0;
++		s->kobject_type = 0;
++		s->dst_pid = -1;
++		s->dst_comm[0] = '\0';
++
++		if (ip_in_a_space(port)) {
++			ipc_space_t dst_space = ip_get_receiver(port);
++			if (dst_space != IS_NULL && dst_space->is_task != TASK_NULL) {
++				void *dst_bsd = get_bsdtask_info(dst_space->is_task);
++				if (dst_bsd) {
++					s->dst_pid = proc_pid(dst_bsd);
++					strlcpy(s->dst_comm, proc_name_address(dst_bsd), sizeof(s->dst_comm));
++				}
++			}
++		} else if (port->ip_specialreply) {
++			s->dst_pid = port->ip_pid;
++			strlcpy(s->dst_comm, "srp", sizeof(s->dst_comm));
++		}
++	}
++}
++
+ extern void pong_ramoops_diagnostic_write(const char *, int);
+ extern const char *pong_thread_get_wmesg(thread_t);
+ 
+@@ -257,6 +386,107 @@
+ 		if (n > 0) {
+ 			pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+ 		}
++
++		if (pong_msg_trace &&
++		    (strcmp(comm, "SpringBoard") == 0 || strcmp(comm, "backboardd") == 0)) {
++			struct pong_msg_trace_slot *ts = NULL;
++			for (int s = 0; s < PONG_MSG_TRACE_MAX_SLOTS; s++) {
++				if (pong_msg_slots[s].thread == cur_th) {
++					ts = &pong_msg_slots[s];
++					break;
++				}
++			}
++			if (ts && ts->timestamp_ms > 0) {
++				char tline[192];
++				int tn;
++				if (ts->is_kobject) {
++					tn = snprintf(tline, sizeof(tline),
++					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s(%u) rep=%u +%ums\n",
++					    comm, pid, i, ts->msgh_id, pong_kobject_type_name(ts->kobject_type),
++					    ts->kobject_type, ts->has_reply, ts->timestamp_ms);
++				} else if (ts->dst_comm[0] != '\0') {
++					tn = snprintf(tline, sizeof(tline),
++					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s[%d] rep=%u +%ums\n",
++					    comm, pid, i, ts->msgh_id, ts->dst_comm, ts->dst_pid,
++					    ts->has_reply, ts->timestamp_ms);
++				} else {
++					tn = snprintf(tline, sizeof(tline),
++					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=none rep=%u +%ums\n",
++					    comm, pid, i, ts->msgh_id, ts->has_reply, ts->timestamp_ms);
++				}
++				if (tn > 0) {
++					pong_ramoops_diagnostic_write(tline, tn < (int)sizeof(tline) ? tn : (int)sizeof(tline) - 1);
++				}
++			}
++
++			ipc_object_t rcv_obj = cur_th->ith_object;
++			mach_port_name_t rcv_name = cur_th->ith_receiver_name;
++			if (IPC_OBJECT_VALID(rcv_obj) && (th_state & 0x01 /* TH_WAIT */)) {
++				unsigned int otype = io_otype(rcv_obj);
++				if (otype == IOT_PORT) {
++					ipc_port_t rport = ip_object_to_port(rcv_obj);
++					const char *ptype = "PORT";
++					if (rport->ip_specialreply) {
++						ptype = "SRP";
++					} else if (ip_is_reply_port(rport)) {
++						ptype = "RP";
++					}
++
++					int link = rport->ip_sync_link_state;
++					char link_buf[64] = "NONE";
++					if (link == PORT_SYNC_LINK_PORT /* 1 */) {
++						ipc_port_t inh_port = rport->ip_sync_inheritor_port;
++						if (inh_port != IP_NULL && IP_VALID(inh_port) && ip_active(inh_port)) {
++							if (ip_is_kobject(inh_port)) {
++								snprintf(link_buf, sizeof(link_buf), "PORT(kobj:%u)", ip_kotype(inh_port));
++							} else if (ip_in_a_space(inh_port)) {
++								void *inh_raw = ip_get_receiver_ptr_noauth(inh_port);
++								ipc_space_t inh_sp = (ipc_space_t)inh_raw;
++								if (inh_sp && inh_sp->is_task) {
++									void *inh_bsd = get_bsdtask_info(inh_sp->is_task);
++									if (inh_bsd) {
++										snprintf(link_buf, sizeof(link_buf), "PORT(%s[%d])",
++										    proc_name_address(inh_bsd), proc_pid(inh_bsd));
++									} else {
++										snprintf(link_buf, sizeof(link_buf), "PORT(task)");
++									}
++								} else {
++									snprintf(link_buf, sizeof(link_buf), "PORT(sp)");
++								}
++							} else {
++								snprintf(link_buf, sizeof(link_buf), "PORT(0x%llx)", (uint64_t)VM_KERNEL_UNSLIDE(inh_port));
++							}
++						} else {
++							snprintf(link_buf, sizeof(link_buf), "PORT(null)");
++						}
++					} else if (link == PORT_SYNC_LINK_WORKLOOP_KNOTE /* 2 */) {
++						strlcpy(link_buf, "WL_KN", sizeof(link_buf));
++					} else if (link == PORT_SYNC_LINK_WORKLOOP_STASH /* 3 */) {
++						strlcpy(link_buf, "WL_TS", sizeof(link_buf));
++					} else if (link == PORT_SYNC_LINK_NO_LINKAGE /* 4 */) {
++						strlcpy(link_buf, "NO_LINK", sizeof(link_buf));
++					} else if (link == PORT_SYNC_LINK_RCV_THREAD /* 5 */) {
++						strlcpy(link_buf, "RCV_TH", sizeof(link_buf));
++					}
++
++					char wline[192];
++					int wn = snprintf(wline, sizeof(wline),
++					    "[PONG_WAIT] %s[%d] th#%u rcv_port=0x%llx name=0x%x type=%s link=%s\n",
++					    comm, pid, i, (uint64_t)VM_KERNEL_UNSLIDE(rport), rcv_name, ptype, link_buf);
++					if (wn > 0) {
++						pong_ramoops_diagnostic_write(wline, wn < (int)sizeof(wline) ? wn : (int)sizeof(wline) - 1);
++					}
++				} else if (otype == IOT_PORT_SET) {
++					char wline[192];
++					int wn = snprintf(wline, sizeof(wline),
++					    "[PONG_WAIT] %s[%d] th#%u rcv_port=0x%llx name=0x%x type=PSET link=NONE\n",
++					    comm, pid, i, (uint64_t)VM_KERNEL_UNSLIDE(rcv_obj), rcv_name);
++					if (wn > 0) {
++						pong_ramoops_diagnostic_write(wline, wn < (int)sizeof(wline) ? wn : (int)sizeof(wline) - 1);
++					}
++				}
++			}
++		}
+ 
+ 		thread_deallocate(cur_th);
+ 	}
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index 81b6728..5e875a6 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -5311,6 +5311,12 @@ ipc_kmsg_send(
+ 	port = hdr->msgh_remote_port;
+ 	assert(IP_VALID(port));
+ 	ip_mq_lock(port);
++
++	extern int pong_msg_trace;
++	extern void pong_msg_trace_send(thread_t th, mach_msg_header_t *hdr, ipc_port_t port);
++	if (__improbable(pong_msg_trace)) {
++		pong_msg_trace_send(th, hdr, port);
++	}
+ 
+ 	/*
+ 	 * If the destination has been guarded with a reply context, and the
