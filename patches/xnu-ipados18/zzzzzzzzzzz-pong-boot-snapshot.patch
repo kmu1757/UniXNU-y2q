@@ -1,0 +1,241 @@
+diff --git a/bsd/kern/pong_userland.c b/bsd/kern/pong_userland.c
+index a971c04..988f01c 100644
+--- a/bsd/kern/pong_userland.c
++++ b/bsd/kern/pong_userland.c
+@@ -15,6 +15,7 @@
+ TUNABLE_WRITEABLE(int, pong_syscall_trace, "pong_syscall_trace", 0);
+ TUNABLE_WRITEABLE(int, pong_heartbeat, "pong_heartbeat", 0);
+ TUNABLE_WRITEABLE(int, pong_pmsg_exec, "pong_pmsg_exec", 0);
++TUNABLE_WRITEABLE(int, pong_boot_snapshot, "pong_boot_snapshot", 0);
+ 
+ TUNABLE_WRITEABLE(int, pong_cs4k_yield, "pong_cs4k_yield", 0);
+ TUNABLE_WRITEABLE(int, pong_cs4k_trust, "pong_cs4k_trust", 0);
+@@ -52,6 +53,38 @@
+ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
+ extern struct uthread *get_bsdthread_info(thread_t);
+ 
++typedef int (*proc_iterate_fn_t)(proc_t, void *);
++#define PROC_ALLPROCLIST  (1U << 0)
++#define PROC_RETURNED     (0)
++extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout,
++    void *arg, proc_iterate_fn_t filterfn, void *filterarg);
++extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec);
++
++static int
++pong_snap_proc_callback(proc_t p, void *arg)
++{
++	const char *comm = p->p_comm;
++	if (!comm) return PROC_RETURNED;
++	int pid = proc_pid(p);
++	if (pid == 1 ||
++	    strcmp(comm, "SpringBoard") == 0 ||
++	    strcmp(comm, "backboardd") == 0 ||
++	    strcmp(comm, "runningboardd") == 0 ||
++	    strcmp(comm, "lockdownd") == 0 ||
++	    strcmp(comm, "keybagd") == 0 ||
++	    strcmp(comm, "containermanagerd") == 0 ||
++	    strcmp(comm, "PurpleBuddy") == 0 ||
++	    strcmp(comm, "mobileactivationd") == 0 ||
++	    strcmp(comm, "cfprefsd") == 0) {
++		task_t task = proc_task(p);
++		if (task != TASK_NULL) {
++			uint32_t target_sec = *(uint32_t *)arg;
++			pong_dump_task_threads_pmsg(task, comm, pid, target_sec);
++		}
++	}
++	return PROC_RETURNED;
++}
++
+ static timer_call_data_t pong_timer_call_entry;
+ static volatile uint32_t pong_timer_ticks = 0;
+ 
+@@ -95,12 +125,15 @@
+ pong_heartbeat_thread(__unused void *param, __unused wait_result_t wr)
+ {
+ 	uint32_t hb_count = 0;
+ 	int interval = pong_heartbeat > 0 ? pong_heartbeat : 1;
++	bool snap_done[4] = { false, false, false, false };
++	static const uint32_t snap_targets[4] = { 35, 90, 180, 300 };
+ 
+ 	while (1) {
+ 		uint64_t now_ns = 0;
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 		uint64_t boot_ms = now_ns / 1000000ULL;
++		uint32_t boot_sec = (uint32_t)(boot_ms / 1000ULL);
+ 		int cur_cpu = cpu_number();
+ 
+ 		pong_live_state.thread_hb = hb_count;
+@@ -106,6 +139,17 @@
+ 		pong_live_state.cpu = cur_cpu;
+ 		pong_ramoops_update_state();
+ 
++		if (pong_boot_snapshot) {
++			for (int s = 0; s < 4; s++) {
++				if (!snap_done[s] && boot_sec >= snap_targets[s]) {
++					snap_done[s] = true;
++					uint32_t tsec = snap_targets[s];
++					proc_iterate(PROC_ALLPROCLIST, pong_snap_proc_callback, &tsec, NULL, NULL);
++				}
++			}
++		}
++
++		if (pong_heartbeat > 0) {
+ 		proc_t p = proc_find(1);
+ 		if (p == PROC_NULL) {
+ 			printf("[PONG_HB] +%llums #%u cpu=%d free=%u/%u memstat=%u pid=1: not found\n",
+@@ -163,5 +207,6 @@
+ 			proc_rele(p);
+ 		}
++		}
+ 
+ 		hb_count++;
+ 		delay_for_interval((uint32_t)interval, NSEC_PER_SEC);
+@@ -178,6 +223,10 @@
+ 	if (PE_parse_boot_argn("pong_heartbeat", &hb, sizeof(hb)) && hb > 0) {
+ 		pong_heartbeat = hb;
+ 	}
++	int bs = 0;
++	if (PE_parse_boot_argn("pong_boot_snapshot", &bs, sizeof(bs))) {
++		pong_boot_snapshot = bs;
++	}
+ 	int st = 0;
+ 	if (PE_parse_boot_argn("pong_syscall_trace", &st, sizeof(st))) {
+ 		pong_syscall_trace = st;
+@@ -206,7 +255,7 @@
+ 	printf("[PONG_CS4K_MODE] nocache=1 yield=%d trust=%d drop=%d mmio_quiet=%d reset_chunk=%u\n",
+ 	    pong_cs4k_yield, pong_cs4k_trust, pong_cs4k_drop, pong_mmio_quiet, pong_reset_after_chunk);
+ 
+-	if (pong_heartbeat <= 0) {
++	if (pong_heartbeat <= 0 && pong_boot_snapshot <= 0) {
+ 		return;
+ 	}
+ 
+diff --git a/osfmk/arm64/pong_ui_exception.c b/osfmk/arm64/pong_ui_exception.c
+index cf3892c..d4a1b02 100644
+--- a/osfmk/arm64/pong_ui_exception.c
++++ b/osfmk/arm64/pong_ui_exception.c
+@@ -142,3 +142,124 @@
+ 	return th;
+ }
++
++extern void pong_ramoops_diagnostic_write(const char *, int);
++extern struct uthread *get_bsdthread_info(thread_t);
++
++void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec);
++void
++pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec)
++{
++	if (task == TASK_NULL || comm == NULL) {
++		return;
++	}
++
++	task_lock(task);
++	if (!task->active) {
++		task_unlock(task);
++		return;
++	}
++
++	thread_t th_list[32];
++	uint32_t nth = 0;
++	thread_t th = THREAD_NULL;
++
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		if (nth < 32) {
++			thread_reference(th);
++			th_list[nth++] = th;
++		}
++	}
++	task_unlock(task);
++
++	for (uint32_t i = 0; i < nth; i++) {
++		thread_t cur_th = th_list[i];
++		int th_state = cur_th->state;
++		uint64_t wait_event = (uint64_t)cur_th->wait_event;
++		uint64_t continuation = cur_th->continuation ? (uint64_t)VM_KERNEL_UNSLIDE(cur_th->continuation) : 0;
++
++		struct uthread *ut = get_bsdthread_info(cur_th);
++		const char *wmesg = (ut && ut->uu_wmesg) ? ut->uu_wmesg : "";
++
++		const char *state_str = "UNK";
++		if (th_state & 0x01 /* TH_WAIT */) {
++			state_str = "WAIT";
++		} else if (th_state & 0x04 /* TH_RUN */) {
++			state_str = "RUN";
++		} else if (th_state & 0x02 /* TH_SUSP */) {
++			state_str = "SUSP";
++		}
++
++		uint64_t kframes[4] = { 0 };
++		int nkframes = 0;
++		if (continuation != 0) {
++			kframes[0] = continuation;
++			nkframes = 1;
++		} else if (cur_th->kernel_stack != 0) {
++			vm_offset_t kstack_bottom = cur_th->kernel_stack;
++			vm_offset_t kstack_top = kstack_bottom + kernel_stack_size;
++			arm_kernel_saved_state_t *kstate = &thread_get_kernel_state(cur_th)->machine.ss;
++			uint64_t fp = kstate->fp;
++			uint64_t lr = kstate->lr;
++			if (lr != 0) {
++#if defined(HAS_APPLE_PAC)
++				lr = (uint64_t)ptrauth_strip((void *)lr, ptrauth_key_return_address);
++#endif
++				kframes[nkframes++] = (uint64_t)VM_KERNEL_UNSLIDE(lr);
++			}
++			while (nkframes < 4) {
++				if (fp < kstack_bottom || fp + 16 > kstack_top || (fp & 7) != 0) {
++					break;
++				}
++				uint64_t next_fp = *(uint64_t *)fp;
++				uint64_t next_lr = *(uint64_t *)(fp + 8);
++#if defined(HAS_APPLE_PAC)
++				next_lr = (uint64_t)ptrauth_strip((void *)next_lr, ptrauth_key_return_address);
++#endif
++				next_lr = (uint64_t)VM_KERNEL_UNSLIDE(next_lr);
++				if (next_lr == 0) break;
++				kframes[nkframes++] = next_lr;
++				if (next_fp <= fp || next_fp >= kstack_top) break;
++				fp = next_fp;
++			}
++		}
++
++		uint64_t user_pc = 0;
++		uint64_t user_lr = 0;
++		const arm_saved_state_t *ustate = get_user_regs(cur_th);
++		if (ustate != NULL && is_saved_state64(ustate)) {
++			user_pc = (uint64_t)get_saved_state_pc(ustate);
++			user_lr = (uint64_t)get_saved_state_lr(ustate);
++		}
++
++		char line[384];
++		int n = snprintf(line, sizeof(line),
++		    "[SNAP %us] %s[%d] th#%u st=%s ev=0x%llx wm='%s' u_pc=0x%llx u_lr=0x%llx",
++		    snap_sec, comm, pid, i, state_str, wait_event, wmesg, user_pc, user_lr);
++		if (n > 0 && n < (int)sizeof(line) && nkframes > 0) {
++			int used = snprintf(line + n, sizeof(line) - (size_t)n, " k_bt=[");
++			if (used > 0 && n + used < (int)sizeof(line)) {
++				n += used;
++				for (int f = 0; f < nkframes; f++) {
++					used = snprintf(line + n, sizeof(line) - (size_t)n, "%s0x%llx", (f > 0 ? "," : ""), kframes[f]);
++					if (used > 0 && n + used < (int)sizeof(line)) {
++						n += used;
++					}
++				}
++				used = snprintf(line + n, sizeof(line) - (size_t)n, "]");
++				if (used > 0 && n + used < (int)sizeof(line)) {
++					n += used;
++				}
++			}
++		}
++		if (n > 0 && n < (int)sizeof(line)) {
++			line[n++] = '\n';
++			line[n] = '\0';
++		}
++		if (n > 0) {
++			pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		}
++
++		thread_deallocate(cur_th);
++	}
++}
+ #endif
