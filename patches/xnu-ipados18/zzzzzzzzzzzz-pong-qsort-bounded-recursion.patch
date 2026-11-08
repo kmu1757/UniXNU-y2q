@@ -1,0 +1,51 @@
+diff --git a/bsd/kern/qsort.c b/bsd/kern/qsort.c
+index e1d6701..275046e 100644
+--- a/bsd/kern/qsort.c
++++ b/bsd/kern/qsort.c
+@@ -126,7 +126,7 @@ qsort(void *a, size_t n, size_t es, int (*cmp)(const void *, const void *))
+ {
+ 	char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
+ 	int swaptype, swap_cnt;
+-	long d, r;
++	long d, r, nl, nr;
+ 
+ loop:   SWAPINIT(a, es);
+ 	swap_cnt = 0;
+@@ -195,16 +195,30 @@ loop:   SWAPINIT(a, es);
+ 	vecswap(a, pb - r, r);
+ 	r = min(pd - pc, pn - pd - es);
+ 	vecswap(pb, pn - r, r);
+-	if ((size_t)(r = pb - pa) > es) {
+-		qsort(a, r / es, es, cmp);
++	nl = pb - pa;
++	nr = pd - pc;
++	if ((size_t)nl > es && (size_t)nr > es) {
++		/* Recurse on smaller partition to bound stack depth to O(log n); iterate larger */
++		if (nl < nr) {
++			qsort(a, (size_t)nl / es, es, cmp);
++			a = pn - nr;
++			n = (size_t)nr / es;
++			goto loop;
++		} else {
++			qsort(pn - nr, (size_t)nr / es, es, cmp);
++			n = (size_t)nl / es;
++			goto loop;
++		}
++	}
++	if ((size_t)nl > es) {
++		n = (size_t)nl / es;
++		goto loop;
+ 	}
+-	if ((size_t)(r = pd - pc) > es) {
+-		/* Iterate rather than recurse to save stack space */
+-		a = pn - r;
+-		n = r / es;
++	if ((size_t)nr > es) {
++		a = pn - nr;
++		n = (size_t)nr / es;
+ 		goto loop;
+ 	}
+-/*		qsort(pn - r, r / es, es, cmp);*/
+ }
+ 
+ /* private KPI */

@@ -9,3 +9,4 @@ zzzzzzzz-pong-native-pac-keys.patch
 zzzzzzzzz-pong-sr-quiet.patch
 zzzzzzzzzz-pong-pmsg-exec.patch
 zzzzzzzzzzz-pong-boot-snapshot.patch
+zzzzzzzzzzzz-pong-qsort-bounded-recursion.patch
