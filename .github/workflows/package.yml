@@ -299,7 +299,14 @@ jobs:
           repository: Chengdong-Yu/uefi-pong
           # The firmware tree the volume and the boot image are built from.
           path: uefi-pong
-          submodules: recursive
+          submodules: false
+      - name: uefi-pong submodules
+        run: |
+          set -euo pipefail
+          # Fetch only the submodules referenced by board.toml [firmware] packages.
+          # Mu_Basecore, Binaries and OpenSSL are unused by this board (0 references in firmware build),
+          # and their recursive trees accounted for >230s of checkout time.
+          git -C uefi-pong submodule update --init --depth 1 Common/Mu Common/Mu_OEM_Sample Silicium-ACPI
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
