@@ -1,0 +1,92 @@
+diff --git a/osfmk/arm64/pong_ramoops_console.h b/osfmk/arm64/pong_ramoops_console.h
+index 3b96c89..1111111 100644
+--- a/osfmk/arm64/pong_ramoops_console.h
++++ b/osfmk/arm64/pong_ramoops_console.h
+@@ -118,15 +118,61 @@ pong_ramoops_update_state(void)
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		struct pong_ramoops_header *header =
+ 		    (struct pong_ramoops_header *)(uintptr_t)pong_diagnostic_base;
+-		if (header->size < 192) {
+-			header->size = 192;
+-			header->start = 192;
++		if (header->size < 256) {
++			header->size = 256;
++			header->start = 256;
+ 			header->sig = PONG_RAMOOPS_MAGIC;
+ 			FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)header, PONG_RAMOOPS_HEADER_BYTES);
+ 			__asm__ volatile("dsb sy" ::: "memory");
+ 		}
+ 	}
+ 	__atomic_store_n(&pong_state_updating, 0, __ATOMIC_RELEASE);
+ }
++
++int pong_ufs_stat = 0;
++static volatile uint32_t pong_ufs_updating = 0;
++
++void pong_ufs_stat_record(int cpu, uint32_t tag, uint8_t op, uint64_t lba, uint32_t len,
++                          uint32_t stage, uint32_t polls, uint32_t db, uint32_t is);
++void
++pong_ufs_stat_record(int cpu, uint32_t tag, uint8_t op, uint64_t lba, uint32_t len,
++                     uint32_t stage, uint32_t polls, uint32_t db, uint32_t is)
++{
++	if (!pong_ufs_stat || !pong_diagnostic_base) {
++		return;
++	}
++	if (__atomic_exchange_n(&pong_ufs_updating, 1, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	char buf[64];
++	int n = snprintf(buf, sizeof(buf),
++	    "PONG_UFS: c=%d tg=%u op=%02x lba=0x%llx ln=%u st=%u pl=%u db=%x is=%x\n",
++	    cpu, tag, (unsigned int)op, (unsigned long long)lba, len, stage, polls, db, is);
++	if (n > 0) {
++		if (n > (int)sizeof(buf) - 1) {
++			n = (int)sizeof(buf) - 1;
++		}
++		volatile uint8_t *slot = (volatile uint8_t *)(uintptr_t)
++		    (pong_diagnostic_base + PONG_RAMOOPS_HEADER_BYTES + 192);
++		for (int i = 0; i < n; i++) {
++			slot[i] = (uint8_t)buf[i];
++		}
++		for (int i = n; i < 64; i++) {
++			slot[i] = (i == 63) ? '\n' : ' ';
++		}
++		FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)slot, 64);
++		__asm__ volatile("dsb sy" ::: "memory");
++		struct pong_ramoops_header *header =
++		    (struct pong_ramoops_header *)(uintptr_t)pong_diagnostic_base;
++		if (header->size < 256) {
++			header->size = 256;
++			header->start = 256;
++			header->sig = PONG_RAMOOPS_MAGIC;
++			FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)header, PONG_RAMOOPS_HEADER_BYTES);
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++	}
++	__atomic_store_n(&pong_ufs_updating, 0, __ATOMIC_RELEASE);
++}
+ 
+ void pong_ramoops_console_write(const char *, int);
+@@ -269,15 +315,19 @@ pong_ramoops_console_init(void)
+ 	pong_ramoops_console_write(ready, (int)sizeof(ready)-1);
+ 	pong_ramoops_diagnostic_write(ready, (int)sizeof(ready)-1);
++	PE_parse_boot_argn("pong_ufs_stat", &pong_ufs_stat, sizeof(pong_ufs_stat));
+ 	if (pong_diagnostic_base) {
+-		pong_diagnostic_size = 192;
++		pong_diagnostic_size = 256;
+ 		struct pong_ramoops_header *header =
+ 		    (struct pong_ramoops_header *)(uintptr_t)pong_diagnostic_base;
+-		header->size = 192;
+-		header->start = 192;
++		header->size = 256;
++		header->start = 256;
+ 		header->sig = PONG_RAMOOPS_MAGIC;
+ 		FlushPoC_DcacheRegion((vm_offset_t)(uintptr_t)header, PONG_RAMOOPS_HEADER_BYTES);
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		pong_ramoops_update_state();
++		if (pong_ufs_stat) {
++			pong_ufs_stat_record(-1, 0, 0, 0, 0, 0, 0, 0, 0);
++		}
+ 	}
+ 	return 1;
+ }

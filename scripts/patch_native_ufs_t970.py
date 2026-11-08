@@ -448,6 +448,138 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
             t_cpp.write_text(txt, encoding='utf-8')
             print(f'Applied built-in IOStorageFamily start to {t_cpp}', flush=True)
 
+    # 5. RootCommands.h: add pong_ufs_stat diagnostic hooks
+    r_cmd = ufs_source / 'RootCommands.h'
+    if r_cmd.is_file():
+        txt = r_cmd.read_text(encoding='utf-8')
+        if 'pong_ufs_stat_record' not in txt:
+            decl = """extern "C" void pong_ufs_stat_record (int cpu, uint32_t tag, uint8_t op, uint64_t lba, uint32_t len,
+                                      uint32_t stage, uint32_t polls, uint32_t db, uint32_t is) __attribute__((weak_import));
+extern "C" int cpu_number (void);
+
+#define PONG_UFS_STAT(cpu, tag, op, lba, len, st, pl, db, is) \\
+  do { if (pong_ufs_stat_record) pong_ufs_stat_record (cpu, tag, op, lba, len, st, pl, db, is); } while (0)
+"""
+            assert '// Shared production command path.' in txt, 'RootCommands.h header anchor not found'
+            txt = txt.replace('// Shared production command path.', decl + '\n// Shared production command path.')
+
+            old_port = """struct HardwareTransferPort {
+  uint64_t deadline;
+  uint32_t doorbell () { return read32 (gHost.hc, 0x58); }
+  uint32_t interrupt () { return read32 (gHost.hc, 0x20); }
+  uint32_t completedOcs () {
+    cacheInvalidate (gHost.virt, 64);
+    return *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
+  }
+  bool expired () { return mach_absolute_time () >= deadline; }
+  void delay () { IODelay (2); }
+};"""
+            new_port = """struct HardwareTransferPort {
+  uint64_t deadline;
+  uint8_t opcode;
+  uint64_t lba;
+  uint32_t dataBytes;
+  uint32_t doorbell () { return read32 (gHost.hc, 0x58); }
+  uint32_t interrupt () { return read32 (gHost.hc, 0x20); }
+  uint32_t completedOcs () {
+    cacheInvalidate (gHost.virt, 64);
+    return *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
+  }
+  bool expired () { return mach_absolute_time () >= deadline; }
+  void delay () { IODelay (2); }
+  void recordPoll (uint32_t polls, uint32_t db, uint32_t is) {
+    PONG_UFS_STAT (cpu_number (), 0, opcode, lba, dataBytes, 3, polls, db, is);
+  }
+};"""
+            assert old_port in txt, 'RootCommands.h HardwareTransferPort anchor not found'
+            txt = txt.replace(old_port, new_port)
+
+            old_submit = """  HardwareTransferPort port;
+  clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  hostWrite (0x58, 1);
+  UfsTransferPoll state;
+  UfsTransferEnd end = pollUfsTransfer (port, state);
+  gRootDiagnostic.polls = state.polls;
+  gRootDiagnostic.dbSeen = state.doorbellSeen;
+  gRootDiagnostic.isSeen = state.interruptSeen;
+  *ocs = state.ocs;
+  if (end != UfsTransferEnd::Completed) {
+    // No cancel/reset/retry: the controller may still own the buffer, even
+    // with DB=0. Keep it allocated and prohibit all subsequent CPU writes.
+    gHost.poisoned = true;
+    gHost.ready = false;
+    return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
+  }
+  cacheInvalidate (gHost.virt + kUcdOffset + kRspOffset, 512);
+  if (direction == 2 && dataBytes) cacheInvalidate (gHost.virt + kDataOffset, dataBytes);
+  gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
+  if (*ocs != 0) return recordTransport (kIOReturnIOError, *ocs);
+  // Keep command status current without a full UFS/SMMU MMIO snapshot on
+  // every successful transfer. Failure paths still capture the registers.
+  gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnSuccess);
+  gRootDiagnostic.ocs = *ocs;
+  return kIOReturnSuccess;"""
+
+            new_submit = """  HardwareTransferPort port;
+  port.opcode = gRootDiagnostic.opcode;
+  port.lba = gRootDiagnostic.lba;
+  port.dataBytes = dataBytes;
+  clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  PONG_UFS_STAT (cpu_number (), 0, gRootDiagnostic.opcode, gRootDiagnostic.lba, dataBytes, 1, 0, 0, 0);
+  hostWrite (0x58, 1);
+  PONG_UFS_STAT (cpu_number (), 0, gRootDiagnostic.opcode, gRootDiagnostic.lba, dataBytes, 2, 0, 1, 0);
+  UfsTransferPoll state;
+  UfsTransferEnd end = pollUfsTransfer (port, state);
+  gRootDiagnostic.polls = state.polls;
+  gRootDiagnostic.dbSeen = state.doorbellSeen;
+  gRootDiagnostic.isSeen = state.interruptSeen;
+  *ocs = state.ocs;
+  if (end != UfsTransferEnd::Completed) {
+    PONG_UFS_STAT (cpu_number (), 0, gRootDiagnostic.opcode, gRootDiagnostic.lba, dataBytes, 5, state.polls, state.doorbellSeen, state.interruptSeen);
+    // No cancel/reset/retry: the controller may still own the buffer, even
+    // with DB=0. Keep it allocated and prohibit all subsequent CPU writes.
+    gHost.poisoned = true;
+    gHost.ready = false;
+    return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
+  }
+  cacheInvalidate (gHost.virt + kUcdOffset + kRspOffset, 512);
+  if (direction == 2 && dataBytes) cacheInvalidate (gHost.virt + kDataOffset, dataBytes);
+  gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
+  if (*ocs != 0) {
+    PONG_UFS_STAT (cpu_number (), 0, gRootDiagnostic.opcode, gRootDiagnostic.lba, dataBytes, 5, state.polls, state.doorbellSeen, state.interruptSeen);
+    return recordTransport (kIOReturnIOError, *ocs);
+  }
+  // Keep command status current without a full UFS/SMMU MMIO snapshot on
+  // every successful transfer. Failure paths still capture the registers.
+  gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnSuccess);
+  gRootDiagnostic.ocs = *ocs;
+  PONG_UFS_STAT (cpu_number (), 0, gRootDiagnostic.opcode, gRootDiagnostic.lba, dataBytes, 4, state.polls, state.doorbellSeen, state.interruptSeen);
+  return kIOReturnSuccess;"""
+
+            assert old_submit in txt, 'RootCommands.h hostSubmit anchor not found'
+            txt = txt.replace(old_submit, new_submit)
+            r_cmd.write_text(txt, encoding='utf-8')
+            print(f'Applied pong_ufs_stat diagnostic hooks to {r_cmd}', flush=True)
+
+    # 6. TransferPoll.h: record polling progress in pollUfsTransfer
+    t_poll = ufs_source / 'TransferPoll.h'
+    if t_poll.is_file():
+        txt = t_poll.read_text(encoding='utf-8')
+        if 'recordPoll' not in txt:
+            old_poll = """    state.interruptSeen |= port.interrupt();
+    if (state.interruptSeen & kUfsFatalStatus) return UfsTransferEnd::Fatal;
+    if (!(doorbell & 1)) {"""
+            new_poll = """    state.interruptSeen |= port.interrupt();
+    if (state.interruptSeen & kUfsFatalStatus) return UfsTransferEnd::Fatal;
+    if (state.polls == 1 || (state.polls & 0x3ff) == 0) {
+      port.recordPoll (state.polls, doorbell, state.interruptSeen);
+    }
+    if (!(doorbell & 1)) {"""
+            assert old_poll in txt, 'TransferPoll.h poll anchor not found'
+            txt = txt.replace(old_poll, new_poll)
+            t_poll.write_text(txt, encoding='utf-8')
+            print(f'Applied poll progress recording to {t_poll}', flush=True)
+
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         patch_native_ufs(Path(sys.argv[1]))
