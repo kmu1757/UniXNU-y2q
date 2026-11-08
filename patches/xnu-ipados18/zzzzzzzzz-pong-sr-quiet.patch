@@ -1,0 +1,168 @@
+diff --git a/osfmk/vm/vm_shared_region.h b/osfmk/vm/vm_shared_region.h
+index eb2523f..47a2889 100644
+--- a/osfmk/vm/vm_shared_region.h
++++ b/osfmk/vm/vm_shared_region.h
+@@ -58,6 +58,7 @@
+ #endif /* DEBUG */
+ 
+ extern int shared_region_trace_level;
++extern int pong_sr_quiet;
+ 
+ extern struct vm_shared_region *primary_system_shared_region;
+ 
+@@ -87,6 +88,12 @@
+ 	SHARED_REGION_TRACE(SHARED_REGION_TRACE_DEBUG_LVL,      \
+ 	                    args);                              \
+ 	MACRO_END
++#define SHARED_REGION_TRACE_SR_INFO(args)                       \
++	MACRO_BEGIN                                             \
++	if (!pong_sr_quiet && shared_region_trace_level >= SHARED_REGION_TRACE_ERROR_LVL) { \
++	        printf args;                            \
++	}                                               \
++	MACRO_END
+ 
+ typedef struct vm_shared_region *vm_shared_region_t;
+ 
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index 38a4c5a..e7a022b 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -136,6 +136,7 @@
+ 
+ /* trace level, output is sent to the system log file */
+ TUNABLE_WRITEABLE(int, shared_region_trace_level, "shared_region_trace_level", SHARED_REGION_TRACE_ERROR_LVL);
++TUNABLE_WRITEABLE(int, pong_sr_quiet, "pong_sr_quiet", 0);
+ 
+ /* should local (non-chroot) shared regions persist when no task uses them ? */
+ int shared_region_persistence = 0;      /* no by default */
+@@ -1044,7 +1045,7 @@ vm_shared_region_start_address(
+ 		*start_address = sr_base_address + sr_first_mapping;
+ 	}
+ 
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p start_address(sr=%p base=0x%llx first=0x%llx in_prog=%p ref=%d) -> kr=0x%x start=0x%llx\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		(void *)VM_KERNEL_ADDRPERM(shared_region),
+@@ -1524,7 +1525,7 @@ vm_shared_region_map_file_setup(
+ 	sr_map = sr_mem_entry->backing.map;
+ 	sr_base_address = shared_region->sr_base_address;
+ 
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p map_file_setup(sr=%p nfiles=%d base=0x%llx first=0x%llx)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		(void *)VM_KERNEL_ADDRPERM(shared_region),
+@@ -1732,7 +1733,7 @@ vm_shared_region_map_file_setup(
+ 
+ 		/* establish the mappings for that file */
+ 		for (i = 0; i < mappings_count; i++) {
+-			SHARED_REGION_TRACE_ERROR(
++			SHARED_REGION_TRACE_SR_INFO(
+ 				("shared_region: mapping[%d]: "
+ 				"address:0x%016llx size:0x%016llx offset:0x%016llx "
+ 				"maxprot:0x%x prot:0x%x\n",
+@@ -1868,7 +1869,7 @@ vm_shared_region_map_file_setup(
+ 
+ 				if (shared_region->sr_first_mapping == (mach_vm_offset_t)-1) {
+ 					shared_region->sr_first_mapping = target_address;
+-					SHARED_REGION_TRACE_ERROR(
++					SHARED_REGION_TRACE_SR_INFO(
+ 						("shared_region: %p sr_first_mapping set to 0x%llx (target=0x%llx)\n",
+ 						(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 						(uint64_t)shared_region->sr_first_mapping,
+@@ -2319,7 +2320,7 @@ vm_shared_region_enter(
+ 	vm_prot_t               cur_prot, max_prot;
+ 	vm_map_kernel_flags_t   vmk_flags;
+ 
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p -> "
+ 		"enter(map=%p,task=%p,root=%p,cpu=<%d,%d>,64bit=%d,driverkit=%d)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+@@ -2520,7 +2521,7 @@ done:
+ 		vm_shared_region_set(task, NULL);
+ 	}
+ 
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p enter(map=%p,task=%p) done kr=0x%x sr=%p (base=0x%llx first=0x%llx)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		(void *)VM_KERNEL_ADDRPERM(map),
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index db00432..4ef3b29 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -976,7 +976,7 @@ shared_region_check_np(
+ 
+ 	/* retrieve the current tasks's shared region */
+ 	shared_region = vm_shared_region_get(task);
+-	SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0x%llx) enter (sr=%p ref=%d first=0x%llx base=0x%llx)\n",
++	SHARED_REGION_TRACE_SR_INFO(("shared_region: %p [%d(%s)] check_np(0x%llx) enter (sr=%p ref=%d first=0x%llx base=0x%llx)\n",
+ 	    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 	    proc_getpid(p), p->p_comm,
+ 	    (uint64_t)uap->start_address,
+@@ -991,7 +991,7 @@ shared_region_check_np(
+ 		 */
+ 		if (uap->start_address == 0) {
+ 			/* unmap it first */
+-			SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0) unmapping sr=%p\n",
++			SHARED_REGION_TRACE_SR_INFO(("shared_region: %p [%d(%s)] check_np(0) unmapping sr=%p\n",
+ 			    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 			    proc_getpid(p), p->p_comm,
+ 			    (void *)VM_KERNEL_ADDRPERM(shared_region)));
+@@ -1041,7 +1041,7 @@ shared_region_check_np(
+ 							(uint64_t)uap->start_address, (uint64_t)start_address,
+ 							error));
+ 					} else {
+-						SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] check_np(0x%llx) success start_address=0x%llx\n",
++						SHARED_REGION_TRACE_SR_INFO(("shared_region: %p [%d(%s)] check_np(0x%llx) success start_address=0x%llx\n",
+ 						    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 						    proc_getpid(p), p->p_comm,
+ 						    (uint64_t)uap->start_address, (uint64_t)start_address));
+@@ -1850,7 +1850,7 @@ _shared_region_map_and_slide(
+ 	 * Get a reference to the current proc's root dir.
+ 	 * Need this to prevent racing with chroot.
+ 	 */
+-	SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] _map_and_slide enter files=%u mappings=%u\n",
++	SHARED_REGION_TRACE_SR_INFO(("shared_region: %p [%d(%s)] _map_and_slide enter files=%u mappings=%u\n",
+ 	    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 	    proc_getpid(p), p->p_comm, files_count, mappings_count));
+ 
+@@ -1884,8 +1884,8 @@ _shared_region_map_and_slide(
+ 		    "vm_shared_region_map_file() failed kr=0x%x\n",
+ 		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		    proc_getpid(p), p->p_comm, kr));
+ 	} else {
+-		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] map(): "
++		SHARED_REGION_TRACE_SR_INFO(("shared_region: %p [%d(%s)] map(): "
+ 		    "vm_shared_region_map_file() succeeded! (sr=%p base=0x%llx first=0x%llx)\n",
+ 		    (void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		    proc_getpid(p), p->p_comm,
+@@ -2190,7 +2190,7 @@ shared_region_map_and_slide_2_np(
+ 	}
+ #endif
+ 
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p [%d(%s)] map_and_slide_2_np enter (files=%u mappings=%u)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		proc_getpid(p), p->p_comm,
+@@ -2291,7 +2291,7 @@ shared_region_map_and_slide_2_np(
+ 	}
+ #endif /* DEVELOPMENT || DEBUG */
+ 
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p [%d(%s)] map_and_slide_2_np slide_amount=0x%x max_slide=0x%x\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		proc_getpid(p), p->p_comm, slide_amount, max_slide));
+@@ -2353,7 +2353,7 @@ shared_region_map_and_slide_2_np(
+ 
+ 	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);
+ done:
+-	SHARED_REGION_TRACE_ERROR(
++	SHARED_REGION_TRACE_SR_INFO(
+ 		("shared_region: %p [%d(%s)] map_and_slide_2_np exit (kr=0x%x)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		proc_getpid(p), p->p_comm, kr));
