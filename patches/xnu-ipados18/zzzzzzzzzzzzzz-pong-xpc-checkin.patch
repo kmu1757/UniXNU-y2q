@@ -1,0 +1,51 @@
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 8ce4c08..7a8b9c0 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2952,16 +2952,46 @@ mach_port_is_connection_for_service(
+ 		 * that the filtering capability is absent. Do not claim a label
+ 		 * match, synthesize a policy, or alter the registered-provider path.
+ 		 */
++		static int pong_xpc_checkin = -1;
++		if (pong_xpc_checkin < 0) {
++			int val = 0;
++			if (PE_parse_boot_argn("pong_xpc_checkin", &val, sizeof(val))) {
++				pong_xpc_checkin = val;
++			} else {
++				pong_xpc_checkin = 0;
++			}
++		}
++
+ 		ret = ipc_port_translate_receive(space, service_port_name, &service_port);
+ 		if (ret != KERN_SUCCESS) {
++			if (pong_xpc_checkin) {
++				printf("[PONG_XPC] checkin service port 0x%x invalid: %d\n", service_port_name, ret);
++			}
+ 			return ret;
+ 		}
+ 		ip_mq_unlock(service_port);
++
+ 		ret = ipc_port_translate_receive(space, connection_port_name, &connection_port);
+ 		if (ret != KERN_SUCCESS) {
++			if (pong_xpc_checkin) {
++				kern_return_t send_ret = ipc_port_translate_send(space, connection_port_name, &connection_port);
++				if (send_ret == KERN_SUCCESS) {
++					ip_mq_unlock(connection_port);
++					printf("[PONG_XPC] checkin conn 0x%x accepted via send-right (srv=0x%x)\n",
++					    connection_port_name, service_port_name);
++					*filter_policy_id = 0;
++					return KERN_INVALID_CAPABILITY;
++				}
++				printf("[PONG_XPC] checkin conn 0x%x invalid: recv=%d send=%d\n",
++				    connection_port_name, ret, send_ret);
++			}
+ 			return ret;
+ 		}
+ 		ip_mq_unlock(connection_port);
++		if (pong_xpc_checkin) {
++			printf("[PONG_XPC] checkin srv=0x%x conn=0x%x OK -> KERN_INVALID_CAPABILITY\n",
++			    service_port_name, connection_port_name);
++		}
+ 		*filter_policy_id = 0;
+ 		return KERN_INVALID_CAPABILITY;
+ #else
