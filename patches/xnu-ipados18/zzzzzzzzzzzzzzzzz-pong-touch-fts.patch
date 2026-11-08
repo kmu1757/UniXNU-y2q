@@ -1,0 +1,489 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -403,4 +403,5 @@
+ bsd/dev/pong_input.c			standard
+ bsd/dev/pong_goodix.c			standard
+ bsd/dev/pong_buttons.c			standard
++bsd/dev/pong_fts.c			standard
+ bsd/pthread/pthread_kext.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1173,4 +1173,6 @@
+ 	pong_goodix_init();
+ 		extern void pong_buttons_init(void);
+ 		pong_buttons_init();
++	extern void pong_fts_init(void);
++	pong_fts_init();
+ #endif
+diff --git a/bsd/sys/pong_input.h b/bsd/sys/pong_input.h
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/sys/pong_input.h
++++ b/bsd/sys/pong_input.h
+@@ -20,4 +20,5 @@
+ bool pong_buttons_device_ready(void);
+ void pong_goodix_init(void);
+ void pong_buttons_init(void);
++void pong_fts_init(void);
+ #endif
+diff --git a/bsd/dev/pong_fts.c b/bsd/dev/pong_fts.c
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/bsd/dev/pong_fts.c
+@@ -0,0 +1,452 @@
++/* STM FTS Touchscreen Driver (Samsung TSP, fts1ba90a) for SM-T970 (SM8250).
++ * Implements I2C via TLMM GPIO bit-banging (GPIO 12 SCL, GPIO 13 SDA, GPIO 15 INT).
++ * Dispatches touch events to the userland HID bridge via pong_touch_post().
++ * Reference: Linux fts5cu56a.c (MIT / GPL-2.0, JeyKul / Samsung downstream).
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/pong_input.h>
++#include <kern/sched_prim.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++extern void thread_deallocate(thread_t thread);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++
++#define TLMM_PHYS_BASE          0x0f000000UL
++#define TLMM_MAP_SIZE           0x00200000UL
++#define GPIO_OFFSET             0x00100000UL
++
++#define GPIO_CFG(tlmm, n)       ((tlmm) + GPIO_OFFSET + 0x1000UL * (n))
++#define GPIO_IO(tlmm, n)        ((tlmm) + GPIO_OFFSET + 0x1000UL * (n) + 4)
++
++#define PIN_SCL                 12
++#define PIN_SDA                 13
++#define PIN_INT                 15
++
++#define FTS_I2C_ADDR            0x49
++
++#define FTS_READ_DEVICE_ID      0x22
++#define FTS_ID0                 0x48
++#define FTS_ID0_1BA90A          0x39
++#define FTS_ID1                 0x36
++
++#define FTS_READ_ONE_EVENT      0x60
++#define FTS_CMD_CLEAR_ALL_EVENT 0x62
++#define FTS_CMD_SET_TOUCHTYPE   0x30
++#define FTS_TOUCHTYPE_DEFAULT   0x0061
++
++#define FTS_EVENT_SIZE          16
++#define FTS_FINGER_MAX          10
++
++#define FTS_EV_COORDINATE       0
++#define FTS_EV_STATUS           1
++#define FTS_STYPE_INFO          2
++#define FTS_INFO_READY          0x00
++
++#define FTS_ACT_PRESS           1
++#define FTS_ACT_MOVE            2
++#define FTS_ACT_RELEASE         3
++
++static vm_offset_t tlmm_vaddr = 0;
++static int pong_touch_fts = 0;
++static int pong_touch_rot = 3; /* bit 0: Swap XY (1), bit 1: Invert X (2), bit 2: Invert Y (4) */
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	assert_wait_deadline((event_t)&tlmm_vaddr, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++pmsg_log(const char *fmt, ...)
++{
++	char buf[128];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		if (n >= (int)sizeof(buf)) {
++			n = (int)sizeof(buf) - 1;
++		}
++		pong_ramoops_diagnostic_write(buf, n);
++	}
++}
++
++/* Open-Drain GPIO bit-bang I2C */
++
++static inline void
++scl_set(int hi)
++{
++	if (hi) {
++		/* Input mode (float high via pull-up) */
++		wr(GPIO_CFG(tlmm_vaddr, PIN_SCL), rd(GPIO_CFG(tlmm_vaddr, PIN_SCL)) & ~(1u << 9));
++		for (int i = 0; i < 200; i++) {
++			if (rd(GPIO_IO(tlmm_vaddr, PIN_SCL)) & 1) {
++				break;
++			}
++			sleep_us(5);
++		}
++	} else {
++		/* Drive low */
++		wr(GPIO_IO(tlmm_vaddr, PIN_SCL), rd(GPIO_IO(tlmm_vaddr, PIN_SCL)) & ~2u);
++		wr(GPIO_CFG(tlmm_vaddr, PIN_SCL), rd(GPIO_CFG(tlmm_vaddr, PIN_SCL)) | (1u << 9));
++	}
++}
++
++static inline void
++sda_set(int hi)
++{
++	if (hi) {
++		/* Input mode (float high via pull-up) */
++		wr(GPIO_CFG(tlmm_vaddr, PIN_SDA), rd(GPIO_CFG(tlmm_vaddr, PIN_SDA)) & ~(1u << 9));
++	} else {
++		/* Drive low */
++		wr(GPIO_IO(tlmm_vaddr, PIN_SDA), rd(GPIO_IO(tlmm_vaddr, PIN_SDA)) & ~2u);
++		wr(GPIO_CFG(tlmm_vaddr, PIN_SDA), rd(GPIO_CFG(tlmm_vaddr, PIN_SDA)) | (1u << 9));
++	}
++}
++
++static inline int
++sda_get(void)
++{
++	return rd(GPIO_IO(tlmm_vaddr, PIN_SDA)) & 1;
++}
++
++static inline void
++i2c_delay(void)
++{
++	sleep_us(4);
++}
++
++static void
++i2c_start(void)
++{
++	sda_set(1);
++	scl_set(1);
++	i2c_delay();
++	sda_set(0);
++	i2c_delay();
++	scl_set(0);
++	i2c_delay();
++}
++
++static void
++i2c_stop(void)
++{
++	sda_set(0);
++	i2c_delay();
++	scl_set(1);
++	i2c_delay();
++	sda_set(1);
++	i2c_delay();
++}
++
++static int
++i2c_write_byte(uint8_t byte)
++{
++	for (int i = 7; i >= 0; i--) {
++		sda_set((byte >> i) & 1);
++		i2c_delay();
++		scl_set(1);
++		i2c_delay();
++		scl_set(0);
++		i2c_delay();
++	}
++	/* Read ACK from slave */
++	sda_set(1);
++	i2c_delay();
++	scl_set(1);
++	i2c_delay();
++	int ack = sda_get() == 0 ? 0 : -1;
++	scl_set(0);
++	i2c_delay();
++	return ack;
++}
++
++static uint8_t
++i2c_read_byte(int send_ack)
++{
++	uint8_t byte = 0;
++	sda_set(1);
++	for (int i = 7; i >= 0; i--) {
++		i2c_delay();
++		scl_set(1);
++		i2c_delay();
++		if (sda_get()) {
++			byte |= (1u << i);
++		}
++		scl_set(0);
++		i2c_delay();
++	}
++	/* Send ACK (0) or NAK (1) */
++	sda_set(send_ack ? 0 : 1);
++	i2c_delay();
++	scl_set(1);
++	i2c_delay();
++	scl_set(0);
++	i2c_delay();
++	sda_set(1);
++	return byte;
++}
++
++static int
++fts_write(const uint8_t *buf, int len)
++{
++	i2c_start();
++	if (i2c_write_byte((FTS_I2C_ADDR << 1) | 0) != 0) {
++		i2c_stop();
++		return -1;
++	}
++	for (int i = 0; i < len; i++) {
++		if (i2c_write_byte(buf[i]) != 0) {
++			i2c_stop();
++			return -1;
++		}
++	}
++	i2c_stop();
++	return 0;
++}
++
++static int
++fts_read(uint8_t reg, uint8_t *buf, int len)
++{
++	i2c_start();
++	if (i2c_write_byte((FTS_I2C_ADDR << 1) | 0) != 0) {
++		i2c_stop();
++		return -1;
++	}
++	if (i2c_write_byte(reg) != 0) {
++		i2c_stop();
++		return -1;
++	}
++	i2c_start(); /* Repeated start */
++	if (i2c_write_byte((FTS_I2C_ADDR << 1) | 1) != 0) {
++		i2c_stop();
++		return -1;
++	}
++	for (int i = 0; i < len; i++) {
++		buf[i] = i2c_read_byte(i < len - 1);
++	}
++	i2c_stop();
++	return 0;
++}
++
++static void
++gpio_init_pins(void)
++{
++	/* Configure SCL (GPIO 12) & SDA (GPIO 13): func=0 (GPIO), pull=3 (pull-up), drive=2mA (0), input (0) */
++	wr(GPIO_CFG(tlmm_vaddr, PIN_SCL), (rd(GPIO_CFG(tlmm_vaddr, PIN_SCL)) & ~0x3ffu) | 3u);
++	wr(GPIO_CFG(tlmm_vaddr, PIN_SDA), (rd(GPIO_CFG(tlmm_vaddr, PIN_SDA)) & ~0x3ffu) | 3u);
++	/* Configure INT (GPIO 15): func=0 (GPIO), pull=3 (pull-up), input (0) */
++	wr(GPIO_CFG(tlmm_vaddr, PIN_INT), (rd(GPIO_CFG(tlmm_vaddr, PIN_INT)) & ~0x3ffu) | 3u);
++	scl_set(1);
++	sda_set(1);
++}
++
++static bool
++fts_hw_init(void)
++{
++	uint8_t id[5] = { 0 };
++	bool probed = false;
++
++	for (int retry = 0; retry < 5; retry++) {
++		if (fts_read(FTS_READ_DEVICE_ID, id, sizeof(id)) == 0) {
++			if ((id[2] == FTS_ID0 || id[2] == FTS_ID0_1BA90A) && id[3] == FTS_ID1) {
++				probed = true;
++				break;
++			}
++		}
++		sleep_ms(20);
++	}
++
++	if (!probed) {
++		pmsg_log("[PONG_FTS] probe failed: chip_id=%02x %02x %02x %02x %02x (SKIP)\n",
++		    id[0], id[1], id[2], id[3], id[4]);
++		printf("Pong FTS touch: unexpected or missing chip id: %02x %02x %02x %02x %02x; SKIP\n",
++		    id[0], id[1], id[2], id[3], id[4]);
++		return false;
++	}
++
++	pmsg_log("[PONG_FTS] probe chip_id=0x%02x%02x rev=0x%02x\n", id[2], id[3], id[4]);
++	printf("Pong FTS touch: found STM FTS chip 0x%02x%02x rev 0x%02x\n", id[2], id[3], id[4]);
++
++	/* System reset */
++	static const uint8_t rst_cmd[] = { 0xfa, 0x20, 0x00, 0x00, 0x24, 0x81 };
++	fts_write(rst_cmd, sizeof(rst_cmd));
++	sleep_ms(10);
++
++	/* Wait for ready event */
++	for (int retry = 0; retry < 50; retry++) {
++		uint8_t ev[FTS_EVENT_SIZE];
++		if (fts_read(FTS_READ_ONE_EVENT, ev, sizeof(ev)) == 0) {
++			if ((ev[0] & 0x03) == FTS_EV_STATUS &&
++			    ((ev[0] >> 2) & 0x0f) == FTS_STYPE_INFO &&
++			    ev[1] == FTS_INFO_READY) {
++				break;
++			}
++		}
++		sleep_ms(20);
++	}
++
++	/* Clear events */
++	static const uint8_t clr_cmd = FTS_CMD_CLEAR_ALL_EVENT;
++	fts_write(&clr_cmd, 1);
++
++	/* Touch type: TOUCH | PALM | WET */
++	static const uint8_t tt_cmd[] = { FTS_CMD_SET_TOUCHTYPE,
++		(uint8_t)(FTS_TOUCHTYPE_DEFAULT & 0xff),
++		(uint8_t)(FTS_TOUCHTYPE_DEFAULT >> 8) };
++	fts_write(tt_cmd, sizeof(tt_cmd));
++
++	/* Interrupt on */
++	static const uint8_t int_on[] = { 0xa4, 0x01, 0x01 };
++	fts_write(int_on, sizeof(int_on));
++	sleep_ms(10);
++
++	/* Scan on */
++	static const uint8_t scan_on[] = { 0xa0, 0x00, 0x01 };
++	fts_write(scan_on, sizeof(scan_on));
++	sleep_ms(50);
++
++	pmsg_log("[PONG_FTS] init ok (rot=%d)\n", pong_touch_rot);
++	printf("Pong FTS touch: hardware initialized, rot=%d\n", pong_touch_rot);
++	return true;
++}
++
++static void
++fts_touch_thread(__unused void *param, __unused wait_result_t wr)
++{
++	tlmm_vaddr = ml_io_map(TLMM_PHYS_BASE, TLMM_MAP_SIZE);
++	if (!tlmm_vaddr) {
++		pmsg_log("[PONG_FTS] ml_io_map(TLMM) failed (SKIP)\n");
++		printf("Pong FTS touch: ml_io_map failed; SKIP\n");
++		thread_terminate(current_thread());
++		return;
++	}
++
++	gpio_init_pins();
++
++	if (!fts_hw_init()) {
++		thread_terminate(current_thread());
++		return;
++	}
++
++	if (!pong_touch_device_ready()) {
++		pmsg_log("[PONG_FTS] pong_touch_device_ready failed (SKIP)\n");
++		printf("Pong FTS touch: cannot ready /dev/pong-touch; SKIP\n");
++		thread_terminate(current_thread());
++		return;
++	}
++
++	uint32_t logged_touches = 0;
++	unsigned idle_count = 0;
++
++	for (;;) {
++		bool int_asserted = (rd(GPIO_IO(tlmm_vaddr, PIN_INT)) & 1) == 0;
++		if (int_asserted || ++idle_count >= 10) {
++			idle_count = 0;
++			for (int drain = 0; drain < 16; drain++) {
++				uint8_t ev[FTS_EVENT_SIZE];
++				if (fts_read(FTS_READ_ONE_EVENT, ev, sizeof(ev)) != 0) {
++					break;
++				}
++				uint8_t id = ev[0] & 0x03;
++				uint8_t tid = (ev[0] >> 2) & 0x0f;
++				uint8_t action = ev[0] >> 6;
++
++				if (id == FTS_EV_COORDINATE && tid < FTS_FINGER_MAX) {
++					uint32_t raw_x = (uint32_t)((ev[1] << 4) | (ev[3] >> 4));
++					uint32_t raw_y = (uint32_t)((ev[2] << 4) | (ev[3] & 0x0f));
++
++					uint32_t sx = raw_x;
++					uint32_t sy = raw_y;
++					uint32_t max_x = 1752;
++					uint32_t max_y = 2800;
++
++					if (pong_touch_rot & 1) {
++						uint32_t tmp = sx; sx = sy; sy = tmp;
++						tmp = max_x; max_x = max_y; max_y = tmp;
++					}
++					if (pong_touch_rot & 2) {
++						sx = (max_x > 1 && sx < max_x) ? (max_x - 1 - sx) : 0;
++					}
++					if (pong_touch_rot & 4) {
++						sy = (max_y > 1 && sy < max_y) ? (max_y - 1 - sy) : 0;
++					}
++
++					uint32_t post_x = max_x > 1 ? (uint32_t)((uint64_t)sx * 65535 / (max_x - 1)) : sx;
++					uint32_t post_y = max_y > 1 ? (uint32_t)((uint64_t)sy * 65535 / (max_y - 1)) : sy;
++					if (post_x > 65535) post_x = 65535;
++					if (post_y > 65535) post_y = 65535;
++
++					pong_touch_post(action, tid, post_x, post_y);
++
++					if (logged_touches < 4) {
++						logged_touches++;
++						pmsg_log("[PONG_FTS] touch#%u: act=%u tid=%u raw=(%u,%u) post=(%u,%u)\n",
++						    logged_touches, action, tid, raw_x, raw_y, post_x, post_y);
++					}
++				}
++
++				uint8_t left = ev[7] & 0x1f;
++				if (left == 0) {
++					break;
++				}
++			}
++		}
++		sleep_ms(8);
++	}
++}
++
++void
++pong_fts_init(void)
++{
++	int en = 0;
++	if (PE_parse_boot_argn("pong_touch_fts", &en, sizeof(en)) && en > 0) {
++		pong_touch_fts = en;
++	}
++	if (!pong_touch_fts) {
++		return;
++	}
++	int rot = 0;
++	if (PE_parse_boot_argn("pong_touch_rot", &rot, sizeof(rot))) {
++		pong_touch_rot = rot;
++	}
++	thread_t th = THREAD_NULL;
++	if (kernel_thread_start(fts_touch_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++#endif /* PONG */
