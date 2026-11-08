@@ -53,7 +53,7 @@ index d4a1b02..8e9f0a1 100644
  
  extern char *proc_name_address(struct proc *p);
  extern int proc_pid(struct proc *p);
-@@ -142,6 +146,131 @@
+@@ -142,6 +146,188 @@
  	return th;
  }
  
@@ -71,6 +71,7 @@ index d4a1b02..8e9f0a1 100644
 +	uint16_t            kobject_type;
 +	uint8_t             has_reply;
 +	uint8_t             is_kobject;
++	uint8_t             is_transit;
 +	char                dst_comm[16];
 +};
 +
@@ -118,10 +119,10 @@ index d4a1b02..8e9f0a1 100644
 +		return;
 +	}
 +	const char *comm = proc_name_address(bsd_info);
-+	if (!comm || (comm[0] != 'S' && comm[0] != 'b')) {
++	if (!comm || (comm[0] != 'S' && comm[0] != 'b' && comm[0] != 'l')) {
 +		return;
 +	}
-+	if (strcmp(comm, "SpringBoard") != 0 && strcmp(comm, "backboardd") != 0) {
++	if (strcmp(comm, "SpringBoard") != 0 && strcmp(comm, "backboardd") != 0 && strcmp(comm, "lsd") != 0) {
 +		return;
 +	}
 +
@@ -154,6 +155,7 @@ index d4a1b02..8e9f0a1 100644
 +	s->timestamp_ms = (uint32_t)(now_ns / 1000000ULL);
 +
 +	s->has_reply = (hdr->msgh_local_port != MACH_PORT_NULL && MACH_PORT_VALID(hdr->msgh_local_port)) ? 1 : 0;
++	s->is_transit = 0;
 +
 +	if (ip_is_kobject(port)) {
 +		s->is_kobject = 1;
@@ -178,6 +180,61 @@ index d4a1b02..8e9f0a1 100644
 +		} else if (port->ip_specialreply) {
 +			s->dst_pid = port->ip_pid;
 +			strlcpy(s->dst_comm, "srp", sizeof(s->dst_comm));
++		} else if (ip_in_transit(port)) {
++			s->is_transit = 1;
++			ipc_port_t dest = ip_get_destination(port);
++			bool resolved = false;
++			int hops = 0;
++			while (hops < 8 && dest != IP_NULL && IP_VALID(dest) && ip_active(dest)) {
++				if (!ip_mq_lock_try(dest)) {
++					break;
++				}
++				hops++;
++				if (ip_is_kobject(dest)) {
++					s->is_kobject = 1;
++					s->kobject_type = (uint16_t)ip_kotype(dest);
++					s->dst_pid = 0;
++					strlcpy(s->dst_comm, "kobj", sizeof(s->dst_comm));
++					ip_mq_unlock(dest);
++					resolved = true;
++					break;
++				}
++				if (ip_in_a_space(dest)) {
++					ipc_space_t dst_space = ip_get_receiver(dest);
++					if (dst_space != IS_NULL && dst_space->is_task != TASK_NULL) {
++						void *dst_bsd = get_bsdtask_info(dst_space->is_task);
++						if (dst_bsd) {
++							s->dst_pid = proc_pid(dst_bsd);
++							strlcpy(s->dst_comm, proc_name_address(dst_bsd), sizeof(s->dst_comm));
++							resolved = true;
++						}
++					}
++					ip_mq_unlock(dest);
++					break;
++				}
++				if (dest->ip_specialreply) {
++					s->dst_pid = dest->ip_pid;
++					strlcpy(s->dst_comm, "srp", sizeof(s->dst_comm));
++					ip_mq_unlock(dest);
++					resolved = true;
++					break;
++				}
++				if (ip_in_transit(dest)) {
++					ipc_port_t next = ip_get_destination(dest);
++					ip_mq_unlock(dest);
++					dest = next;
++				} else {
++					ip_mq_unlock(dest);
++					break;
++				}
++			}
++			if (!resolved && s->dst_comm[0] == '\0') {
++				s->dst_pid = -1;
++				strlcpy(s->dst_comm, "in_transit", sizeof(s->dst_comm));
++			}
++		} else if (ip_in_limbo(port)) {
++			s->dst_pid = -1;
++			strlcpy(s->dst_comm, "in_limbo", sizeof(s->dst_comm));
 +		}
 +	}
 +}
@@ -185,13 +242,15 @@ index d4a1b02..8e9f0a1 100644
  extern void pong_ramoops_diagnostic_write(const char *, int);
  extern const char *pong_thread_get_wmesg(thread_t);
  
-@@ -257,6 +386,107 @@
+@@ -257,6 +443,116 @@
  		if (n > 0) {
  			pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
  		}
 +
 +		if (pong_msg_trace &&
-+		    (strcmp(comm, "SpringBoard") == 0 || strcmp(comm, "backboardd") == 0)) {
++		    (strcmp(comm, "SpringBoard") == 0 ||
++		     strcmp(comm, "backboardd") == 0 ||
++		     strcmp(comm, "lsd") == 0)) {
 +			struct pong_msg_trace_slot *ts = NULL;
 +			for (int s = 0; s < PONG_MSG_TRACE_MAX_SLOTS; s++) {
 +				if (pong_msg_slots[s].thread == cur_th) {
@@ -204,14 +263,21 @@ index d4a1b02..8e9f0a1 100644
 +				int tn;
 +				if (ts->is_kobject) {
 +					tn = snprintf(tline, sizeof(tline),
-+					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s(%u) rep=%u +%ums\n",
++					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s(%u)%s rep=%u +%ums\n",
 +					    comm, pid, i, ts->msgh_id, pong_kobject_type_name(ts->kobject_type),
-+					    ts->kobject_type, ts->has_reply, ts->timestamp_ms);
++					    ts->kobject_type, ts->is_transit ? "(tr)" : "", ts->has_reply, ts->timestamp_ms);
 +				} else if (ts->dst_comm[0] != '\0') {
-+					tn = snprintf(tline, sizeof(tline),
-+					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s[%d] rep=%u +%ums\n",
-+					    comm, pid, i, ts->msgh_id, ts->dst_comm, ts->dst_pid,
-+					    ts->has_reply, ts->timestamp_ms);
++					if (ts->dst_pid >= 0) {
++						tn = snprintf(tline, sizeof(tline),
++						    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s[%d]%s rep=%u +%ums\n",
++						    comm, pid, i, ts->msgh_id, ts->dst_comm, ts->dst_pid,
++						    ts->is_transit ? "(tr)" : "", ts->has_reply, ts->timestamp_ms);
++					} else {
++						tn = snprintf(tline, sizeof(tline),
++						    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=%s rep=%u +%ums\n",
++						    comm, pid, i, ts->msgh_id, ts->dst_comm,
++						    ts->has_reply, ts->timestamp_ms);
++					}
 +				} else {
 +					tn = snprintf(tline, sizeof(tline),
 +					    "[PONG_TRACE] %s[%d] th#%u last_snd id=0x%x dst=none rep=%u +%ums\n",
