@@ -94,8 +94,8 @@ index 10e8b8f..80f02d0 100644
 +		if (vnode_lookup(path, 0, &vp, ctx) == 0) {
 +			struct vnode_attr va;
 +			VATTR_INIT(&va);
-+			VATTR_SET(&va, va_uid, (kauth_uid_t)501);
-+			VATTR_SET(&va, va_gid, (kauth_gid_t)501);
++			VATTR_SET(&va, va_uid, (uid_t)501);
++			VATTR_SET(&va, va_gid, (gid_t)501);
 +			VATTR_SET(&va, va_mode, (mode_t)0755);
 +			vnode_setattr(vp, &va, ctx);
 +			vnode_put(vp);
@@ -168,8 +168,8 @@ index 10e8b8f..80f02d0 100644
 +
 +		struct vnode_attr va;
 +		VATTR_INIT(&va);
-+		VATTR_SET(&va, va_uid, (kauth_uid_t)501);
-+		VATTR_SET(&va, va_gid, (kauth_gid_t)501);
++		VATTR_SET(&va, va_uid, (uid_t)501);
++		VATTR_SET(&va, va_gid, (gid_t)501);
 +		VATTR_SET(&va, va_mode, (mode_t)0600);
 +		vnode_setattr(vp, &va, ctx);
 +
