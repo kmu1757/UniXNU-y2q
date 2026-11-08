@@ -10,16 +10,16 @@ index 988f01c..1a2b3c4 100644
  
  TUNABLE_WRITEABLE(int, pong_cs4k_yield, "pong_cs4k_yield", 0);
  TUNABLE_WRITEABLE(int, pong_cs4k_trust, "pong_cs4k_trust", 0);
-@@ -146,7 +147,7 @@
+@@ -151,7 +152,7 @@
  		pong_live_state.cpu = cur_cpu;
  		pong_ramoops_update_state();
  
 -		if (pong_boot_snapshot) {
 +		if (pong_boot_snapshot || pong_msg_trace) {
- 			for (int s = 0; s < 4; s++) {
+ 			for (int s = 0; s < 6; s++) {
  				if (!snap_done[s] && boot_sec >= snap_targets[s]) {
  					snap_done[s] = true;
-@@ -234,6 +235,10 @@
+@@ -239,6 +240,10 @@
  	if (PE_parse_boot_argn("pong_boot_snapshot", &bs, sizeof(bs))) {
  		pong_boot_snapshot = bs;
  	}
@@ -30,7 +30,7 @@ index 988f01c..1a2b3c4 100644
  	int st = 0;
  	if (PE_parse_boot_argn("pong_syscall_trace", &st, sizeof(st))) {
  		pong_syscall_trace = st;
-@@ -262,7 +267,7 @@
+@@ -267,7 +272,7 @@
  	printf("[PONG_CS4K_MODE] nocache=1 yield=%d trust=%d drop=%d mmio_quiet=%d reset_chunk=%u\n",
  	    pong_cs4k_yield, pong_cs4k_trust, pong_cs4k_drop, pong_mmio_quiet, pong_reset_after_chunk);
  
