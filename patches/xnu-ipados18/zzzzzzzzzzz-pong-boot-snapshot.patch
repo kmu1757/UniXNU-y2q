@@ -66,8 +66,8 @@ index a971c04..988f01c 100644
  {
  	uint32_t hb_count = 0;
  	int interval = pong_heartbeat > 0 ? pong_heartbeat : 1;
-+	bool snap_done[6] = { false, false, false, false, false, false };
-+	static const uint32_t snap_targets[6] = { 35, 90, 180, 300, 420, 600 };
++	bool snap_done[4] = { false, false, false, false };
++	static const uint32_t snap_targets[4] = { 35, 90, 180, 300 };
  
  	while (1) {
  		uint64_t now_ns = 0;
@@ -82,7 +82,7 @@ index a971c04..988f01c 100644
  		pong_ramoops_update_state();
  
 +		if (pong_boot_snapshot) {
-+			for (int s = 0; s < 6; s++) {
++			for (int s = 0; s < 4; s++) {
 +				if (!snap_done[s] && boot_sec >= snap_targets[s]) {
 +					snap_done[s] = true;
 +					uint32_t tsec = snap_targets[s];

@@ -16,7 +16,7 @@ index 988f01c..1a2b3c4 100644
  
 -		if (pong_boot_snapshot) {
 +		if (pong_boot_snapshot || pong_msg_trace) {
- 			for (int s = 0; s < 6; s++) {
+ 			for (int s = 0; s < 4; s++) {
  				if (!snap_done[s] && boot_sec >= snap_targets[s]) {
  					snap_done[s] = true;
 @@ -239,6 +240,10 @@
