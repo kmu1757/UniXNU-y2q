@@ -34,9 +34,9 @@ new file mode 100644
 index 0000000..1234567
 --- /dev/null
 +++ b/bsd/dev/pong_fts.c
-@@ -0,0 +1,848 @@
+@@ -0,0 +1,871 @@
 +/* STM FTS Touchscreen Driver (Samsung TSP, fts1ba90a) for SM-T970 (SM8250).
-+ * Implements I2C via TLMM North Tile GPIO bit-banging (GPIO 12 SCL, GPIO 13 SDA, GPIO 15 INT).
++ * Implements I2C via TLMM North Tile GPIO bit-banging (GPIO 12 SDA, GPIO 13 SCL, GPIO 15 INT).
 + * Powers on AVDD (3.3V) via PM8150 ldoa13 and DVDD (1.8V) via PM8150 ldoa14 using RPMh VRM voting.
 + * Dispatches touch events to the userland HID bridge via pong_touch_post().
 + * Reference: Linux fts5cu56a.c (MIT / GPL-2.0, JeyKul / Samsung downstream) and
@@ -60,9 +60,10 @@ index 0000000..1234567
 +extern void thread_deallocate(thread_t thread);
 +extern void pong_ramoops_diagnostic_write(const char *buf, int len);
 +
-+/* TLMM North Tile: GPIO 12 (SCL), GPIO 13 (SDA), GPIO 15 (INT)
++/* TLMM North Tile: GPIO 12 (SDA), GPIO 13 (SCL), GPIO 15 (INT)
 + * SM8250 TLMM North base: 0x0f900000 (Linux pinctrl-sm8250 North tile).
 + * CFG(12)=0x0f90c000, CFG(13)=0x0f90d000, CFG(15)=0x0f90f000.
++ * In Qualcomm QUPv3 SE5, Pad 0 is DATA (SDA, GPIO 12) and Pad 1 is CLK (SCL, GPIO 13).
 + */
 +#define TLMM_NORTH_PHYS         0x0f900000UL
 +#define TLMM_MAP_SIZE           0x00100000UL
@@ -70,8 +71,8 @@ index 0000000..1234567
 +#define GPIO_CFG(tlmm, n)       ((tlmm) + 0x1000UL * (n))
 +#define GPIO_IO(tlmm, n)        ((tlmm) + 0x1000UL * (n) + 4)
 +
-+#define PIN_SCL                 12
-+#define PIN_SDA                 13
++#define PIN_SDA                 12
++#define PIN_SCL                 13
 +#define PIN_INT                 15
 +
 +/* Qualcomm CMD-DB & RPMh RSC DRV 2 for SM8250 (SM-T970)
@@ -614,13 +615,35 @@ index 0000000..1234567
 +	pmsg_log("[PONG_FTS] pins raw: SCL(cfg=0x%x in=%d) SDA(cfg=0x%x in=%d) INT(cfg=0x%x in=%d)\n",
 +	    scl_cfg_raw, scl_in_raw, sda_cfg_raw, sda_in_raw, int_cfg_raw, int_in_raw);
 +
-+	/* Configure SCL (GPIO 12), SDA (GPIO 13), INT (GPIO 15): func=0 (GPIO), pull=3 (pull-up), input (0) */
++	/* 1. Diagnose external pull levels with SoC internal pull-ups DISABLED (bias-disable / pull=0) */
++	wr(GPIO_CFG(tlmm_vaddr, PIN_SCL), (rd(GPIO_CFG(tlmm_vaddr, PIN_SCL)) & ~0x3ffu));
++	wr(GPIO_CFG(tlmm_vaddr, PIN_SDA), (rd(GPIO_CFG(tlmm_vaddr, PIN_SDA)) & ~0x3ffu));
++	wr(GPIO_CFG(tlmm_vaddr, PIN_INT), (rd(GPIO_CFG(tlmm_vaddr, PIN_INT)) & ~0x3ffu));
++	sleep_us(10);
++
++	int scl_in_nopull = scl_get();
++	int sda_in_nopull = sda_get();
++	int int_in_nopull = int_get();
++
++	pmsg_log("[PONG_FTS] pins nopull: SCL(in=%d) SDA(in=%d) INT(in=%d)\n",
++	    scl_in_nopull, sda_in_nopull, int_in_nopull);
++
++	/* 2. Configure SCL (GPIO 13), SDA (GPIO 12), INT (GPIO 15): func=0 (GPIO), pull=3 (pull-up), input (0) */
 +	wr(GPIO_CFG(tlmm_vaddr, PIN_SCL), (rd(GPIO_CFG(tlmm_vaddr, PIN_SCL)) & ~0x3ffu) | 3u);
 +	wr(GPIO_CFG(tlmm_vaddr, PIN_SDA), (rd(GPIO_CFG(tlmm_vaddr, PIN_SDA)) & ~0x3ffu) | 3u);
 +	wr(GPIO_CFG(tlmm_vaddr, PIN_INT), (rd(GPIO_CFG(tlmm_vaddr, PIN_INT)) & ~0x3ffu) | 3u);
 +
 +	scl_set(1);
 +	sda_set(1);
++
++	/* Bus clear: pulse SCL 9 times with SDA released high in case slave was interrupted */
++	for (int p = 0; p < 9; p++) {
++		scl_set(0);
++		sleep_us(5);
++		scl_set(1);
++		sleep_us(5);
++	}
++	i2c_stop();
 +
 +	int scl_in_ready = scl_get();
 +	int sda_in_ready = sda_get();
