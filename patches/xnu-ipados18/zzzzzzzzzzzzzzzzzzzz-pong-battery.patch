@@ -15,6 +15,16 @@ index 2c7a6e1..d45e1c3 100644
 +	pong_battery_start(this);
  	return true;
  }
+diff --git a/iokit/IOKit/pwr_mgt/IOPMPowerSource.h b/iokit/IOKit/pwr_mgt/IOPMPowerSource.h
+--- a/iokit/IOKit/pwr_mgt/IOPMPowerSource.h
++++ b/iokit/IOKit/pwr_mgt/IOPMPowerSource.h
+@@ -169,5 +169,6 @@ class IOPMPowerSource : public IOService
+ 	OSDeclareDefaultStructors(IOPMPowerSource);
+ 
+ 	friend class IOPMPowerSourceList;
++	friend void pong_battery_publish(IOPMPowerSource *, unsigned int, unsigned int, bool, bool, unsigned int, int, unsigned int, bool, bool, bool);
+ 
+ protected:
 diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
 index 9c8aa45..d369251 100644
 --- a/iokit/Kernel/IOPMPowerSource.cpp
@@ -29,7 +39,7 @@ index 9c8aa45..d369251 100644
  
  #define super IOService
  
-@@ -580,5 +584,272 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+@@ -580,5 +584,284 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
  OSDictionary *
  IOPMPowerSource::legacyIOBatteryInfo(void)
  {
@@ -46,6 +56,7 @@ index 9c8aa45..d369251 100644
 + * share this bus with the MAX77705 companion PMIC at 0x66. GPIO 19-23 and
 + * 40-42 are not used. The bus is enabled only by pong_battery=1.
 + */
++void pong_battery_publish(IOPMPowerSource *, unsigned int, unsigned int, bool, bool, unsigned int, int, unsigned int, bool, bool, bool);
 +namespace {
 +constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
 +constexpr vm_size_t kT970TlmmBytes = 0x100000;
@@ -209,15 +220,9 @@ index 9c8aa45..d369251 100644
 +}
 +static void publish(IOPMPowerSource *ps, const BatterySample &s) {
 +	const unsigned capacityMah = unsigned(uint64_t(s.fullMah) * s.permille / 1000);
-+	ps->setBatteryInstalled(true);
-+	ps->setCurrentCapacity(capacityMah);
-+	ps->setMaxCapacity(s.fullMah);
-+	ps->setAtWarnLevel(s.permille <= 150);
-+	ps->setAtCriticalLevel(s.permille <= 50);
-+	ps->setVoltage(s.voltageMv);
-+	ps->setAmperage(s.currentMa);
-+	ps->setCycleCount(s.cycles);
-+	ps->setTimeRemaining(-1);
++	pong_battery_publish(ps, capacityMah, s.fullMah, s.permille <= 150,
++	    s.permille <= 50, s.voltageMv, s.currentMa, s.cycles,
++	    s.chargerValid, s.external, s.charging);
 +	setBoolean(ps, "HasBattery", true);
 +	setBoolean(ps, "GasGaugeCapability", true);
 +	setNumber(ps, "BatteryCurrentCapacity", s.permille / 10);
@@ -225,9 +230,6 @@ index 9c8aa45..d369251 100644
 +	setNumber(ps, "AppleRawMaxCapacity", s.fullMah);
 +	setNumber(ps, "InstantAmperage", uint32_t(s.currentMa));
 +	if (s.chargerValid) {
-+		ps->setExternalConnected(s.external);
-+		ps->setExternalChargeCapable(s.external);
-+		ps->setIsCharging(s.charging);
 +		setBoolean(ps, "FullyCharged", s.full);
 +		setBoolean(ps, "BatteryIsCharging", s.charging);
 +		setBoolean(ps, "BatteryIsFullyCharged", s.full);
@@ -286,6 +288,26 @@ index 9c8aa45..d369251 100644
 +	}
 +}
 +} // namespace
++
++void pong_battery_publish(IOPMPowerSource *ps, unsigned int capacityMah,
++    unsigned int fullMah, bool warn, bool critical, unsigned int voltageMv,
++    int currentMa, unsigned int cycles, bool chargerValid, bool external,
++    bool charging) {
++	ps->setBatteryInstalled(true);
++	ps->setCurrentCapacity(capacityMah);
++	ps->setMaxCapacity(fullMah);
++	ps->setAtWarnLevel(warn);
++	ps->setAtCriticalLevel(critical);
++	ps->setVoltage(voltageMv);
++	ps->setAmperage(currentMa);
++	ps->setCycleCount(cycles);
++	ps->setTimeRemaining(-1);
++	if (chargerValid) {
++		ps->setExternalConnected(external);
++		ps->setExternalChargeCapable(external);
++		ps->setIsCharging(charging);
++	}
++}
 +
 +extern "C" void pong_battery_start(IOService *provider) {
 +	uint32_t enabled = 0;
