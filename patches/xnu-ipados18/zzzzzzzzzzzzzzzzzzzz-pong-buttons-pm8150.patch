@@ -13,7 +13,7 @@ index fd213cf..cf3d053 100644
  #include <pexpert/arm64/board_config.h>
  #if defined(PONG)
  #include <kern/clock.h>
-@@ -11,235 +12,326 @@
+@@ -11,236 +12,326 @@
  #include <pexpert/pexpert.h>
  #include <sys/pong_input.h>
  #include <sys/systm.h>
@@ -385,6 +385,7 @@ index fd213cf..cf3d053 100644
      }
 -    if (!(keys[0].usable || keys[1].usable) || !pong_buttons_device_ready()) {
 -        printf("Pong keys: no verified input peripheral; SKIP\n");goto out;
+-    }
 +
 -    for (unsigned i=0;i<3;i++) keys[i].live=keys[i].usable && !keys[i].last;
 -    printf("Pong keys: arbiter v%u channels=%u PON=%u GPIO6=%u; power=%u up=%u down=%u\n",
