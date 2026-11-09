@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,1315 @@
+@@ -0,0 +1,1424 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -208,6 +208,7 @@ index 0000000..2222222
 +
 +#define DWC3_TRB_CTRL_HWO               (1u << 0)
 +#define DWC3_TRB_CTRL_LST               (1u << 1)
++#define DWC3_TRB_CTRL_ISP_IMI           (1u << 10)
 +#define DWC3_TRB_CTRL_IOC               (1u << 11)
 +
 +#define DWC3_DEPEVT_XFERCOMPLETE        1u
@@ -224,6 +225,8 @@ index 0000000..2222222
 +#define OFF_RX_DATA             0x2100
 +#define OFF_TX_TRB              0x3000
 +#define OFF_TX_DATA             0x3100
++#define OFF_INTR_TRB            0x4000
++#define OFF_INTR_DATA           0x4100
 +
 +/* State Variables */
 +static vm_offset_t tlmm_base;
@@ -240,11 +243,15 @@ index 0000000..2222222
 +static bool ctl_enabled;
 +static bool ctl_configured;
 +static bool ctl_dtr;
++static bool ctl_rts;
 +static volatile bool ctl_tx_active;
 +static volatile bool ctl_rx_active;
 +static unsigned ctl_stage;
 +static unsigned ctl_control_bytes;
 +static unsigned ctl_status_dep;
++static uint8_t ctl_req_type;
++static uint8_t ctl_req_cmd;
++static uint8_t ctl_line_coding[7] = {0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08}; /* 115200 8N1 */
 +static unsigned ctl_event_offset;
 +static unsigned ctl_packet_size = 64;
 +
@@ -256,6 +263,12 @@ index 0000000..2222222
 +static unsigned diag_conndone_count = 0;
 +static unsigned diag_ep0_evt_count = 0;
 +static unsigned diag_setup_count = 0;
++static unsigned diag_cdc_set_line_coding = 0;
++static unsigned diag_cdc_get_line_coding = 0;
++static unsigned diag_cdc_set_ctrl_line = 0;
++static unsigned diag_cdc_send_break = 0;
++static unsigned diag_cdc_other = 0;
++static unsigned diag_rx_line_count = 0;
 +
 +/* Low-level MMIO helpers */
 +static inline uint32_t rd(vm_offset_t a) { return *(volatile uint32_t *)a; }
@@ -497,7 +510,7 @@ index 0000000..2222222
 +	p[1] = (uint32_t)(addr >> 32);
 +	p[2] = size;
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	p[3] = type | DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_IOC | DWC3_TRB_CTRL_HWO;
++	p[3] = type | DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_IOC | DWC3_TRB_CTRL_ISP_IMI | DWC3_TRB_CTRL_HWO;
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	uint64_t trb_addr = dma_phys + trb_off;
 +	return ep_cmd(ep, DWC3_DEPCMD_STARTTRANSFER, (uint32_t)(trb_addr >> 32), (uint32_t)trb_addr, 0);
@@ -543,11 +556,28 @@ index 0000000..2222222
 +	ep_transfer(ep, OFF_EP_TRB, OFF_EP_DATA + 0x100, ep ? length : 64, DWC3_TRBCTL_CONTROL_DATA);
 +}
 +
++/* Send CDC ACM SERIAL_STATE notification (Interrupt IN EP5) */
++static void
++send_serial_state(void)
++{
++	if (!ctl_configured) return;
++	uint8_t *p = (uint8_t *)(dma_wcomb + OFF_INTR_DATA);
++	p[0] = 0xa1; /* bmRequestType: Device-to-Host, Class, Interface */
++	p[1] = 0x20; /* bNotification: SERIAL_STATE */
++	p[2] = 0; p[3] = 0; /* wValue = 0 */
++	p[4] = 0; p[5] = 0; /* wIndex = 0 (Interface 0) */
++	p[6] = 2; p[7] = 0; /* wLength = 2 */
++	p[8] = 0x03;        /* bRxCarrier=1 (DCD), bTxCarrier=1 (DSR) */
++	p[9] = 0x00;
++	ep_transfer(5, OFF_INTR_TRB, OFF_INTR_DATA, 10, DWC3_TRBCTL_NORMAL);
++}
++
 +static void
 +reset_endpoints(void)
 +{
 +	ctl_configured = false;
 +	ctl_dtr = false;
++	ctl_rts = false;
 +	ctl_tx_active = false;
 +	ctl_rx_active = false;
 +	cmd_len = 0;
@@ -637,6 +667,15 @@ index 0000000..2222222
 +	for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
 +		process_events();
 +		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	/* ZLP termination if total transfer length is an exact multiple of packet size */
++	if (len > 0 && ctl_packet_size > 0 && (len % ctl_packet_size) == 0 && !ctl_tx_active) {
++		ctl_tx_active = true;
++		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, 0, DWC3_TRBCTL_NORMAL);
++		for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
++			process_events();
++			delay_for_interval(1, NSEC_PER_MSEC);
++		}
 +	}
 +}
 +
@@ -920,8 +959,16 @@ index 0000000..2222222
 +		char c = (char)data[i];
 +		if (c == '\r' || c == '\n') {
 +			if (cmd_len > 0) {
++				while (cmd_len > 0 && (cmd_buf[cmd_len - 1] == ' ' || cmd_buf[cmd_len - 1] == '\t')) {
++					cmd_len--;
++				}
 +				cmd_buf[cmd_len] = '\0';
-+				dispatch_command(cmd_buf);
++				if (cmd_len > 0) {
++					if (diag_rx_line_count < 8) {
++						pmsg_log("[PONG_USB] rx_line #%u: '%s'\n", ++diag_rx_line_count, cmd_buf);
++					}
++					dispatch_command(cmd_buf);
++				}
 +				cmd_len = 0;
 +			}
 +		} else if (cmd_len + 1 < sizeof(cmd_buf)) {
@@ -951,6 +998,8 @@ index 0000000..2222222
 +
 +	ctl_control_bytes = len;
 +	ctl_status_dep = (type & 0x80) ? 0 : 1;
++	ctl_req_type = type;
++	ctl_req_cmd = req;
 +	uint8_t *out = (uint8_t *)(dma_wcomb + OFF_EP_DATA + 0x100);
 +	unsigned resp_len = 0;
 +
@@ -1000,8 +1049,13 @@ index 0000000..2222222
 +			core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << 2) | (1u << 3) | (1u << 5));
 +			pmsg_log("[PONG_USB] configured: speed=%s packet=%u\n",
 +			    (ctl_packet_size == 512) ? "HS" : "FS", ctl_packet_size);
++			if (!ctl_rx_active) {
++				ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
++			}
++			send_serial_state();
 +		} else {
 +			ctl_dtr = false;
++			ctl_rts = false;
 +		}
 +		status_stage(1);
 +		return;
@@ -1027,9 +1081,11 @@ index 0000000..2222222
 +		resp_len = 2;
 +	} else if (type == 0xa1 && req == 0x21 && len == 7) {
 +		/* CDC: GET_LINE_CODING */
-+		uint8_t coding[7] = {0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08}; /* 115200 8N1 */
-+		memcpy(out, coding, 7);
++		memcpy(out, ctl_line_coding, 7);
 +		resp_len = 7;
++		if (diag_cdc_get_line_coding < 5) {
++			pmsg_log("[PONG_USB] cdc: GET_LINE_CODING #%u\n", ++diag_cdc_get_line_coding);
++		}
 +	} else if (type == 0x21 && req == 0x20 && len == 7) {
 +		/* CDC: SET_LINE_CODING */
 +		control_data(0, 7);
@@ -1037,17 +1093,50 @@ index 0000000..2222222
 +	} else if (type == 0x21 && req == 0x22 && !len) {
 +		/* CDC: SET_CONTROL_LINE_STATE */
 +		ctl_dtr = (val & 1) != 0;
++		ctl_rts = (val & 2) != 0;
 +		cmd_len = 0;
++		if (diag_cdc_set_ctrl_line < 5) {
++			pmsg_log("[PONG_USB] cdc: SET_CONTROL_LINE_STATE #%u (dtr=%u rts=%u)\n",
++			    ++diag_cdc_set_ctrl_line, ctl_dtr, ctl_rts);
++		}
 +		status_stage(1);
-+		if (ctl_configured && ctl_dtr && !ctl_rx_active) {
++		if (ctl_configured && !ctl_rx_active) {
 +			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
 +		}
++		send_serial_state();
 +		return;
 +	} else if (type == 0x21 && req == 0x23 && !len) {
 +		/* CDC: SEND_BREAK */
++		if (diag_cdc_send_break < 5) {
++			pmsg_log("[PONG_USB] cdc: SEND_BREAK #%u (dur=%ums)\n", ++diag_cdc_send_break, val);
++		}
 +		status_stage(1);
 +		return;
++	} else if (type == 0x21 && req == 0x02 && len == 2) {
++		/* CDC: SET_COMM_FEATURE */
++		control_data(0, 2);
++		return;
++	} else if (type == 0xa1 && req == 0x03 && len == 2) {
++		/* CDC: GET_COMM_FEATURE */
++		out[0] = 0; out[1] = 0;
++		resp_len = 2;
++	} else if (type == 0x21 && req == 0x04 && !len) {
++		/* CDC: CLEAR_COMM_FEATURE */
++		status_stage(1);
++		return;
++	} else if (type == 0x01 && req == 0x0b && !len) {
++		/* Standard: SET_INTERFACE */
++		status_stage(1);
++		return;
++	} else if (type == 0x81 && req == 0x0a && len == 1) {
++		/* Standard: GET_INTERFACE */
++		out[0] = 0;
++		resp_len = 1;
 +	} else {
++		if (diag_cdc_other < 5) {
++			pmsg_log("[PONG_USB] cdc/req: stall type=0x%02x req=0x%02x v=0x%04x i=0x%04x l=%u (#%u)\n",
++			    type, req, val, idx, len, ++diag_cdc_other);
++		}
 +		stall_control();
 +		return;
 +	}
@@ -1085,7 +1174,7 @@ index 0000000..2222222
 +					}
 +				}
 +				ctl_rx_active = false;
-+				if (ctl_configured && ctl_dtr) {
++				if (ctl_configured) {
 +					ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
 +				}
 +			}
@@ -1096,8 +1185,10 @@ index 0000000..2222222
 +	/* Control EP0/EP1 */
 +	if (kind == DWC3_DEPEVT_XFERNOTREADY) {
 +		unsigned phase = (status & 3);
-+		if (phase == DWC3_DEPEVT_STATUS_CONTROL_STATUS || ctl_stage == 2) {
-+			status_stage(ep);
++		if (phase == DWC3_DEPEVT_STATUS_CONTROL_STATUS) {
++			if (ctl_stage != 3) {
++				status_stage(ep);
++			}
 +			return;
 +		}
 +		return;
@@ -1109,7 +1200,24 @@ index 0000000..2222222
 +		return;
 +	}
 +	if (ctl_stage == 1) {
-+		ctl_stage = 2;
++		if (ctl_status_dep == 1) {
++			/* Control OUT data phase finished */
++			__asm__ volatile("dsb sy" ::: "memory");
++			if (ctl_req_cmd == 0x20) {
++				/* SET_LINE_CODING: latch 7-byte line coding */
++				memcpy(ctl_line_coding, (const void *)(dma_wcomb + OFF_EP_DATA + 0x100), 7);
++				if (diag_cdc_set_line_coding < 5) {
++					uint32_t baud = (uint32_t)ctl_line_coding[0] | ((uint32_t)ctl_line_coding[1] << 8) |
++					                ((uint32_t)ctl_line_coding[2] << 16) | ((uint32_t)ctl_line_coding[3] << 24);
++					pmsg_log("[PONG_USB] cdc: SET_LINE_CODING #%u (baud=%u fmt=%u parity=%u data=%u)\n",
++					    ++diag_cdc_set_line_coding, baud, ctl_line_coding[4], ctl_line_coding[5], ctl_line_coding[6]);
++				}
++			}
++			status_stage(1);
++		} else {
++			/* Control IN data phase finished: prepare for host's OUT status */
++			status_stage(0);
++		}
 +		return;
 +	}
 +	if (ctl_stage == 3) {
@@ -1142,6 +1250,7 @@ index 0000000..2222222
 +			case 0: /* Disconnect */
 +				ctl_configured = false;
 +				ctl_dtr = false;
++				ctl_rts = false;
 +				if (diag_dev_evt_count < 6) {
 +					pmsg_log("[PONG_USB] usb_disconnect\n");
 +					diag_dev_evt_count++;
@@ -1329,7 +1438,7 @@ index 0000000..2222222
 +
 +	while (1) {
 +		process_events();
-+		if (ctl_configured && ctl_dtr && !ctl_rx_active) {
++		if (ctl_configured && !ctl_rx_active) {
 +			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
 +		}
 +		delay_for_interval(2, NSEC_PER_MSEC);
