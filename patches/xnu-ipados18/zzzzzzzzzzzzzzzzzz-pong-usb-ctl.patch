@@ -1139,7 +1139,7 @@ index 0000000..2222222
 +
 +/* Deferred USB Control Thread */
 +static void
-+pong_usb_ctl_thread(void *param, __unused wait_result_t wr)
++pong_usb_ctl_thread(void *param, __unused wait_result_t result)
 +{
 +	uint32_t delay_sec = (uint32_t)(uintptr_t)param;
 +	if (delay_sec > 0) {
