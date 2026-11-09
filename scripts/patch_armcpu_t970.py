@@ -3,14 +3,34 @@
 from pathlib import Path
 import sys
 
+POLICY_ON = '  PongCpuPolicy::start();\n'
+POLICY_OFF = '  if (false) PongCpuPolicy::start(); // T970: SM8250 has no EPSS at 0x17d91000\n'
+
+
+def disable_cpu_policy(txt: str) -> str:
+    """PongCpuPolicy.h is SM8475: its worker sleeps 3 s, then reads EPSS at 0x17d91000.
+
+    SM8250 has nothing there (its EPSS is 0x18591000, driven by pong_cpu_perf). On T970 the
+    read never returns, none of the worker's three result lines is ever logged, and the core
+    that ran the worker stops for good. When that core is cpu0 every timer armed during
+    start-up is lost (no USB, no touch, no screen, UFS polls that never wake).
+    """
+    if POLICY_OFF in txt:
+        return txt
+    assert txt.count(POLICY_ON) == 1, 'expected exactly one PongCpuPolicy::start() call'
+    return txt.replace(POLICY_ON, POLICY_OFF)
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
     if not target.is_file():
         return
 
-    txt = target.read_text(encoding='utf-8')
+    txt = disable_cpu_policy(target.read_text(encoding='utf-8'))
     if 'armcpu-spi-ipi' in txt:
+        # already carries the SPI IPI patch; still make sure the policy is off
+        target.write_text(txt, encoding='utf-8')
         return
 
     # 1. Add SPI IPI state and helper functions after gBootAffinity
