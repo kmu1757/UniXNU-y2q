@@ -1,4 +1,4 @@
-diff --git a/bsd/conf/files b/bsd/conf/files
+iff --git a/bsd/conf/files b/bsd/conf/files
 index a1b2c3d..e4f5a6b 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,1424 @@
+@@ -0,0 +1,1440 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -253,6 +253,9 @@ index 0000000..2222222
 +static uint8_t ctl_req_cmd;
 +static uint8_t ctl_line_coding[7] = {0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08}; /* 115200 8N1 */
 +static unsigned ctl_event_offset;
++static unsigned diag_event_count;
++static unsigned diag_event_overflow;
++static unsigned diag_command_count;
 +static unsigned ctl_packet_size = 64;
 +
 +static char cmd_buf[128];
@@ -967,6 +970,7 @@ index 0000000..2222222
 +					if (diag_rx_line_count < 8) {
 +						pmsg_log("[PONG_USB] rx_line #%u: '%s'\n", ++diag_rx_line_count, cmd_buf);
 +					}
++					diag_command_count++;
 +					dispatch_command(cmd_buf);
 +				}
 +				cmd_len = 0;
@@ -1231,17 +1235,27 @@ index 0000000..2222222
 +process_events(void)
 +{
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	unsigned count = core_r(DWC3_GEVNTCOUNT(0)) & 0xfffc;
++	/* GEVNTCOUNT bits 15:2 are byte count; bits 1:0 are reserved. */
++	unsigned count = core_r(DWC3_GEVNTCOUNT(0)) & 0xfffcu;
 +	if (count == 0) return;
-+	if (count > 4096) {
-+		pmsg_log("[PONG_USB] event ring overflow (%u)\n", count);
++	if ((count & 3u) || count > 4096u) {
++		if (diag_event_overflow < 8) {
++			pmsg_log("[PONG_USB] ring resync #%u count=%u lpos=%u\n", ++diag_event_overflow, count, ctl_event_offset);
++		}
 +		core_w(DWC3_GEVNTCOUNT(0), count);
 +		ctl_event_offset = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (ctl_configured) ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
++		if (ctl_stage != 0) arm_setup();
 +		return;
 +	}
++	__asm__ volatile("dmb oshld" ::: "memory");
 +	for (unsigned done = 0; done < count; done += 4) {
 +		uint32_t event = *(volatile uint32_t *)(dma_wcomb + OFF_EVT_RING + ctl_event_offset);
-+		ctl_event_offset = (ctl_event_offset + 4) & 4095;
++		ctl_event_offset = (ctl_event_offset + 4) % 4096;
++		diag_event_count++;
++		/* Acknowledge before dispatch: handlers can synchronously poll again. */
++		core_w(DWC3_GEVNTCOUNT(0), 4);
 +		if (!(event & 1)) {
 +			handle_ep_event(event);
 +		} else {
@@ -1291,8 +1305,10 @@ index 0000000..2222222
 +			}
 +		}
 +	}
-+	core_w(DWC3_GEVNTCOUNT(0), count);
 +	__asm__ volatile("dsb sy" ::: "memory");
++	if ((diag_event_count & 0x3ffu) == 0) {
++		pmsg_log("[PONG_USB] summary events=%u overflow=%u commands=%u\n", diag_event_count, diag_event_overflow, diag_command_count);
++	}
 +}
 +
 +/* Deferred USB Control Thread */
