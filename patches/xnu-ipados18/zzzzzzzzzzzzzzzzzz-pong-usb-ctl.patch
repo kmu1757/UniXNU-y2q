@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,1457 @@
+@@ -0,0 +1,1459 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -1251,8 +1251,11 @@ index 0000000..2222222
 +static void
 +process_events(void)
 +{
++	for (unsigned budget = 0; budget < 1024; budget++) {
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	/* GEVNTCOUNT bits 15:2 are byte count; bits 1:0 are reserved. */
++	/* GEVNTCOUNT bits 15:2 are byte count; bits 1:0 are reserved.
++	 * Re-read it for every event: handlers send responses and poll again, so
++	 * events get consumed underneath this loop and a cached count over-acks. */
 +	unsigned count = core_r(DWC3_GEVNTCOUNT(0)) & 0xfffcu;
 +	if (count == 0) return;
 +	if ((count & 3u) || count > 4096u) {
@@ -1267,7 +1270,6 @@ index 0000000..2222222
 +		return;
 +	}
 +	__asm__ volatile("dmb oshld" ::: "memory");
-+	for (unsigned done = 0; done < count; done += 4) {
 +		uint32_t event = *(volatile uint32_t *)(dma_wcomb + OFF_EVT_RING + ctl_event_offset);
 +		ctl_event_offset = (ctl_event_offset + 4) % 4096;
 +		diag_event_count++;

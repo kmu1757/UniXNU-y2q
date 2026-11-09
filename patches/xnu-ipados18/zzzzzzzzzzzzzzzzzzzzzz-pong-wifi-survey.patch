@@ -19,7 +19,7 @@ diff --git a/bsd/dev/pong_wifi_survey.c b/bsd/dev/pong_wifi_survey.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pong_wifi_survey.c
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,87 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(PONG)
 +#include <kern/clock.h>
@@ -43,7 +43,6 @@ new file mode 100644
 +#define WIFI_TLMM_SOUTH    0x0f500000UL
 +#define WIFI_TLMM_MAP_SIZE 0x00100000UL
 +#define WIFI_GCC_BASE      0x00100000UL
-+#define WIFI_GCC_MAP_SIZE  0x001f0000UL
 +#define WIFI_GPIO_CFG(base, gpio) ((base) + 0x1000UL * (gpio))
 +
 +static void
@@ -78,15 +77,17 @@ new file mode 100644
 +		}
 +	}
 +
-+	vm_offset_t gcc = ml_io_map(WIFI_GCC_BASE, WIFI_GCC_MAP_SIZE);
-+	if (!gcc) {
-+		wifi_say("[PONG_WIFI] gcc map FAIL\n");
-+	} else {
-+		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
-+			snprintf(line, sizeof(line), "[PONG_WIFI] gcc %s %x=%08x\n", regs[i].name, regs[i].offset,
-+			    *(volatile uint32_t *)(gcc + regs[i].offset));
-+			wifi_say(line);
++	/* One page per register: mapping the whole GCC block panicked in kmem_alloc. */
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		vm_offset_t phys = WIFI_GCC_BASE + regs[i].offset;
++		vm_offset_t page = ml_io_map(phys & ~0x3fffUL, 0x4000);
++		if (!page) {
++			wifi_say("[PONG_WIFI] gcc map FAIL\n");
++			continue;
 +		}
++		snprintf(line, sizeof(line), "[PONG_WIFI] gcc %s %x=%08x\n", regs[i].name, regs[i].offset,
++		    *(volatile uint32_t *)(page + (phys & 0x3fffUL)));
++		wifi_say(line);
 +	}
 +	wifi_say("[PONG_WIFI] survey done\n");
 +	thread_terminate(current_thread());

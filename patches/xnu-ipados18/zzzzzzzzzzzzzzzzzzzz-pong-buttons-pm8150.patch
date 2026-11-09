@@ -13,7 +13,7 @@ index fd213cf..cf3d053 100644
  #include <pexpert/arm64/board_config.h>
  #if defined(PONG)
  #include <kern/clock.h>
-@@ -11,236 +12,326 @@
+@@ -11,236 +12,327 @@
  #include <pexpert/pexpert.h>
  #include <sys/pong_input.h>
  #include <sys/systm.h>
@@ -287,6 +287,7 @@ index fd213cf..cf3d053 100644
 +    uint32_t version = rd(core);
 +    if (version < 0x50000000 || version >= 0x80000000) {
 +        pmsg_log("[PONG_KEYS] fail: unsupported arbiter version 0x%08x\n", version);
++        pmsg_log("[PONG_KEYS] regs: feat=%08x map0=%08x own0=%08x\n", rd(core + 4), rd(core + 0x900), rd(cnfg + 0x700));
 +        printf("Pong keys: unsupported arbiter version %x; SKIP\n", version);
 +        goto out;
      }
