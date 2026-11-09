@@ -1,0 +1,108 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -408,3 +408,4 @@
+ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
++bsd/dev/pong_wifi_survey.c		standard
+ bsd/pthread/pthread_kext.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1182,3 +1182,5 @@
+ 	extern void pong_pogo_init(void);
+ 	pong_pogo_init();
++	extern void pong_wifi_survey_init(void);
++	pong_wifi_survey_init();
+ #endif
+diff --git a/bsd/dev/pong_wifi_survey.c b/bsd/dev/pong_wifi_survey.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/pong_wifi_survey.c
+@@ -0,0 +1,86 @@
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++/* Read-only survey of SM8250 PCIe0/WLAN pins and GCC state (pong_wifi_survey=1).
++ * Writes no register. PARF, PHY, DBI and config space are not touched because
++ * reading them with their clocks off raises a bus error.
++ * Tiles: Linux pinctrl-sm8250.c (GPIO 79-81 north, GPIO 90 south).
++ * GCC offsets: Linux gcc-sm8250.c. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++
++#define WIFI_TLMM_NORTH    0x0f900000UL
++#define WIFI_TLMM_SOUTH    0x0f500000UL
++#define WIFI_TLMM_MAP_SIZE 0x00100000UL
++#define WIFI_GCC_BASE      0x00100000UL
++#define WIFI_GCC_MAP_SIZE  0x001f0000UL
++#define WIFI_GPIO_CFG(base, gpio) ((base) + 0x1000UL * (gpio))
++
++static void
++wifi_say(const char *line)
++{
++	pong_ramoops_diagnostic_write(line, (int)strlen(line));
++}
++
++static void
++wifi_survey_worker(__unused void *param, __unused wait_result_t wait_res)
++{
++	static const struct { unsigned gpio; bool north; } pins[] = {
++		{ 79, true }, { 80, true }, { 81, true }, { 90, false },
++	};
++	static const struct { uint32_t offset; const char *name; } regs[] = {
++		{ 0x6b000, "bcr" }, { 0x6b004, "gdsc" }, { 0x6c01c, "phy_bcr" }, { 0x52008, "vote" },
++	};
++	char line[96];
++
++	delay_for_interval(60, NSEC_PER_SEC);
++
++	vm_offset_t north = ml_io_map(WIFI_TLMM_NORTH, WIFI_TLMM_MAP_SIZE);
++	vm_offset_t south = ml_io_map(WIFI_TLMM_SOUTH, WIFI_TLMM_MAP_SIZE);
++	if (!north || !south) {
++		wifi_say("[PONG_WIFI] tlmm map FAIL\n");
++	} else {
++		for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++			vm_offset_t cfg = WIFI_GPIO_CFG(pins[i].north ? north : south, pins[i].gpio);
++			snprintf(line, sizeof(line), "[PONG_WIFI] gpio%u cfg=%08x io=%08x\n", pins[i].gpio,
++			    *(volatile uint32_t *)cfg, *(volatile uint32_t *)(cfg + 4));
++			wifi_say(line);
++		}
++	}
++
++	vm_offset_t gcc = ml_io_map(WIFI_GCC_BASE, WIFI_GCC_MAP_SIZE);
++	if (!gcc) {
++		wifi_say("[PONG_WIFI] gcc map FAIL\n");
++	} else {
++		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++			snprintf(line, sizeof(line), "[PONG_WIFI] gcc %s %x=%08x\n", regs[i].name, regs[i].offset,
++			    *(volatile uint32_t *)(gcc + regs[i].offset));
++			wifi_say(line);
++		}
++	}
++	wifi_say("[PONG_WIFI] survey done\n");
++	thread_terminate(current_thread());
++}
++
++void
++pong_wifi_survey_init(void)
++{
++	thread_t thread = THREAD_NULL;
++	int enabled = 0;
++
++	if (!PE_parse_boot_argn("pong_wifi_survey", &enabled, sizeof(enabled)) || !enabled) {
++		return;
++	}
++	if (kernel_thread_start(wifi_survey_worker, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif
