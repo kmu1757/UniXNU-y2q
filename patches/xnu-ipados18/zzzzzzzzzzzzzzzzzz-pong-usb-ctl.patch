@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,858 @@
+@@ -0,0 +1,1025 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -54,6 +54,8 @@ index 0000000..2222222
 + *    (ref/gts7xl-mainline/tools/usbroute.c, MIT; ref/G986N-iOS, BSD-2-Clause)
 + *  - DWC3 core: 0x0a600000, QSCRATCH glue: 0x0a6f8800 (ref/UniXNU-pong, BSD-2-Clause-Patent)
 + *  - Apps SMMU: 0x15000000, SID 0 bypass configuration
++ *  - IMEM reboot: 0x146bf65c = 0x77665502 (ref/gts7xl-mainline/linux-patches)
++ *  - Ramoops console: 0x9FA40000 (0001-pong-darwin24.patch)
 + *  - Standard USB CDC-ACM: driverless on Windows 10/11 (usbser.sys)
 + */
 +
@@ -63,6 +65,8 @@ index 0000000..2222222
 +#include <mach/mach_types.h>
 +#include <pexpert/pexpert.h>
 +#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/reboot.h>
 +#include <sys/pong_usb_ctl.h>
 +#include <IOKit/IOLib.h>
 +
@@ -70,6 +74,13 @@ index 0000000..2222222
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 +extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
 +extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern unsigned int vm_page_free_count;
++
++typedef int (*proc_iterate_fn_t)(proc_t, void *);
++#define PROC_ALLPROCLIST        (1U << 0)
++extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout, void *arg, proc_iterate_fn_t filterfn, void *filterarg);
++extern const char *proc_best_name(proc_t p);
++extern int reboot_kernel(int howto, char *bootstr);
 +
 +/* Diagnostic pmsg output */
 +static void
@@ -107,6 +118,25 @@ index 0000000..2222222
 +#define DWC3_CORE_SIZE          0x10000UL
 +#define QSCRATCH_PHYS           0x0a6f8800UL
 +#define QSCRATCH_SIZE           0x400UL
++
++/* IMEM Reboot Target Base */
++#define IMEM_PHYS_BASE          0x146bf000UL
++#define IMEM_SIZE               0x1000UL
++#define IMEM_RECOVERY_OFFSET    0x65c
++#define IMEM_MAGIC_RECOVERY     0x77665502U
++
++/* Ramoops Console Ring Buffer */
++#define PONG_RAMOOPS_PHYS_BASE      0x9FA00000ULL
++#define PONG_RAMOOPS_CONSOLE_OFFSET 0x00040000U
++#define PONG_RAMOOPS_CONSOLE_BYTES  0x00040000U
++#define PONG_RAMOOPS_MAGIC          0x43474244U
++#define PONG_RAMOOPS_HEADER_BYTES   12U
++
++struct pong_ramoops_header {
++	volatile uint32_t sig;
++	volatile uint32_t start;
++	volatile uint32_t size;
++};
 +
 +/* DWC3 Register Offsets */
 +#define DWC3_GCTL               0xC110
@@ -179,6 +209,8 @@ index 0000000..2222222
 +static vm_offset_t core_base;
 +static vm_offset_t qscratch_base;
 +static vm_offset_t smmu_base;
++static vm_offset_t imem_base;
++static vm_offset_t ramoops_console_base;
 +static vm_offset_t dma_wcomb;
 +static void *dma_virt;
 +static IOPhysicalAddress dma_phys;
@@ -186,8 +218,8 @@ index 0000000..2222222
 +static bool ctl_enabled;
 +static bool ctl_configured;
 +static bool ctl_dtr;
-+static bool ctl_tx_active;
-+static bool ctl_rx_active;
++static volatile bool ctl_tx_active;
++static volatile bool ctl_rx_active;
 +static unsigned ctl_stage;
 +static unsigned ctl_control_bytes;
 +static unsigned ctl_status_dep;
@@ -363,19 +395,16 @@ index 0000000..2222222
 +			*(volatile uint32_t *)(smmu + 0xc00 + 4 * sid0_slot) = (s2cr & ~(3u << 16)) | (1u << 16);
 +			__asm__ volatile("dsb sy" ::: "memory");
 +		}
-+		pmsg_log("[PONG_USB] smmu: SID 0 bypass slot=%d
-+", sid0_slot);
++		pmsg_log("[PONG_USB] smmu: SID 0 bypass slot=%d\n", sid0_slot);
 +		return true;
 +	} else if (free_slot >= 0) {
 +		*(volatile uint32_t *)(smmu + 0xc00 + 4 * free_slot) = (1u << 16);
 +		*(volatile uint32_t *)(smmu + 0x800 + 4 * free_slot) = 0x80000000U | 0;
 +		__asm__ volatile("dsb sy" ::: "memory");
-+		pmsg_log("[PONG_USB] smmu: SID 0 bypass free_slot=%d
-+", free_slot);
++		pmsg_log("[PONG_USB] smmu: SID 0 bypass free_slot=%d\n", free_slot);
 +		return true;
 +	} else {
-+		pmsg_log("[PONG_USB] smmu: warning no free stream slot
-+");
++		pmsg_log("[PONG_USB] smmu: warning no free stream slot\n");
 +		return false;
 +	}
 +}
@@ -517,23 +546,162 @@ index 0000000..2222222
 +	return out[0];
 +}
 +
-+/* Command Dispatcher (Stage 1: ping only) */
++/* Event processing forward declaration */
++static void process_events(void);
++
++/* Bulk IN Transmission Helper (synchronous wait for transfer complete) */
++static void
++send_response(const void *data, unsigned len)
++{
++	if (!ctl_configured || len == 0) return;
++	const uint8_t *src = (const uint8_t *)data;
++	unsigned remaining = len;
++
++	while (remaining > 0) {
++		unsigned chunk = (remaining > 4096) ? 4096 : remaining;
++		for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
++			process_events();
++			delay_for_interval(1, NSEC_PER_MSEC);
++		}
++		if (ctl_tx_active) {
++			pmsg_log("[PONG_USB] tx busy drop\n");
++			return;
++		}
++		memcpy((void *)(dma_wcomb + OFF_TX_DATA), src, chunk);
++		ctl_tx_active = true;
++		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, chunk, DWC3_TRBCTL_NORMAL);
++		src += chunk;
++		remaining -= chunk;
++	}
++	for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
++		process_events();
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++}
++
++/* Process scan callback for 'status' command */
++struct proc_scan_state {
++	bool launchd;
++	bool backboardd;
++	bool SpringBoard;
++};
++
++static int
++proc_scan_callback(proc_t p, void *arg)
++{
++	struct proc_scan_state *st = (struct proc_scan_state *)arg;
++	const char *name = proc_best_name(p);
++	if (name) {
++		if (!st->launchd && strcmp(name, "launchd") == 0) st->launchd = true;
++		if (!st->backboardd && strcmp(name, "backboardd") == 0) st->backboardd = true;
++		if (!st->SpringBoard && strcmp(name, "SpringBoard") == 0) st->SpringBoard = true;
++	}
++	return 0;
++}
++
++/* Stream console ring for 'log' command */
++static void
++stream_console_log(void)
++{
++	if (!ramoops_console_base) {
++		ramoops_console_base = ml_io_map(PONG_RAMOOPS_PHYS_BASE + PONG_RAMOOPS_CONSOLE_OFFSET,
++		    PONG_RAMOOPS_CONSOLE_BYTES);
++	}
++	if (!ramoops_console_base) {
++		send_response("[LOG] error: ml_io_map ramoops failed\n", 37);
++		return;
++	}
++	struct pong_ramoops_header *h = (struct pong_ramoops_header *)ramoops_console_base;
++	if (h->sig != PONG_RAMOOPS_MAGIC) {
++		send_response("[LOG] error: ramoops magic invalid\n", 35);
++		return;
++	}
++	uint32_t capacity = PONG_RAMOOPS_CONSOLE_BYTES - PONG_RAMOOPS_HEADER_BYTES;
++	uint32_t start = h->start;
++	uint32_t size = h->size;
++	if (size > capacity) size = capacity;
++	if (start >= capacity) start = 0;
++
++	if (size == 0) {
++		send_response("[LOG] (ring buffer empty)\n[LOG_END]\n", 36);
++		return;
++	}
++
++	send_response("[LOG_START]\n", 12);
++	volatile uint8_t *data = (volatile uint8_t *)(ramoops_console_base + PONG_RAMOOPS_HEADER_BYTES);
++
++	if (size >= capacity) {
++		/* Ring wrapped: part 1 from start to capacity, part 2 from 0 to start */
++		if (capacity > start) {
++			send_response((const void *)(data + start), capacity - start);
++		}
++		if (start > 0) {
++			send_response((const void *)data, start);
++		}
++	} else {
++		/* Ring not wrapped: 0 to size */
++		send_response((const void *)data, size);
++	}
++	send_response("\n[LOG_END]\n", 11);
++}
++
++/* Command Dispatcher (Stage 2: ping, status, log, reboot, reboot-recovery) */
 +static void
 +handle_command(const char *cmd)
 +{
 +	if (strcmp(cmd, "ping") == 0) {
-+		pmsg_log("[PONG_USB] cmd: ping -> pong
-+");
-+		if (!ctl_tx_active) {
-+			volatile uint8_t *tx_buf = (volatile uint8_t *)(dma_wcomb + OFF_TX_DATA);
-+			tx_buf[0] = 'p'; tx_buf[1] = 'o'; tx_buf[2] = 'n'; tx_buf[3] = 'g'; tx_buf[4] = '
-+';
-+			ctl_tx_active = true;
-+			ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, 5, DWC3_TRBCTL_NORMAL);
++		pmsg_log("[PONG_USB] cmd: ping -> pong\n");
++		send_response("pong\n", 5);
++	} else if (strcmp(cmd, "status") == 0) {
++		pmsg_log("[PONG_USB] cmd: status\n");
++		uint64_t uptime_ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
++		uint32_t uptime_sec = (uint32_t)(uptime_ns / 1000000000ULL);
++		unsigned free_pages = vm_page_free_count;
++		unsigned free_mb = (unsigned)((uint64_t)free_pages * 4096 / (1024 * 1024));
++
++		struct proc_scan_state st = { false, false, false };
++		proc_iterate(PROC_ALLPROCLIST, proc_scan_callback, &st, NULL, NULL);
++
++		char buf[256];
++		int n = snprintf(buf, sizeof(buf),
++		    "STATUS: OK\n"
++		    "uptime: %us\n"
++		    "free_pages: %u (%u MB)\n"
++		    "proc_launchd: %s\n"
++		    "proc_backboardd: %s\n"
++		    "proc_SpringBoard: %s\n",
++		    uptime_sec, free_pages, free_mb,
++		    st.launchd ? "RUNNING" : "NOT_FOUND",
++		    st.backboardd ? "RUNNING" : "NOT_FOUND",
++		    st.SpringBoard ? "RUNNING" : "NOT_FOUND");
++		if (n > 0) {
++			send_response(buf, (unsigned)n);
 +		}
++	} else if (strcmp(cmd, "log") == 0) {
++		pmsg_log("[PONG_USB] cmd: log\n");
++		stream_console_log();
++	} else if (strcmp(cmd, "reboot") == 0) {
++		pmsg_log("[PONG_USB] cmd: reboot\n");
++		send_response("reboot: ok\n", 11);
++		delay_for_interval(50, NSEC_PER_MSEC);
++		reboot_kernel(RB_AUTOBOOT, NULL);
++	} else if (strcmp(cmd, "reboot-recovery") == 0 || strcmp(cmd, "reboot_recovery") == 0) {
++		pmsg_log("[PONG_USB] cmd: reboot-recovery\n");
++		if (!imem_base) {
++			imem_base = ml_io_map(IMEM_PHYS_BASE, IMEM_SIZE);
++		}
++		if (imem_base) {
++			*(volatile uint32_t *)(imem_base + IMEM_RECOVERY_OFFSET) = IMEM_MAGIC_RECOVERY;
++			__asm__ volatile("dsb sy" ::: "memory");
++			pmsg_log("[PONG_USB] imem: 0x146bf65c = 0x77665502 latched\n");
++		}
++		send_response("reboot-recovery: ok (rebooting to TWRP)\n", 39);
++		delay_for_interval(50, NSEC_PER_MSEC);
++		reboot_kernel(RB_QUICK, "reboot recovery");
 +	} else {
-+		pmsg_log("[PONG_USB] unknown cmd: %s
-+", cmd);
++		pmsg_log("[PONG_USB] unknown cmd: %s\n", cmd);
++		send_response("ERR: unknown command\n", 21);
 +	}
 +}
 +
@@ -614,8 +782,7 @@ index 0000000..2222222
 +				return;
 +			}
 +			core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << 2) | (1u << 3) | (1u << 5));
-+			pmsg_log("[PONG_USB] configured: speed=%s packet=%u
-+",
++			pmsg_log("[PONG_USB] configured: speed=%s packet=%u\n",
 +			    (ctl_packet_size == 512) ? "HS" : "FS", ctl_packet_size);
 +		} else {
 +			ctl_dtr = false;
