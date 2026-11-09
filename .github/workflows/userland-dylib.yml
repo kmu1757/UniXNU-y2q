@@ -1,0 +1,134 @@
+name: userland-dylib
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image"
+        type: choice
+        options:
+          - "macos-15-intel"
+          - "macos-14"
+          - "macos-15"
+        default: "macos-15-intel"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: userland-dylib-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ui:
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: developer environment
+        run: |
+          set -euo pipefail
+          dev="$(xcode-select -p)"
+          echo "Xcode developer directory: ${dev}"
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "iPhoneOS SDK: ${sdk}"
+          xcrun --sdk iphoneos clang --version
+
+      - name: compile libpong-ui18.dylib
+        run: |
+          set -euo pipefail
+          mkdir -p out/ui
+          python3 userland/build-ipados18.py ui --out out/ui --developer "$(xcode-select -p)"
+          test -f out/ui/libpong-ui18.dylib
+          test -f out/ui/libpong-ui.dylib
+
+      - name: inspect and document dylib
+        run: |
+          set -euo pipefail
+          DYLIB="out/ui/libpong-ui18.dylib"
+          INFO="out/ui/libpong-ui18-info.txt"
+
+          SIZE=$(stat -f%z "$DYLIB" 2>/dev/null || wc -c < "$DYLIB" | tr -d ' ')
+          SHA=$(shasum -a 256 "$DYLIB" | awk '{print $1}')
+
+          {
+            echo "================================================================"
+            echo "libpong-ui18.dylib inspection report"
+            echo "================================================================"
+            echo "File: libpong-ui18.dylib"
+            echo "Size: ${SIZE} bytes"
+            echo "SHA256: ${SHA}"
+            echo ""
+            echo "----------------------------------------------------------------"
+            echo "Code Signature (codesign -dvvv)"
+            echo "----------------------------------------------------------------"
+            codesign -dvvv "$DYLIB" 2>&1 || true
+            echo ""
+            echo "----------------------------------------------------------------"
+            echo "Shared Library Dependencies (otool -L)"
+            echo "----------------------------------------------------------------"
+            otool -L "$DYLIB"
+            echo ""
+            echo "----------------------------------------------------------------"
+            echo "Segments and Code Signature (otool -l summary)"
+            echo "----------------------------------------------------------------"
+          } > "$INFO"
+
+          python3 - >> "$INFO" << 'PY'
+          import subprocess, re
+          raw = subprocess.check_output(['otool', '-l', 'out/ui/libpong-ui18.dylib'], text=True)
+          print("Segments (LC_SEGMENT_64):")
+          seg_pattern = re.compile(
+              r'cmd\s+LC_SEGMENT_64\s*\n\s*cmdsize\s+\d+\s*\n\s*segname\s+(\S+)\s*\n\s*vmaddr\s+(\S+)\s*\n\s*vmsize\s+(\S+)\s*\n\s*fileoff\s+(\S+)\s*\n\s*filesize\s+(\S+)',
+              re.MULTILINE
+          )
+          for m in seg_pattern.finditer(raw):
+              seg, vmaddr, vmsize, fileoff, filesize = m.groups()
+              fs = int(filesize, 0)
+              vs = int(vmsize, 0)
+              print(f"  {seg:<12} : filesize {fs:>8} bytes ({filesize:>10}), vmsize {vs:>8} bytes ({vmsize:>10})")
+
+          sig_pattern = re.compile(
+              r'cmd\s+LC_CODE_SIGNATURE\s*\n\s*cmdsize\s+\d+\s*\n\s*dataoff\s+(\S+)\s*\n\s*datasize\s+(\S+)',
+              re.MULTILINE
+          )
+          sig = sig_pattern.search(raw)
+          if sig:
+              off, sz = sig.groups()
+              sz_int = int(sz, 0)
+              off_int = int(off, 0)
+              print(f"\nCode Signature (LC_CODE_SIGNATURE):")
+              print(f"  offset       : {off_int:>8} ({off})")
+              print(f"  size         : {sz_int:>8} bytes ({sz})")
+          PY
+
+          {
+            echo ""
+            echo "----------------------------------------------------------------"
+            echo "Full Load Commands (otool -l)"
+            echo "----------------------------------------------------------------"
+            otool -l "$DYLIB"
+          } >> "$INFO"
+
+          cat "$INFO"
+
+          echo "### libpong-ui18.dylib Build Inspection" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **File**: \`libpong-ui18.dylib\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Size**: \`${SIZE}\` bytes" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **SHA256**: \`${SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          head -n 45 "$INFO" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpong-ui18-dylib
+          path: |
+            out/ui/libpong-ui18.dylib
+            out/ui/libpong-ui.dylib
+            out/ui/libpong-ui18-info.txt
+            out/ui/ui-compile-command.json
+          if-no-files-found: error

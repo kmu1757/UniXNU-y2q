@@ -1072,6 +1072,13 @@ def stage_sileo_application(root, stage, runtime):
 
 def helper(a):
     out = a.out.resolve(); out.mkdir(parents=True, exist_ok=True)
+    if getattr(a, 'only_ui', False):
+        ui_library = compile_ui(out, a.developer)
+        dest18 = out / 'libpong-ui18.dylib'
+        if not dest18.exists():
+            shutil.copyfile(ui_library, dest18)
+        print(dest18)
+        return
     signature = compile_init(out, a.developer, out / 'init')
     ui_library = compile_ui(out, a.developer)
     sleep_service = compile_sleep(out, a.developer)
@@ -1094,6 +1101,21 @@ def helper(a):
         sleep_service=str(sleep_service), sleep_scope='local configuration; no alarm/Focus/Health/Watch backend',
         image_verification='skipped' if not VERIFY_IMAGES else 'requested'))
     print(out / 'init')
+
+
+def ui(a):
+    out = a.out.resolve(); out.mkdir(parents=True, exist_ok=True)
+    developer = a.developer
+    if not developer:
+        dev_str = os.environ.get('DEVELOPER_DIR')
+        if not dev_str:
+            dev_str = subprocess.check_output(['xcode-select', '-p'], text=True).strip()
+        developer = Path(dev_str)
+    ui_library = compile_ui(out, developer)
+    dest18 = out / 'libpong-ui18.dylib'
+    if not dest18.exists():
+        shutil.copyfile(ui_library, dest18)
+    print(dest18)
 
 
 def prepare(a):
@@ -1769,6 +1791,10 @@ def main():
         s = sub.add_parser(name); s.add_argument('--out', type=Path, required=True)
     s = sub.add_parser('helper'); s.add_argument('--out', type=Path, required=True)
     s.add_argument('--developer', type=Path, required=True)
+    s.add_argument('--only-ui', action='store_true', help='compile libpong-ui only')
+    s = sub.add_parser('ui', help='compile libpong-ui only')
+    s.add_argument('--out', type=Path, required=True)
+    s.add_argument('--developer', type=Path, default=None, help='Developer directory (defaults to DEVELOPER_DIR or xcode-select -p)')
     s = sub.add_parser('refresh_jobs'); s.add_argument('--out', type=Path, required=True)
     s.add_argument('--os-root', type=Path, required=True)
     s.add_argument('--system-cryptex', type=Path, required=True)
