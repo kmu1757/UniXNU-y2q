@@ -13,7 +13,7 @@ index fd213cf..cf3d053 100644
  #include <pexpert/arm64/board_config.h>
  #if defined(PONG)
  #include <kern/clock.h>
-@@ -11,236 +12,321 @@
+@@ -11,235 +12,326 @@
  #include <pexpert/pexpert.h>
  #include <sys/pong_input.h>
  #include <sys/systm.h>
@@ -53,6 +53,7 @@ index fd213cf..cf3d053 100644
 +
 +static uint32_t log_count[3];
 +static bool buttons_init_started;
++static uint32_t buttons_delay_seconds = 15;
 +
 +static void pmsg_log(const char *fmt, ...)
 +{
@@ -62,6 +63,7 @@ index fd213cf..cf3d053 100644
 +    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
 +    va_end(ap);
 +    if (n > 0) {
++        if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
 +        pong_ramoops_diagnostic_write(buf, n);
 +        __asm__ volatile("dsb sy" ::: "memory");
 +    }
@@ -254,9 +256,16 @@ index fd213cf..cf3d053 100644
 +
 +static void keys_thread(__unused void *arg, __unused wait_result_t wait_res)
  {
++    delay_for_interval(buttons_delay_seconds, NSEC_PER_SEC);
++    pmsg_log("[PONG_KEYS] init: thread delay=%u s mask=0x%x\n", buttons_delay_seconds, buttons_mask);
 +    uint64_t start_time = mach_absolute_time();
 +    bool summary_logged = false;
 +    unsigned failures = 0;
++    /* Create the userland node before read-only PMIC verification. */
++    if (!pong_buttons_device_ready()) {
++        pmsg_log("[PONG_KEYS] fail: devfs /dev/pong-buttons ready failed\n");
++        goto out;
++    }
 -    if(!v7 || !pon.found || !pin.found)return false;
 -    /* Confirm ownership before touching each channel's write window. */
 -    for(unsigned i=0;i<2;i++) {
@@ -377,11 +386,6 @@ index fd213cf..cf3d053 100644
 -    if (!(keys[0].usable || keys[1].usable) || !pong_buttons_device_ready()) {
 -        printf("Pong keys: no verified input peripheral; SKIP\n");goto out;
 +
-+    if (!pong_buttons_device_ready()) {
-+        pmsg_log("[PONG_KEYS] fail: devfs /dev/pong-buttons ready failed\n");
-+        printf("Pong keys: devfs device not ready; SKIP\n");
-+        goto out;
-     }
 -    for (unsigned i=0;i<3;i++) keys[i].live=keys[i].usable && !keys[i].last;
 -    printf("Pong keys: arbiter v%u channels=%u PON=%u GPIO6=%u; power=%u up=%u down=%u\n",
 -        v7?7:5,channels,pon.channel,pin.channel,keys[0].usable,keys[1].usable,keys[2].usable);
@@ -511,7 +515,8 @@ index fd213cf..cf3d053 100644
 -    if (kernel_thread_start(keys_thread,NULL,&t)==KERN_SUCCESS) thread_deallocate(t);
 +    thread_t th = THREAD_NULL;
 +    bool parsed = PE_parse_boot_argn("pong_buttons", &buttons_mask, sizeof(buttons_mask));
-+    pmsg_log("[PONG_KEYS] init: parsed=%u mask=0x%x started=%u\n", parsed, buttons_mask, buttons_init_started);
++    (void)PE_parse_boot_argn("pong_buttons_delay", &buttons_delay_seconds, sizeof(buttons_delay_seconds));
++    if (buttons_delay_seconds > 30) buttons_delay_seconds = 30;
 +    if (!parsed || (buttons_mask & 3) == 0) return;
 +    if (buttons_init_started) return;
 +    buttons_init_started = true;
