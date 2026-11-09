@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1184 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -56,6 +56,9 @@ index 0000000..2222222
 + *  - Apps SMMU: 0x15000000, SID 0 bypass configuration
 + *  - IMEM reboot: 0x146bf65c = 0x77665502 (ref/gts7xl-mainline/linux-patches)
 + *  - Ramoops console: 0x9FA40000 (0001-pong-darwin24.patch)
++ *  - Framebuffer: vinfo.v_baseaddr (2800x1752 BGRA)
++ *  - Touch injection: pong_touch_post(type, finger, x, y)
++ *  - Thread snapshot: pong_dump_task_threads_pmsg(task, comm, pid, sec)
 + *  - Standard USB CDC-ACM: driverless on Windows 10/11 (usbser.sys)
 + */
 +
@@ -67,6 +70,7 @@ index 0000000..2222222
 +#include <sys/systm.h>
 +#include <sys/proc.h>
 +#include <sys/reboot.h>
++#include <console/video_console.h>
 +#include <sys/pong_usb_ctl.h>
 +#include <IOKit/IOLib.h>
 +
@@ -81,6 +85,11 @@ index 0000000..2222222
 +extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout, void *arg, proc_iterate_fn_t filterfn, void *filterarg);
 +extern const char *proc_best_name(proc_t p);
 +extern int reboot_kernel(int howto, char *bootstr);
++extern task_t proc_task(proc_t);
++extern int proc_pid(proc_t);
++extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec);
++extern void pong_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
++extern struct vc_info vinfo;
 +
 +/* Diagnostic pmsg output */
 +static void
@@ -261,6 +270,19 @@ index 0000000..2222222
 +	deadline = mach_absolute_time() + interval;
 +	while (mach_absolute_time() < deadline) {
 +	}
++}
++
++/* Simple unsigned integer parser for command arguments */
++static unsigned
++parse_uint(const char **p)
++{
++	while (**p == ' ') (*p)++;
++	unsigned val = 0;
++	while (**p >= '0' && **p <= '9') {
++		val = val * 10 + (**p - '0');
++		(*p)++;
++	}
++	return val;
 +}
 +
 +/* Open-drain bit-bang I2C */
@@ -645,7 +667,127 @@ index 0000000..2222222
 +	send_response("\n[LOG_END]\n", 11);
 +}
 +
-+/* Command Dispatcher (Stage 2: ping, status, log, reboot, reboot-recovery) */
++/* Thread snapshot walk callback for 'threads' command */
++static int
++pong_threads_snap_cb(proc_t p, void *arg)
++{
++	task_t task = proc_task(p);
++	const char *comm = proc_best_name(p);
++	int pid = proc_pid(p);
++	uint32_t sec = *(uint32_t *)arg;
++	if (task && comm) {
++		pong_dump_task_threads_pmsg(task, comm, pid, sec);
++	}
++	return 0;
++}
++
++static void
++handle_threads(void)
++{
++	uint64_t uptime_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
++	uint32_t sec = (uint32_t)(uptime_ns / 1000000000ULL);
++	pmsg_log("[PONG_USB] cmd: threads (snap sec=%u)\n", sec);
++	proc_iterate(PROC_ALLPROCLIST, pong_threads_snap_cb, &sec, NULL, NULL);
++	send_response("threads: ok (snapshot written to pmsg ramoops)\n", 48);
++}
++
++/* Touch Input Injection Helpers (Stage 3) */
++static void
++handle_tap(unsigned x, unsigned y)
++{
++	if (x >= 2800) x = 2799;
++	if (y >= 1752) y = 1751;
++	uint32_t nx = (x * 65535U) / 2800U;
++	uint32_t ny = (y * 65535U) / 1752U;
++	pong_touch_post(1, 0, nx, ny); /* PONG_TOUCH_DOWN = 1 */
++	delay_for_interval(50, NSEC_PER_MSEC);
++	pong_touch_post(3, 0, nx, ny); /* PONG_TOUCH_UP = 3 */
++	pmsg_log("[PONG_USB] tap (%u,%u) -> (%u,%u)\n", x, y, nx, ny);
++	send_response("tap: ok\n", 8);
++}
++
++static void
++handle_swipe(unsigned x1, unsigned y1, unsigned x2, unsigned y2, unsigned ms)
++{
++	if (x1 >= 2800) x1 = 2799;
++	if (y1 >= 1752) y1 = 1751;
++	if (x2 >= 2800) x2 = 2799;
++	if (y2 >= 1752) y2 = 1751;
++	if (ms < 50) ms = 50;
++	if (ms > 2000) ms = 2000;
++
++	uint32_t sx = (x1 * 65535U) / 2800U;
++	uint32_t sy = (y1 * 65535U) / 1752U;
++	uint32_t ex = (x2 * 65535U) / 2800U;
++	uint32_t ey = (y2 * 65535U) / 1752U;
++
++	unsigned steps = ms / 10;
++	if (steps == 0) steps = 1;
++
++	pong_touch_post(1, 0, sx, sy); /* DOWN */
++	delay_for_interval(10, NSEC_PER_MSEC);
++
++	for (unsigned i = 1; i < steps; i++) {
++		uint32_t cx = (uint32_t)((int32_t)sx + (int32_t)(ex - sx) * (int32_t)i / (int32_t)steps);
++		uint32_t cy = (uint32_t)((int32_t)sy + (int32_t)(ey - sy) * (int32_t)i / (int32_t)steps);
++		pong_touch_post(2, 0, cx, cy); /* MOVE */
++		delay_for_interval(10, NSEC_PER_MSEC);
++	}
++
++	pong_touch_post(3, 0, ex, ey); /* UP */
++	pmsg_log("[PONG_USB] swipe (%u,%u)->(%u,%u) %ums\n", x1, y1, x2, y2, ms);
++	send_response("swipe: ok\n", 10);
++}
++
++/* Raw Framebuffer Screenshot Streaming (Stage 3) */
++static void
++handle_screenshot(void)
++{
++	pmsg_log("[PONG_USB] cmd: screenshot\n");
++	if (!vinfo.v_baseaddr || vinfo.v_width == 0 || vinfo.v_height == 0) {
++		send_response("SCREENSHOT_ERROR: framebuffer not mapped\n", 41);
++		return;
++	}
++	uint32_t w = vinfo.v_width;
++	uint32_t h = vinfo.v_height;
++	uint32_t rowbytes = vinfo.v_rowbytes;
++	uint32_t total_bytes = h * rowbytes;
++
++	char header[64];
++	int n = snprintf(header, sizeof(header), "SCREENSHOT %u %u BGRA %u\n", w, h, total_bytes);
++	if (n > 0) {
++		send_response(header, (unsigned)n);
++	}
++
++	const uint8_t *fb = (const uint8_t *)vinfo.v_baseaddr;
++	uint32_t sent = 0;
++	while (sent < total_bytes && ctl_configured) {
++		uint32_t chunk = total_bytes - sent;
++		if (chunk > 4096) chunk = 4096;
++
++		for (unsigned w_idx = 0; w_idx < 500 && ctl_tx_active; w_idx++) {
++			process_events();
++			delay_for_interval(1, NSEC_PER_MSEC);
++		}
++		if (ctl_tx_active) {
++			pmsg_log("[PONG_USB] screenshot: tx timeout\n");
++			return;
++		}
++
++		memcpy((void *)(dma_wcomb + OFF_TX_DATA), fb + sent, chunk);
++		ctl_tx_active = true;
++		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, chunk, DWC3_TRBCTL_NORMAL);
++		sent += chunk;
++	}
++
++	for (unsigned w_idx = 0; w_idx < 500 && ctl_tx_active; w_idx++) {
++		process_events();
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++}
++
++/* Command Dispatcher (Stage 3: complete command set) */
 +static void
 +handle_command(const char *cmd)
 +{
@@ -699,6 +841,23 @@ index 0000000..2222222
 +		send_response("reboot-recovery: ok (rebooting to TWRP)\n", 39);
 +		delay_for_interval(50, NSEC_PER_MSEC);
 +		reboot_kernel(RB_QUICK, "reboot recovery");
++	} else if (strcmp(cmd, "screenshot") == 0) {
++		handle_screenshot();
++	} else if (strncmp(cmd, "tap ", 4) == 0) {
++		const char *p = cmd + 4;
++		unsigned x = parse_uint(&p);
++		unsigned y = parse_uint(&p);
++		handle_tap(x, y);
++	} else if (strncmp(cmd, "swipe ", 6) == 0) {
++		const char *p = cmd + 6;
++		unsigned x1 = parse_uint(&p);
++		unsigned y1 = parse_uint(&p);
++		unsigned x2 = parse_uint(&p);
++		unsigned y2 = parse_uint(&p);
++		unsigned ms = parse_uint(&p);
++		handle_swipe(x1, y1, x2, y2, ms);
++	} else if (strcmp(cmd, "threads") == 0) {
++		handle_threads();
 +	} else {
 +		pmsg_log("[PONG_USB] unknown cmd: %s\n", cmd);
 +		send_response("ERR: unknown command\n", 21);
