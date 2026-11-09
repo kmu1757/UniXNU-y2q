@@ -1,0 +1,493 @@
+diff --git a/bsd/dev/pong_buttons.c b/bsd/dev/pong_buttons.c
+index fd213cf..cf3d053 100644
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -1,6 +1,7 @@
+-/* Pong SM8475 PMIC keys. Read-only peripheral access, adapted from the earlier
+- * redwood_buttons.c (APSL 2.0) and NothingOSS spmi-pmic-arb.c register layouts.
+- * No PMIC configuration/reset/supply writes and no display/GPU dependency. */
++/* Pong SM8250/PM8150 & SM8475 PMIC keys. Read-only peripheral access via SPMI observer.
++ * Adapted from redwood_buttons.c (APSL 2.0) and NothingOSS/Linux spmi-pmic-arb.c layouts.
++ * Read-only polling only: no PMIC configuration/reset/supply writes, no PDC/IRQ writes,
++ * and no display/GPU dependency. Safe against reboot combo interference. */
+ #include <pexpert/arm64/board_config.h>
+ #if defined(PONG)
+ #include <kern/clock.h>
+@@ -11,236 +12,293 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/pong_input.h>
+ #include <sys/systm.h>
+-extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+-static vm_offset_t core,cnfg,observer,channels_base,pdc;
+-static volatile uint32_t irq_events;
+-static bool irq_mode;
+-extern int armcpu_spi_attach(uint32_t,bool,void (*)(void *),void *,uint32_t *,uint64_t *);
++extern void pong_ramoops_diagnostic_write(const char *, int);
+ 
++static vm_offset_t core, cnfg, observer;
+ static bool v7;
+ static uint32_t channels;
+-struct peripheral {uint16_t ppid,channel;bool found;};
+-static struct peripheral pon={.ppid=0x013},pin={.ppid=0x18d};
+-struct key {bool usable,live,last,down;uint32_t code;};
+-static struct key keys[3]={{.code=PONG_BUTTON_POWER},{.code=PONG_BUTTON_VOLUME_UP},
+-    {.code=PONG_BUTTON_VOLUME_DOWN}};
+-static uint32_t rd(vm_offset_t a) {return *(volatile uint32_t *)a;}
+-static void wr(vm_offset_t a,uint32_t v) {*(volatile uint32_t *)a=v;__asm__ volatile("dsb sy":::"memory");}
+-
+-static bool property(DTEntry e,const char *name,void *out,unsigned size)
++static uint32_t buttons_mask;
++
++struct peripheral { uint16_t ppid, channel; bool found; };
++static struct peripheral pon = {.ppid = 0x008}, pin = {.ppid = 0x4c2};
++
++struct key { bool usable, live, last, down; uint32_t code; };
++static struct key keys[3] = {
++    {.code = PONG_BUTTON_POWER},
++    {.code = PONG_BUTTON_VOLUME_UP},
++    {.code = PONG_BUTTON_VOLUME_DOWN}
++};
++
++static uint32_t log_count[3];
++
++static void pmsg_log(const char *fmt, ...)
++{
++    char buf[128];
++    va_list ap;
++    va_start(ap, fmt);
++    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    if (n > 0) {
++        pong_ramoops_diagnostic_write(buf, n);
++        __asm__ volatile("dsb sy" ::: "memory");
++    }
++}
++
++static uint32_t rd(vm_offset_t a) { return *(volatile uint32_t *)a; }
++static void wr(vm_offset_t a, uint32_t v) { *(volatile uint32_t *)a = v; __asm__ volatile("dsb sy" ::: "memory"); }
++
++static bool property(DTEntry e, const char *name, void *out, unsigned size)
+ {
+-    void *p=NULL;unsigned n=0;
+-    if (SecureDTGetProperty(e,name,&p,&n)!=kSuccess || n!=size) return false;
+-    memcpy(out,p,size);return true;
++    void *p = NULL;
++    unsigned n = 0;
++    if (SecureDTGetProperty(e, name, &p, &n) != kSuccess || n != size) return false;
++    memcpy(out, p, size);
++    return true;
+ }
+ 
+ static bool configuration(void)
+ {
+-    DTEntry e;uint64_t c=0,n=0,o=0;uint32_t ee=~0u,a=0,b=0;
+-    if (SecureDTLookupEntry(NULL,"/arm-io/pong-buttons",&e)!=kSuccess ||
+-        !property(e,"core-base",&c,8) || !property(e,"cnfg-base",&n,8) ||
+-        !property(e,"observer-base",&o,8) || !property(e,"ee",&ee,4) ||
+-        !property(e,"pon-ppid",&a,4) || !property(e,"volume-up-ppid",&b,4) ||
+-        c!=0xc400000 || n!=0xc42d000 || o!=0xc440000 || ee!=0 || a!=pon.ppid || b!=pin.ppid)
++    DTEntry e;
++    uint64_t c = 0, n = 0, o = 0;
++    uint32_t ee = ~0u, a = 0, b = 0;
++    char compat[32] = {0};
++
++    if (SecureDTLookupEntry(NULL, "/arm-io/pong-buttons", &e) != kSuccess) {
++        pmsg_log("[PONG_KEYS] fail: SecureDTLookupEntry(/arm-io/pong-buttons)\n");
++        return false;
++    }
++    (void)property(e, "compatible", compat, sizeof(compat) - 1);
++    (void)property(e, "core-base", &c, 8);
++    (void)property(e, "cnfg-base", &n, 8);
++    (void)property(e, "observer-base", &o, 8);
++    (void)property(e, "ee", &ee, 4);
++    (void)property(e, "pon-ppid", &a, 4);
++    (void)property(e, "volume-up-ppid", &b, 4);
++
++    /* Check platform compatible & bases.
++     * SM8250 (gts7xlwifi / T970): core 0xc440000, cnfg 0xc40a000, obsrvr 0xe600000,
++     * PON PPID 0x008 (PM8150 SID 0, periph 0x08), GPIO PPID 0x4c2 (PM8150L SID 4, periph 0xc2). */
++    if (strcmp(compat, "qcom,pm8150-keys") == 0 ||
++        (c == 0x0c440000ULL && o == 0x0e600000ULL)) {
++        c = 0x0c440000ULL;
++        n = 0x0c40a000ULL;
++        o = 0x0e600000ULL;
++        a = 0x008;
++        b = 0x4c2;
++    } else if (c == 0x0c400000ULL && n == 0x0c42d000ULL && o == 0x0c440000ULL) {
++        /* SM8475 fallback */
++        a = 0x013;
++        b = 0x18d;
++    } else {
++        pmsg_log("[PONG_KEYS] fail: incompatible DT config compat=%s core=0x%llx\n",
++                 compat, (unsigned long long)c);
++        return false;
++    }
++
++    pon.ppid = (uint16_t)a;
++    pin.ppid = (uint16_t)b;
++
++    core = ml_io_map(c, 0x4000);
++    cnfg = ml_io_map(n, 0x4000);
++    observer = ml_io_map(o, 0x80000);
++    if (!core || !cnfg || !observer) {
++        pmsg_log("[PONG_KEYS] fail: ml_io_map core=%p cnfg=%p obs=%p\n",
++                 (void *)core, (void *)cnfg, (void *)observer);
+         return false;
+-    core=ml_io_map(c,0x3000);cnfg=ml_io_map(n,0x4000);observer=ml_io_map(o,0x80000);
+-    return core && cnfg && observer;
++    }
++    return true;
+ }
+ 
+ static void find_channel(struct peripheral *p)
+ {
+-    for (uint32_t i=0;i<channels;i++) {
+-        uint32_t map=rd(core+(v7?0x2000:0x900)+4*i);
+-        if (!map || ((map>>8)&0xfff)!=p->ppid) continue;
+-        unsigned owner=rd(cnfg+(v7?0:0x700)+4*i)&7;
+-        if (!p->found || owner==0) {p->found=true;p->channel=(uint16_t)i;}
++    for (uint32_t i = 0; i < channels; i++) {
++        uint32_t map = rd(core + (v7 ? 0x2000 : 0x900) + 4 * i);
++        if (!map || ((map >> 8) & 0xfff) != p->ppid) continue;
++        unsigned owner = rd(cnfg + (v7 ? 0 : 0x700) + 4 * i) & 7;
++        if (!p->found || owner == 0) {
++            p->found = true;
++            p->channel = (uint16_t)i;
++        }
+     }
+ }
+ 
+-static bool read_registers(const struct peripheral *p,uint8_t reg,uint8_t *out,unsigned count)
++static bool read_registers(const struct peripheral *p, uint8_t reg, uint8_t *out, unsigned count)
+ {
+-    if (!p->found || !count || count>8) return false;
+-    vm_offset_t ch=observer+(v7?0x20UL:0x80UL)*p->channel;
+-    uint64_t limit=0;clock_interval_to_deadline(2000,NSEC_PER_USEC,&limit);
++    if (!p->found || !count || count > 8 || !observer) return false;
++    vm_offset_t ch = observer + (v7 ? 0x20UL : 0x80UL) * p->channel;
++    uint64_t limit = 0;
++    clock_interval_to_deadline(2000, NSEC_PER_USEC, &limit);
+     /* Extended-read-long observer command; this never writes a PMIC register. */
+-    wr(ch,(1u<<27)|((uint32_t)reg<<4)|(count-1));
++    wr(ch, (1u << 27) | ((uint32_t)reg << 4) | (count - 1));
+     uint32_t status;
+-    do {status=rd(ch+8);} while (!(status&1) && mach_absolute_time()<limit);
+-    if ((status&0xf)!=1) return false;
+-    uint32_t data[2]={rd(ch+0x18),count>4?rd(ch+0x1c):0};
+-    for (unsigned i=0;i<count;i++) out[i]=(uint8_t)(data[i/4]>>(8*(i%4)));
++    do {
++        status = rd(ch + 8);
++    } while (!(status & 1) && mach_absolute_time() < limit);
++    if ((status & 0xf) != 1) return false;
++    uint32_t data[2] = {rd(ch + 0x18), count > 4 ? rd(ch + 0x1c) : 0};
++    for (unsigned i = 0; i < count; i++) out[i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
+     return true;
+ }
+ 
+-/* Pong live DT: PDC pin 1 -> GIC SPI481; PMK8350 PON bits7/6,
+- * PM8350 GPIO6 (PPID18d) bit0. The interrupt wakes the worker only;
+- * SPMI commands and HID queueing run in thread context. */
+-static void key_irq(void *context)
+-{
+-    (void)context;
+-    /* Mask until the owner has read and acknowledged the peripheral. */
+-    uint32_t cfg=rd(pdc+0x114);
+-    wr(pdc+0x114,cfg&~8u);
+-    __atomic_fetch_add(&irq_events,1u,__ATOMIC_RELEASE);
+-    thread_wakeup((event_t)&irq_events);
+-}
+-static bool peripheral_write(const struct peripheral *p,uint8_t reg,uint8_t value)
++static void look(struct key *k, bool down, unsigned key_idx)
+ {
+-    vm_offset_t ch=channels_base+0x1000UL*p->channel;
+-    wr(ch+0x10,value);wr(ch,((uint32_t)reg<<4));
+-    uint64_t limit;clock_interval_to_deadline(2000,NSEC_PER_USEC,&limit);
+-    uint32_t status;
+-    do {status=rd(ch+8);}while(!(status&1)&&mach_absolute_time()<limit);
+-    return (status&0xf)==1;
+-}
+-static bool arm_key_irq(const struct peripheral *p,uint8_t bits)
+-{
+-    uint32_t map=rd(core+0x2000+4*p->channel);
+-    if(!(map&(1u<<24)) || (rd(cnfg+4*p->channel)&7)!=0)return false;
+-    uint8_t type,high,low;
+-    if(!read_registers(p,0x11,&type,1)||!read_registers(p,0x12,&high,1)||
+-       !read_registers(p,0x13,&low,1))return false;
+-    if(!peripheral_write(p,0x11,type|bits)||!peripheral_write(p,0x12,high|bits)||
+-       !peripheral_write(p,0x13,low|bits)||!peripheral_write(p,0x14,bits)||
+-       !peripheral_write(p,0x15,bits))return false;
+-    wr(channels_base+0x1000UL*p->channel+0x100,1);return true;
+-}
+-static void acknowledge_key_irq(const struct peripheral *p,uint8_t bits)
+-{
+-    if(!p->found)return;
+-    vm_offset_t ch=channels_base+0x1000UL*p->channel;
+-    uint32_t status=rd(ch+0x104)&bits;
+-    if(status){wr(ch+0x108,status);(void)peripheral_write(p,0x14,(uint8_t)status);}
+-}
+-static void disable_irqs(void)
+-{
+-    if(!irq_mode)return;
+-    wr(pdc+0x114,rd(pdc+0x114)&~8u);
+-    (void)peripheral_write(&pon,0x16,0xc0);
+-    (void)peripheral_write(&pin,0x16,1);
+-    irq_mode=false;
++    bool steady = k->last == down;
++    k->last = down;
++    if (!k->usable || !steady) return;
++    if (!k->live) { if (!down) k->live = true; return; }
++    if (k->down == down) return;
++    k->down = down;
++    pong_touch_post(down ? PONG_BUTTON_DOWN : PONG_BUTTON_UP, k->code, 0, 0);
++    printf("Pong keys: %u %s\n", k->code, down ? "down" : "up");
++    if (log_count[key_idx] < 5) {
++        log_count[key_idx]++;
++        const char *name = (key_idx == 0) ? "POWER" : (key_idx == 1 ? "VOL_UP" : "VOL_DOWN");
++        pmsg_log("[PONG_KEYS] event: %s %s (count=%u)\n", name, down ? "down" : "up", log_count[key_idx]);
++    }
+ }
+-static bool enable_irqs(void)
++
++static void keys_thread(__unused void *arg, __unused wait_result_t wait_res)
+ {
+-    if(!v7 || !pon.found || !pin.found)return false;
+-    /* Confirm ownership before touching each channel's write window. */
+-    for(unsigned i=0;i<2;i++) {
+-        struct peripheral *p=i?&pin:&pon;
+-        if(!(rd(core+0x2000+4*p->channel)&(1u<<24)) ||
+-           (rd(cnfg+4*p->channel)&7)!=0)return false;
++    if (!configuration()) {
++        printf("Pong keys: missing/incompatible DT; SKIP\n");
++        goto out;
+     }
+-    channels_base=ml_io_map(0xc500000,0x400000);
+-    pdc=ml_io_map(0xb220000,0x2000);
+-    if(!channels_base||!pdc||rd(pdc+0x1000)<0x30200)return false;
+-    int result=-1;
+-    for(unsigned attempt=0;attempt<120 && result;attempt++) {
+-        result=armcpu_spi_attach(32+481,false,key_irq,NULL,NULL,NULL);
+-        if(result){uint64_t d;clock_interval_to_deadline(100,NSEC_PER_MSEC,&d);
+-            assert_wait_deadline((event_t)&irq_events,THREAD_UNINT,d);thread_block(THREAD_CONTINUE_NULL);}
++    uint32_t version = rd(core);
++    if (version < 0x50000000 || version >= 0x80000000) {
++        pmsg_log("[PONG_KEYS] fail: unsupported arbiter version 0x%08x\n", version);
++        printf("Pong keys: unsupported arbiter version %x; SKIP\n", version);
++        goto out;
+     }
+-    if(result)return false;
+-    if(!arm_key_irq(&pon,0xc0)||!arm_key_irq(&pin,1)) {
+-        (void)peripheral_write(&pon,0x16,0xc0);
+-        (void)peripheral_write(&pin,0x16,1);return false;
++    v7 = version >= 0x70000000;
++    channels = rd(core + 4) & 0x7ff;
++    if (!channels || channels > (v7 ? 1024u : 512u)) {
++        pmsg_log("[PONG_KEYS] fail: invalid channel count %u\n", channels);
++        printf("Pong keys: invalid channel count %u; SKIP\n", channels);
++        goto out;
+     }
+-    wr(pdc+0x114,12u);
+-    printf("Pong keys: owned PMIC interrupts on SPI481; coherent consumer transitions\n");
+-    return true;
+-}
+-static void look(struct key *k,bool down)
+-{
+-    bool steady=k->last==down;k->last=down;
+-    if (!k->usable || !steady) return;
+-    if (!k->live) {if (!down) k->live=true;return;}
+-    if (k->down==down) return;
+-    k->down=down;
+-    pong_touch_post(down?PONG_BUTTON_DOWN:PONG_BUTTON_UP,k->code,0,0);
+-    printf("Pong keys: %u %s\n",k->code,down?"down":"up");
+-}
+ 
+-static void keys_thread(__unused void *arg,__unused wait_result_t result)
+-{
+-    if (!configuration()) {printf("Pong keys: missing/incompatible DT; SKIP\n");goto out;}
+-    uint32_t version=rd(core);
+-    if (version<0x50000000 || version>=0x80000000) {
+-        printf("Pong keys: unsupported arbiter version %x; SKIP\n",version);goto out;
+-    }
+-    v7=version>=0x70000000;channels=rd(core+4)&0x7ff;
+-    if (!channels || channels>(v7?1024u:512u)) {
+-        printf("Pong keys: invalid channel count %u; SKIP\n",channels);goto out;
++    bool enable_volume = (buttons_mask & 1) != 0;
++    bool enable_power = (buttons_mask & 2) != 0;
++
++    find_channel(&pon);
++    if (enable_volume) find_channel(&pin);
++
++    uint8_t id[2] = {0, 0}, state = 0, c[8];
++
++    /* Verify PON peripheral (id[0] == 1, id[1] in 1..9) */
++    if (read_registers(&pon, 4, id, 2) && id[0] == 1 && id[1] >= 1 && id[1] <= 9 &&
++        read_registers(&pon, 0x10, &state, 1)) {
++        bool gen3 = (id[1] == 9);
++        uint8_t pwr_mask = gen3 ? 0x80 : 0x01;
++        uint8_t voldn_mask = gen3 ? 0x40 : 0x02;
++        if (enable_power) {
++            keys[0].usable = true;
++            keys[0].last = (state & pwr_mask) != 0;
++        }
++        if (enable_volume) {
++            keys[2].usable = true;
++            keys[2].last = (state & voldn_mask) != 0;
++        }
++    } else {
++        pmsg_log("[PONG_KEYS] fail: PON verify failed id[0]=0x%02x id[1]=0x%02x found=%d\n",
++                 id[0], id[1], pon.found);
+     }
+-    find_channel(&pon);find_channel(&pin);
+-    uint8_t id[2],state=0,c[8];
+-    if (read_registers(&pon,4,id,2) && id[0]==1 && id[1]==9 &&
+-        read_registers(&pon,0x10,&state,1)) {
+-        keys[0].usable=keys[2].usable=true;
+-        keys[0].last=(state&0x80)!=0;keys[2].last=(state&0x40)!=0;
++
++    /* Verify Volume Up GPIO pin peripheral (id[0] == 0x10, id[1] in 1..0x15) */
++    if (enable_volume && pin.found) {
++        uint8_t pin_id[2] = {0, 0};
++        if (read_registers(&pin, 4, pin_id, 2) && pin_id[0] == 0x10 &&
++            pin_id[1] >= 1 && pin_id[1] <= 0x15 &&
++            read_registers(&pin, 0x40, c, 8) && (c[0] & 3) == 0 && (c[2] & 7) < 4 && (c[6] & 0x80) &&
++            read_registers(&pin, 0x10, &state, 1)) {
++            keys[1].usable = true;
++            keys[1].last = (state & 1) == 0;
++        } else {
++            pmsg_log("[PONG_KEYS] fail: PIN verify failed id[0]=0x%02x id[1]=0x%02x c[0]=0x%02x c[6]=0x%02x\n",
++                     pin_id[0], pin_id[1], c[0], c[6]);
++        }
+     }
+-    if (read_registers(&pin,4,id,2) && id[0]==0x10 && id[1]>=0x10 && id[1]<=0x13 &&
+-        read_registers(&pin,0x40,c,8) && (c[0]&3)==0 && (c[2]&7)<4 && (c[6]&0x80) &&
+-        read_registers(&pin,0x10,&state,1)) {
+-        keys[1].usable=true;keys[1].last=(state&1)==0;
++
++    if (!(keys[0].usable || keys[1].usable || keys[2].usable)) {
++        pmsg_log("[PONG_KEYS] fail: no usable keys (mask=0x%x)\n", buttons_mask);
++        printf("Pong keys: no verified input peripheral; SKIP\n");
++        goto out;
+     }
+-    if (!(keys[0].usable || keys[1].usable) || !pong_buttons_device_ready()) {
+-        printf("Pong keys: no verified input peripheral; SKIP\n");goto out;
++
++    if (!pong_buttons_device_ready()) {
++        pmsg_log("[PONG_KEYS] fail: devfs /dev/pong-buttons ready failed\n");
++        printf("Pong keys: devfs device not ready; SKIP\n");
++        goto out;
+     }
+-    for (unsigned i=0;i<3;i++) keys[i].live=keys[i].usable && !keys[i].last;
+-    printf("Pong keys: arbiter v%u channels=%u PON=%u GPIO6=%u; power=%u up=%u down=%u\n",
+-        v7?7:5,channels,pon.channel,pin.channel,keys[0].usable,keys[1].usable,keys[2].usable);
+-    irq_mode=enable_irqs();
+-    unsigned failures=0,irq_burst=0;uint64_t irq_window=mach_absolute_time();
++
++    for (unsigned i = 0; i < 3; i++) keys[i].live = keys[i].usable && !keys[i].last;
++
++    pmsg_log("[PONG_KEYS] ready: arbiter v%u ch=%u PON_ch=%u PIN_ch=%u pwr=%u up=%u dn=%u mask=0x%x\n",
++             v7 ? 7 : 5, channels, pon.channel, pin.channel,
++             keys[0].usable, keys[1].usable, keys[2].usable, buttons_mask);
++    printf("Pong keys: arbiter v%u channels=%u PON=%u GPIO=%u; power=%u up=%u down=%u mask=0x%x\n",
++           v7 ? 7 : 5, channels, pon.channel, pin.channel,
++           keys[0].usable, keys[1].usable, keys[2].usable, buttons_mask);
++
++    unsigned failures = 0;
++    bool gen3 = (id[1] == 9);
++    uint8_t pwr_mask = gen3 ? 0x80 : 0x01;
++    uint8_t voldn_mask = gen3 ? 0x40 : 0x02;
++
+     for (;;) {
+-        bool good=true;
+-        if(irq_mode) {
+-            uint64_t elapsed=0;absolutetime_to_nanoseconds(mach_absolute_time()-irq_window,&elapsed);
+-            if(elapsed>=NSEC_PER_SEC){irq_burst=0;irq_window=mach_absolute_time();}
+-            if(++irq_burst>128) {disable_irqs();
+-                printf("Pong keys: shared interrupt remained pending; use bounded read fallback\n");}
+-        }
+-        if (keys[0].usable) {
+-            if (read_registers(&pon,0x10,&state,1)) {
+-                look(&keys[0],(state&0x80)!=0);look(&keys[2],(state&0x40)!=0);
+-            } else good=false;
++        bool good = true;
++
++        if (keys[0].usable || keys[2].usable) {
++            if (read_registers(&pon, 0x10, &state, 1)) {
++                if (keys[0].usable) look(&keys[0], (state & pwr_mask) != 0, 0);
++                if (keys[2].usable) look(&keys[2], (state & voldn_mask) != 0, 2);
++            } else {
++                good = false;
++            }
+         }
++
+         if (keys[1].usable) {
+-            if (read_registers(&pin,0x10,&state,1)) look(&keys[1],(state&1)==0);
+-            else good=false;
++            if (read_registers(&pin, 0x10, &state, 1)) {
++                look(&keys[1], (state & 1) == 0, 1);
++            } else {
++                good = false;
++            }
+         }
+-        failures=good?0:failures+1;
+-        if (failures>=8) {
+-            for (unsigned i=0;i<3;i++) if (keys[i].down)
+-                pong_touch_post(PONG_BUTTON_UP,keys[i].code,0,0);
+-            printf("Pong keys: repeated observer read failure; stop optional polling\n");break;
++
++        failures = good ? 0 : failures + 1;
++        if (failures >= 8) {
++            for (unsigned i = 0; i < 3; i++) {
++                if (keys[i].down) pong_touch_post(PONG_BUTTON_UP, keys[i].code, 0, 0);
++            }
++            pmsg_log("[PONG_KEYS] fail: repeated observer read failures; stopping\n");
++            printf("Pong keys: repeated observer read failure; stop optional polling\n");
++            break;
+         }
+-        /* A detected edge needs its debounce confirmation promptly. Waiting
+-         * 64ms for a second IRQ sample can lose a short press/release pair. */
+-        bool settling=false;
+-        for(unsigned i=0;i<3;i++)
+-            if(keys[i].usable && keys[i].live && keys[i].last!=keys[i].down)settling=true;
+-        if(irq_mode) {
+-            acknowledge_key_irq(&pon,0xc0);acknowledge_key_irq(&pin,1);
+-            /* A bounded recheck covers debounce and a missed edge; it is
+-             * also the authority for releasing a coalesced userland press. */
+-            uint32_t seen=__atomic_load_n(&irq_events,__ATOMIC_ACQUIRE);
+-            assert_wait_timeout((event_t)&irq_events,THREAD_UNINT,settling?8:64,NSEC_PER_MSEC);
+-            wr(pdc+0x114,rd(pdc+0x114)|8u);
+-            if(seen!=__atomic_load_n(&irq_events,__ATOMIC_ACQUIRE))clear_wait(current_thread(),THREAD_AWAKENED);
+-            else thread_block(THREAD_CONTINUE_NULL);
+-        } else {
+-            uint64_t deadline;clock_interval_to_deadline(settling?8:16,NSEC_PER_MSEC,&deadline);
+-            assert_wait_deadline((event_t)keys,THREAD_UNINT,deadline);thread_block(THREAD_CONTINUE_NULL);
++
++        /* Check if any key is currently transitioning (settling debounce) */
++        bool settling = false;
++        for (unsigned i = 0; i < 3; i++) {
++            if (keys[i].usable && keys[i].live && keys[i].last != keys[i].down) settling = true;
+         }
++
++        /* Polling interval: 16ms during settling, 32ms steady (>= 16ms rule) */
++        uint64_t deadline = 0;
++        clock_interval_to_deadline(settling ? 16 : 32, NSEC_PER_MSEC, &deadline);
++        assert_wait_deadline((event_t)keys, THREAD_UNINT, deadline);
++        thread_block(THREAD_CONTINUE_NULL);
+     }
++
+ out:
+-    disable_irqs();
+     thread_terminate(current_thread());
+ }
+ 
+ void pong_buttons_init(void)
+ {
+-    uint32_t enabled=0;thread_t t;
+-    if (!PE_parse_boot_argn("pong_buttons",&enabled,sizeof(enabled)) || !enabled) return;
+-    if (kernel_thread_start(keys_thread,NULL,&t)==KERN_SUCCESS) thread_deallocate(t);
++    thread_t th = THREAD_NULL;
++    if (!PE_parse_boot_argn("pong_buttons", &buttons_mask, sizeof(buttons_mask)) || (buttons_mask & 3) == 0) return;
++    if (kernel_thread_start(keys_thread, NULL, &th) == KERN_SUCCESS) thread_deallocate(th);
+ }
+ #endif
