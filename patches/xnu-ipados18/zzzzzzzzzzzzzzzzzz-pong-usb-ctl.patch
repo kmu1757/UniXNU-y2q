@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,1184 @@
+@@ -0,0 +1,1266 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -53,7 +53,8 @@ index 0000000..2222222
 + *  - MUIC: MAX77705 I2C slave 0x25 via TLMM North GPIO 28 (SDA) / 29 (SCL)
 + *    (ref/gts7xl-mainline/tools/usbroute.c, MIT; ref/G986N-iOS, BSD-2-Clause)
 + *  - DWC3 core: 0x0a600000, QSCRATCH glue: 0x0a6f8800 (ref/UniXNU-pong, BSD-2-Clause-Patent)
-+ *  - Apps SMMU: 0x15000000, SID 0 bypass configuration
++ *  - GCC Clocks/GDSC: 0x00100000 (SM8250 gcc-sm8250.c, USB30_PRIM_GDSC=0xf004, Master CBCR=0xf010)
++ *  - Apps SMMU: 0x15000000, SID 0 read-only check (SMMUv2 global registers owned by TZ/Hypervisor)
 + *  - IMEM reboot: 0x146bf65c = 0x77665502 (ref/gts7xl-mainline/linux-patches)
 + *  - Ramoops console: 0x9FA40000 (0001-pong-darwin24.patch)
 + *  - Framebuffer: vinfo.v_baseaddr (2800x1752 BGRA)
@@ -91,7 +92,7 @@ index 0000000..2222222
 +extern void pong_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 +extern struct vc_info vinfo;
 +
-+/* Diagnostic pmsg output */
++/* Diagnostic pmsg output with synchronous barrier flush */
 +static void
 +pmsg_log(const char *fmt, ...)
 +{
@@ -102,6 +103,7 @@ index 0000000..2222222
 +	va_end(ap);
 +	if (n > 0) {
 +		pong_ramoops_diagnostic_write(buf, n);
++		__asm__ volatile("dsb sy" ::: "memory");
 +	}
 +}
 +
@@ -118,7 +120,15 @@ index 0000000..2222222
 +#define STRETCH_US              1000
 +#define MUIC_I2C_ADDR           0x25
 +
-+/* SMMUv2 Base */
++/* GCC Clock & Power registers for SM8250 (SM-T970) */
++#define GCC_PHYS_BASE           0x00100000UL
++#define GCC_MAP_SIZE            0x00020000UL
++#define GCC_USB30_PRIM_GDSCR    0x0f004
++#define GCC_USB30_PRIM_MASTER_CBCR 0x0f010
++#define GCC_USB30_PRIM_MOCK_CBCR   0x0f018
++#define GCC_USB30_PRIM_SLEEP_CBCR  0x0f024
++
++/* Apps SMMU Base */
 +#define APPS_SMMU_PHYS          0x15000000UL
 +#define APPS_SMMU_SIZE          0x100000UL
 +
@@ -389,46 +399,66 @@ index 0000000..2222222
 +	return ok1 && ok2;
 +}
 +
-+/* SMMUv2 SID 0 Bypass */
++/* GCC Clocks and Power Domain Pre-Check (SM8250 / SM-T970) */
 +static bool
-+pong_smmu_setup_sid0_bypass(vm_offset_t smmu)
++pong_usb_check_clocks_and_power(void)
++{
++	vm_offset_t gcc_base = ml_io_map(GCC_PHYS_BASE, GCC_MAP_SIZE);
++	if (!gcc_base) {
++		pmsg_log("[PONG_USB] gcc: ml_io_map failed (skip check)\n");
++		return true;
++	}
++	uint32_t gdscr = *(volatile uint32_t *)(gcc_base + GCC_USB30_PRIM_GDSCR);
++	uint32_t master_cbcr = *(volatile uint32_t *)(gcc_base + GCC_USB30_PRIM_MASTER_CBCR);
++	uint32_t mock_cbcr = *(volatile uint32_t *)(gcc_base + GCC_USB30_PRIM_MOCK_CBCR);
++	uint32_t sleep_cbcr = *(volatile uint32_t *)(gcc_base + GCC_USB30_PRIM_SLEEP_CBCR);
++
++	pmsg_log("[PONG_USB] gcc: gdscr=0x%08x master=0x%08x mock=0x%08x sleep=0x%08x\n",
++	    gdscr, master_cbcr, mock_cbcr, sleep_cbcr);
++
++	/* Check GDSC power status (bit 31: PWR_ON) */
++	if (!(gdscr & (1u << 31))) {
++		pmsg_log("[PONG_USB] fail: USB30_PRIM_GDSC is not powered on (0x%08x)\n", gdscr);
++		return false;
++	}
++
++	/* Check Master clock status (bit 31: CLK_OFF, bit 0: ENABLE) */
++	if ((master_cbcr & (1u << 31)) || !(master_cbcr & 1u)) {
++		pmsg_log("[PONG_USB] fail: USB30 master clk is not active (0x%08x)\n", master_cbcr);
++		return false;
++	}
++
++	return true;
++}
++
++/* SMMUv2 SID 0 Check (Read-Only)
++ * On Qualcomm SM8250, Apps SMMU global register space (0x15000000)
++ * is owned by TrustZone / Hypervisor. Non-secure EL1 must NOT write
++ * to global SMR/S2CR registers (triggers SError / XPU reset).
++ * UEFI already configured SID 0 bypass during bootloader handoff.
++ */
++static bool
++pong_smmu_check_sid0_bypass(vm_offset_t smmu)
 +{
 +	uint32_t idr0 = *(volatile uint32_t *)(smmu + 0x20);
 +	unsigned count = idr0 & 0xff;
 +	if (count > 128) count = 128;
 +	int sid0_slot = -1;
-+	int free_slot = -1;
 +
 +	for (unsigned i = 0; i < count; i++) {
 +		uint32_t smr = *(volatile uint32_t *)(smmu + 0x800 + 4 * i);
-+		if (!(smr & 0x80000000U)) {
-+			if (free_slot < 0) free_slot = (int)i;
-+			continue;
-+		}
++		if (!(smr & 0x80000000U)) continue;
 +		if ((smr & 0x7fff) == 0) {
 +			sid0_slot = (int)i;
-+			break;
++			uint32_t s2cr = *(volatile uint32_t *)(smmu + 0xc00 + 4 * i);
++			pmsg_log("[PONG_USB] smmu: SID 0 found slot=%d smr=0x%08x s2cr=0x%08x (ro)\n",
++			    sid0_slot, smr, s2cr);
++			return true;
 +		}
 +	}
 +
-+	if (sid0_slot >= 0) {
-+		uint32_t s2cr = *(volatile uint32_t *)(smmu + 0xc00 + 4 * sid0_slot);
-+		if (((s2cr >> 16) & 3) != 1) {
-+			*(volatile uint32_t *)(smmu + 0xc00 + 4 * sid0_slot) = (s2cr & ~(3u << 16)) | (1u << 16);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+		}
-+		pmsg_log("[PONG_USB] smmu: SID 0 bypass slot=%d\n", sid0_slot);
-+		return true;
-+	} else if (free_slot >= 0) {
-+		*(volatile uint32_t *)(smmu + 0xc00 + 4 * free_slot) = (1u << 16);
-+		*(volatile uint32_t *)(smmu + 0x800 + 4 * free_slot) = 0x80000000U | 0;
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		pmsg_log("[PONG_USB] smmu: SID 0 bypass free_slot=%d\n", free_slot);
-+		return true;
-+	} else {
-+		pmsg_log("[PONG_USB] smmu: warning no free stream slot\n");
-+		return false;
-+	}
++	pmsg_log("[PONG_USB] smmu: SID 0 not found in %u slots (continuing)\n", count);
++	return false;
 +}
 +
 +/* DWC3 Endpoint Commands and Transfers */
@@ -601,177 +631,157 @@ index 0000000..2222222
 +	}
 +}
 +
-+/* Process scan callback for 'status' command */
-+struct proc_scan_state {
-+	bool launchd;
-+	bool backboardd;
-+	bool SpringBoard;
++static void
++send_str(const char *s)
++{
++	send_response(s, (unsigned)strlen(s));
++}
++
++/* Command Execution Handlers */
++struct proc_search {
++	const char *target;
++	bool found;
 +};
 +
 +static int
-+proc_scan_callback(proc_t p, void *arg)
++proc_find_callout(proc_t p, void *arg)
 +{
-+	struct proc_scan_state *st = (struct proc_scan_state *)arg;
++	struct proc_search *ps = (struct proc_search *)arg;
 +	const char *name = proc_best_name(p);
-+	if (name) {
-+		if (!st->launchd && strcmp(name, "launchd") == 0) st->launchd = true;
-+		if (!st->backboardd && strcmp(name, "backboardd") == 0) st->backboardd = true;
-+		if (!st->SpringBoard && strcmp(name, "SpringBoard") == 0) st->SpringBoard = true;
++	if (name && strcmp(name, ps->target) == 0) {
++		ps->found = true;
++		return 1;
 +	}
 +	return 0;
 +}
 +
-+/* Stream console ring for 'log' command */
 +static void
-+stream_console_log(void)
++cmd_handle_status(void)
++{
++	char reply[256];
++	uint64_t uptime_sec = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_sec);
++	uptime_sec /= NSEC_PER_SEC;
++
++	unsigned free_pages = vm_page_free_count;
++	unsigned free_mb = (free_pages * 4096u) / (1024u * 1024u);
++
++	struct proc_search ps_launchd = {"launchd", false};
++	struct proc_search ps_bbd = {"backboardd", false};
++	struct proc_search ps_sb = {"SpringBoard", false};
++
++	proc_iterate(PROC_ALLPROCLIST, proc_find_callout, &ps_launchd, NULL, NULL);
++	proc_iterate(PROC_ALLPROCLIST, proc_find_callout, &ps_bbd, NULL, NULL);
++	proc_iterate(PROC_ALLPROCLIST, proc_find_callout, &ps_sb, NULL, NULL);
++
++	snprintf(reply, sizeof(reply),
++	    "STATUS: OK\nuptime: %llus\nfree_pages: %u (%u MB)\nproc_launchd: %s\nproc_backboardd: %s\nproc_SpringBoard: %s\n",
++	    uptime_sec, free_pages, free_mb,
++	    ps_launchd.found ? "RUNNING" : "NOT_FOUND",
++	    ps_bbd.found ? "RUNNING" : "NOT_FOUND",
++	    ps_sb.found ? "RUNNING" : "NOT_FOUND");
++	send_str(reply);
++}
++
++static void
++cmd_handle_log(void)
 +{
 +	if (!ramoops_console_base) {
-+		ramoops_console_base = ml_io_map(PONG_RAMOOPS_PHYS_BASE + PONG_RAMOOPS_CONSOLE_OFFSET,
-+		    PONG_RAMOOPS_CONSOLE_BYTES);
++		ramoops_console_base = ml_io_map(PONG_RAMOOPS_PHYS_BASE + PONG_RAMOOPS_CONSOLE_OFFSET, PONG_RAMOOPS_CONSOLE_BYTES);
 +	}
 +	if (!ramoops_console_base) {
-+		send_response("[LOG] error: ml_io_map ramoops failed\n", 37);
++		send_str("ERROR: cannot map ramoops console\n");
 +		return;
 +	}
-+	struct pong_ramoops_header *h = (struct pong_ramoops_header *)ramoops_console_base;
-+	if (h->sig != PONG_RAMOOPS_MAGIC) {
-+		send_response("[LOG] error: ramoops magic invalid\n", 35);
++
++	struct pong_ramoops_header *hdr = (struct pong_ramoops_header *)ramoops_console_base;
++	if (hdr->sig != PONG_RAMOOPS_MAGIC) {
++		send_str("ERROR: ramoops console bad magic\n");
 +		return;
 +	}
++
 +	uint32_t capacity = PONG_RAMOOPS_CONSOLE_BYTES - PONG_RAMOOPS_HEADER_BYTES;
-+	uint32_t start = h->start;
-+	uint32_t size = h->size;
-+	if (size > capacity) size = capacity;
-+	if (start >= capacity) start = 0;
-+
-+	if (size == 0) {
-+		send_response("[LOG] (ring buffer empty)\n[LOG_END]\n", 36);
++	uint32_t start = hdr->start;
++	uint32_t size = hdr->size;
++	if (start >= capacity || size > capacity) {
++		send_str("ERROR: corrupt ramoops indices\n");
 +		return;
 +	}
 +
-+	send_response("[LOG_START]\n", 12);
-+	volatile uint8_t *data = (volatile uint8_t *)(ramoops_console_base + PONG_RAMOOPS_HEADER_BYTES);
++	send_str("[LOG_START]\n");
++	const char *buffer = (const char *)(ramoops_console_base + PONG_RAMOOPS_HEADER_BYTES);
 +
-+	if (size >= capacity) {
-+		/* Ring wrapped: part 1 from start to capacity, part 2 from 0 to start */
-+		if (capacity > start) {
-+			send_response((const void *)(data + start), capacity - start);
++	if (size == capacity) {
++		uint32_t tail = capacity - start;
++		if (tail > 0) send_response(buffer + start, tail);
++		if (start > 0) send_response(buffer, start);
++	} else {
++		if (size > 0) send_response(buffer, size);
++	}
++	send_str("\n[LOG_END]\n");
++}
++
++static void
++cmd_handle_reboot(bool to_recovery)
++{
++	if (to_recovery) {
++		if (!imem_base) {
++			imem_base = ml_io_map(IMEM_PHYS_BASE, IMEM_SIZE);
 +		}
-+		if (start > 0) {
-+			send_response((const void *)data, start);
++		if (imem_base) {
++			*(volatile uint32_t *)(imem_base + IMEM_RECOVERY_OFFSET) = IMEM_MAGIC_RECOVERY;
++			__asm__ volatile("dsb sy" ::: "memory");
++			pmsg_log("[PONG_USB] recovery flag 0x%08x set\n", IMEM_MAGIC_RECOVERY);
++			send_str("reboot-recovery: ok (rebooting to TWRP)\n");
++		} else {
++			send_str("reboot-recovery: error mapping IMEM; falling back to normal reboot\n");
 +		}
 +	} else {
-+		/* Ring not wrapped: 0 to size */
-+		send_response((const void *)data, size);
++		send_str("reboot: ok\n");
 +	}
-+	send_response("\n[LOG_END]\n", 11);
-+}
 +
-+/* Thread snapshot walk callback for 'threads' command */
-+static int
-+pong_threads_snap_cb(proc_t p, void *arg)
-+{
-+	task_t task = proc_task(p);
-+	const char *comm = proc_best_name(p);
-+	int pid = proc_pid(p);
-+	uint32_t sec = *(uint32_t *)arg;
-+	if (task && comm) {
-+		pong_dump_task_threads_pmsg(task, comm, pid, sec);
-+	}
-+	return 0;
-+}
-+
-+static void
-+handle_threads(void)
-+{
-+	uint64_t uptime_ns = 0;
-+	absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
-+	uint32_t sec = (uint32_t)(uptime_ns / 1000000000ULL);
-+	pmsg_log("[PONG_USB] cmd: threads (snap sec=%u)\n", sec);
-+	proc_iterate(PROC_ALLPROCLIST, pong_threads_snap_cb, &sec, NULL, NULL);
-+	send_response("threads: ok (snapshot written to pmsg ramoops)\n", 48);
-+}
-+
-+/* Touch Input Injection Helpers (Stage 3) */
-+static void
-+handle_tap(unsigned x, unsigned y)
-+{
-+	if (x >= 2800) x = 2799;
-+	if (y >= 1752) y = 1751;
-+	uint32_t nx = (x * 65535U) / 2800U;
-+	uint32_t ny = (y * 65535U) / 1752U;
-+	pong_touch_post(1, 0, nx, ny); /* PONG_TOUCH_DOWN = 1 */
 +	delay_for_interval(50, NSEC_PER_MSEC);
-+	pong_touch_post(3, 0, nx, ny); /* PONG_TOUCH_UP = 3 */
-+	pmsg_log("[PONG_USB] tap (%u,%u) -> (%u,%u)\n", x, y, nx, ny);
-+	send_response("tap: ok\n", 8);
-+}
-+
-+static void
-+handle_swipe(unsigned x1, unsigned y1, unsigned x2, unsigned y2, unsigned ms)
-+{
-+	if (x1 >= 2800) x1 = 2799;
-+	if (y1 >= 1752) y1 = 1751;
-+	if (x2 >= 2800) x2 = 2799;
-+	if (y2 >= 1752) y2 = 1751;
-+	if (ms < 50) ms = 50;
-+	if (ms > 2000) ms = 2000;
-+
-+	uint32_t sx = (x1 * 65535U) / 2800U;
-+	uint32_t sy = (y1 * 65535U) / 1752U;
-+	uint32_t ex = (x2 * 65535U) / 2800U;
-+	uint32_t ey = (y2 * 65535U) / 1752U;
-+
-+	unsigned steps = ms / 10;
-+	if (steps == 0) steps = 1;
-+
-+	pong_touch_post(1, 0, sx, sy); /* DOWN */
-+	delay_for_interval(10, NSEC_PER_MSEC);
-+
-+	for (unsigned i = 1; i < steps; i++) {
-+		uint32_t cx = (uint32_t)((int32_t)sx + (int32_t)(ex - sx) * (int32_t)i / (int32_t)steps);
-+		uint32_t cy = (uint32_t)((int32_t)sy + (int32_t)(ey - sy) * (int32_t)i / (int32_t)steps);
-+		pong_touch_post(2, 0, cx, cy); /* MOVE */
-+		delay_for_interval(10, NSEC_PER_MSEC);
++	if (to_recovery && imem_base) {
++		reboot_kernel(RB_QUICK, "reboot recovery");
++	} else {
++		reboot_kernel(RB_AUTOBOOT, NULL);
 +	}
-+
-+	pong_touch_post(3, 0, ex, ey); /* UP */
-+	pmsg_log("[PONG_USB] swipe (%u,%u)->(%u,%u) %ums\n", x1, y1, x2, y2, ms);
-+	send_response("swipe: ok\n", 10);
 +}
 +
-+/* Raw Framebuffer Screenshot Streaming (Stage 3) */
 +static void
-+handle_screenshot(void)
++cmd_handle_screenshot(void)
 +{
-+	pmsg_log("[PONG_USB] cmd: screenshot\n");
-+	if (!vinfo.v_baseaddr || vinfo.v_width == 0 || vinfo.v_height == 0) {
-+		send_response("SCREENSHOT_ERROR: framebuffer not mapped\n", 41);
++	if (!vinfo.v_baseaddr) {
++		send_str("ERROR: video framebuffer not available\n");
 +		return;
 +	}
-+	uint32_t w = vinfo.v_width;
-+	uint32_t h = vinfo.v_height;
-+	uint32_t rowbytes = vinfo.v_rowbytes;
-+	uint32_t total_bytes = h * rowbytes;
++	unsigned width = (unsigned)vinfo.v_width;
++	unsigned height = (unsigned)vinfo.v_height;
++	unsigned depth = (unsigned)vinfo.v_depth;
++	unsigned rowbytes = (unsigned)vinfo.v_rowbytes;
 +
-+	char header[64];
-+	int n = snprintf(header, sizeof(header), "SCREENSHOT %u %u BGRA %u\n", w, h, total_bytes);
-+	if (n > 0) {
-+		send_response(header, (unsigned)n);
++	if (width != 2800 || height != 1752 || depth != 32) {
++		send_str("ERROR: unexpected framebuffer geometry\n");
++		return;
 +	}
 +
++	char header[64];
++	unsigned total_bytes = rowbytes * height;
++	snprintf(header, sizeof(header), "SCREENSHOT %u %u BGRA %u\n", width, height, total_bytes);
++	send_str(header);
++
 +	const uint8_t *fb = (const uint8_t *)vinfo.v_baseaddr;
-+	uint32_t sent = 0;
++	unsigned sent = 0;
 +	while (sent < total_bytes && ctl_configured) {
-+		uint32_t chunk = total_bytes - sent;
++		unsigned chunk = total_bytes - sent;
 +		if (chunk > 4096) chunk = 4096;
 +
-+		for (unsigned w_idx = 0; w_idx < 500 && ctl_tx_active; w_idx++) {
++		for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
 +			process_events();
 +			delay_for_interval(1, NSEC_PER_MSEC);
 +		}
 +		if (ctl_tx_active) {
-+			pmsg_log("[PONG_USB] screenshot: tx timeout\n");
++			pmsg_log("[PONG_USB] screenshot tx drop\n");
 +			return;
 +		}
 +
@@ -780,120 +790,152 @@ index 0000000..2222222
 +		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, chunk, DWC3_TRBCTL_NORMAL);
 +		sent += chunk;
 +	}
-+
-+	for (unsigned w_idx = 0; w_idx < 500 && ctl_tx_active; w_idx++) {
++	for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
 +		process_events();
 +		delay_for_interval(1, NSEC_PER_MSEC);
 +	}
 +}
 +
-+/* Command Dispatcher (Stage 3: complete command set) */
 +static void
-+handle_command(const char *cmd)
++cmd_handle_tap(const char *args)
 +{
-+	if (strcmp(cmd, "ping") == 0) {
-+		pmsg_log("[PONG_USB] cmd: ping -> pong\n");
-+		send_response("pong\n", 5);
-+	} else if (strcmp(cmd, "status") == 0) {
-+		pmsg_log("[PONG_USB] cmd: status\n");
-+		uint64_t uptime_ns = 0;
-+		absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
-+		uint32_t uptime_sec = (uint32_t)(uptime_ns / 1000000000ULL);
-+		unsigned free_pages = vm_page_free_count;
-+		unsigned free_mb = (unsigned)((uint64_t)free_pages * 4096 / (1024 * 1024));
++	const char *p = args;
++	unsigned x = parse_uint(&p);
++	unsigned y = parse_uint(&p);
 +
-+		struct proc_scan_state st = { false, false, false };
-+		proc_iterate(PROC_ALLPROCLIST, proc_scan_callback, &st, NULL, NULL);
-+
-+		char buf[256];
-+		int n = snprintf(buf, sizeof(buf),
-+		    "STATUS: OK\n"
-+		    "uptime: %us\n"
-+		    "free_pages: %u (%u MB)\n"
-+		    "proc_launchd: %s\n"
-+		    "proc_backboardd: %s\n"
-+		    "proc_SpringBoard: %s\n",
-+		    uptime_sec, free_pages, free_mb,
-+		    st.launchd ? "RUNNING" : "NOT_FOUND",
-+		    st.backboardd ? "RUNNING" : "NOT_FOUND",
-+		    st.SpringBoard ? "RUNNING" : "NOT_FOUND");
-+		if (n > 0) {
-+			send_response(buf, (unsigned)n);
-+		}
-+	} else if (strcmp(cmd, "log") == 0) {
-+		pmsg_log("[PONG_USB] cmd: log\n");
-+		stream_console_log();
-+	} else if (strcmp(cmd, "reboot") == 0) {
-+		pmsg_log("[PONG_USB] cmd: reboot\n");
-+		send_response("reboot: ok\n", 11);
-+		delay_for_interval(50, NSEC_PER_MSEC);
-+		reboot_kernel(RB_AUTOBOOT, NULL);
-+	} else if (strcmp(cmd, "reboot-recovery") == 0 || strcmp(cmd, "reboot_recovery") == 0) {
-+		pmsg_log("[PONG_USB] cmd: reboot-recovery\n");
-+		if (!imem_base) {
-+			imem_base = ml_io_map(IMEM_PHYS_BASE, IMEM_SIZE);
-+		}
-+		if (imem_base) {
-+			*(volatile uint32_t *)(imem_base + IMEM_RECOVERY_OFFSET) = IMEM_MAGIC_RECOVERY;
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			pmsg_log("[PONG_USB] imem: 0x146bf65c = 0x77665502 latched\n");
-+		}
-+		send_response("reboot-recovery: ok (rebooting to TWRP)\n", 39);
-+		delay_for_interval(50, NSEC_PER_MSEC);
-+		reboot_kernel(RB_QUICK, "reboot recovery");
-+	} else if (strcmp(cmd, "screenshot") == 0) {
-+		handle_screenshot();
-+	} else if (strncmp(cmd, "tap ", 4) == 0) {
-+		const char *p = cmd + 4;
-+		unsigned x = parse_uint(&p);
-+		unsigned y = parse_uint(&p);
-+		handle_tap(x, y);
-+	} else if (strncmp(cmd, "swipe ", 6) == 0) {
-+		const char *p = cmd + 6;
-+		unsigned x1 = parse_uint(&p);
-+		unsigned y1 = parse_uint(&p);
-+		unsigned x2 = parse_uint(&p);
-+		unsigned y2 = parse_uint(&p);
-+		unsigned ms = parse_uint(&p);
-+		handle_swipe(x1, y1, x2, y2, ms);
-+	} else if (strcmp(cmd, "threads") == 0) {
-+		handle_threads();
-+	} else {
-+		pmsg_log("[PONG_USB] unknown cmd: %s\n", cmd);
-+		send_response("ERR: unknown command\n", 21);
++	if (x > 65535 || y > 65535) {
++		send_str("ERROR: coordinates out of range (0..65535)\n");
++		return;
 +	}
++
++	pong_touch_post(1, 0, x, y); /* DOWN */
++	delay_for_interval(30, NSEC_PER_MSEC);
++	pong_touch_post(3, 0, x, y); /* UP */
++
++	char reply[64];
++	snprintf(reply, sizeof(reply), "tap: ok (%u, %u)\n", x, y);
++	send_str(reply);
 +}
 +
 +static void
-+feed_input(const uint8_t *data, unsigned size)
++cmd_handle_swipe(const char *args)
 +{
-+	for (unsigned i = 0; i < size; i++) {
++	const char *p = args;
++	unsigned x1 = parse_uint(&p);
++	unsigned y1 = parse_uint(&p);
++	unsigned x2 = parse_uint(&p);
++	unsigned y2 = parse_uint(&p);
++	unsigned duration_ms = parse_uint(&p);
++
++	if (duration_ms < 50) duration_ms = 50;
++	if (duration_ms > 5000) duration_ms = 5000;
++
++	unsigned steps = duration_ms / 10;
++	if (steps < 5) steps = 5;
++
++	pong_touch_post(1, 0, x1, y1); /* DOWN */
++	delay_for_interval(10, NSEC_PER_MSEC);
++
++	for (unsigned i = 1; i <= steps; i++) {
++		unsigned cur_x = x1 + (int)((int)x2 - (int)x1) * (int)i / (int)steps;
++		unsigned cur_y = y1 + (int)((int)y2 - (int)y1) * (int)i / (int)steps;
++		pong_touch_post(2, 0, cur_x, cur_y); /* MOVE */
++		delay_for_interval(10, NSEC_PER_MSEC);
++	}
++
++	pong_touch_post(3, 0, x2, y2); /* UP */
++
++	char reply[64];
++	snprintf(reply, sizeof(reply), "swipe: ok (%u,%u)->(%u,%u) in %ums\n", x1, y1, x2, y2, duration_ms);
++	send_str(reply);
++}
++
++static int
++proc_thread_snapshot_callout(proc_t p, __unused void *arg)
++{
++	task_t t = proc_task(p);
++	if (!t) return 0;
++	const char *name = proc_best_name(p);
++	if (!name) name = "unknown";
++	int pid = proc_pid(p);
++
++	uint64_t snap_sec = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &snap_sec);
++	snap_sec /= NSEC_PER_SEC;
++
++	pong_dump_task_threads_pmsg(t, name, pid, (uint32_t)snap_sec);
++	return 0;
++}
++
++static void
++cmd_handle_threads(void)
++{
++	proc_iterate(PROC_ALLPROCLIST, proc_thread_snapshot_callout, NULL, NULL, NULL);
++	send_str("threads: snapshot written to pmsg; use 'log' to read\n");
++}
++
++/* Dispatch Received Command String */
++static void
++dispatch_command(const char *cmd)
++{
++	pmsg_log("[PONG_USB] cmd: '%s'\n", cmd);
++
++	if (strcmp(cmd, "ping") == 0) {
++		send_str("pong\n");
++	} else if (strcmp(cmd, "status") == 0) {
++		cmd_handle_status();
++	} else if (strcmp(cmd, "log") == 0) {
++		cmd_handle_log();
++	} else if (strcmp(cmd, "reboot") == 0) {
++		cmd_handle_reboot(false);
++	} else if (strcmp(cmd, "reboot-recovery") == 0) {
++		cmd_handle_reboot(true);
++	} else if (strcmp(cmd, "screenshot") == 0) {
++		cmd_handle_screenshot();
++	} else if (strncmp(cmd, "tap ", 4) == 0) {
++		cmd_handle_tap(cmd + 4);
++	} else if (strncmp(cmd, "swipe ", 6) == 0) {
++		cmd_handle_swipe(cmd + 6);
++	} else if (strcmp(cmd, "threads") == 0) {
++		cmd_handle_threads();
++	} else {
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads\n");
++	}
++}
++
++/* Feed Incoming Bulk OUT Characters into Line Buffer */
++static void
++feed_input(const uint8_t *data, unsigned len)
++{
++	for (unsigned i = 0; i < len; i++) {
 +		char c = (char)data[i];
 +		if (c == '\r' || c == '\n') {
 +			if (cmd_len > 0) {
 +				cmd_buf[cmd_len] = '\0';
-+				handle_command(cmd_buf);
++				dispatch_command(cmd_buf);
 +				cmd_len = 0;
 +			}
-+		} else if (c >= 32 && c <= 126 && cmd_len < sizeof(cmd_buf) - 1) {
++		} else if (cmd_len + 1 < sizeof(cmd_buf)) {
 +			cmd_buf[cmd_len++] = c;
++		} else {
++			cmd_len = 0; /* Overflow: discard */
 +		}
 +	}
 +}
 +
-+/* Control Pipe Request Handler */
++/* EP0 Setup Packet Dispatch */
 +static void
 +handle_setup(void)
 +{
-+	volatile uint8_t *in = (volatile uint8_t *)(dma_wcomb + OFF_EP_DATA);
-+	uint8_t type = in[0];
-+	uint8_t req = in[1];
-+	uint16_t val = (uint16_t)(in[2] | (in[3] << 8));
-+	uint16_t idx = (uint16_t)(in[4] | (in[5] << 8));
-+	uint16_t len = (uint16_t)(in[6] | (in[7] << 8));
++	volatile const uint8_t *setup_pkt = (volatile const uint8_t *)(dma_wcomb + OFF_EP_DATA);
++	uint8_t type = setup_pkt[0];
++	uint8_t req = setup_pkt[1];
++	uint16_t val = (uint16_t)setup_pkt[2] | ((uint16_t)setup_pkt[3] << 8);
++	uint16_t idx = (uint16_t)setup_pkt[4] | ((uint16_t)setup_pkt[5] << 8);
++	uint16_t len = (uint16_t)setup_pkt[6] | ((uint16_t)setup_pkt[7] << 8);
++
 +	ctl_control_bytes = len;
 +	ctl_status_dep = (type & 0x80) ? 0 : 1;
-+
 +	uint8_t *out = (uint8_t *)(dma_wcomb + OFF_EP_DATA + 0x100);
 +	unsigned resp_len = 0;
 +
@@ -1095,11 +1137,147 @@ index 0000000..2222222
 +	}
 +}
 +
-+/* Worker Thread */
++/* Deferred USB Control Thread */
 +static void
-+pong_usb_ctl_worker(__unused void *param, __unused wait_result_t wr)
++pong_usb_ctl_thread(void *param, __unused wait_result_t wr)
 +{
-+	pmsg_log("[PONG_USB] ready: listening on CDC-ACM\n");
++	uint32_t delay_sec = (uint32_t)(uintptr_t)param;
++	if (delay_sec > 0) {
++		pmsg_log("[PONG_USB] delaying USB init by %u sec...\n", delay_sec);
++		printf("Pong USB: delaying init by %u sec\n", delay_sec);
++		for (uint32_t s = 0; s < delay_sec; s++) {
++			delay_for_interval(1, NSEC_PER_SEC);
++		}
++	}
++
++	pmsg_log("[PONG_USB] step 1: checking GCC clocks and GDSC...\n");
++	if (!pong_usb_check_clocks_and_power()) {
++		pmsg_log("[PONG_USB] fail: clock/power check failed; aborting\n");
++		thread_terminate(current_thread());
++		return;
++	}
++
++	pmsg_log("[PONG_USB] step 2: mapping TLMM North 0x%lx...\n", (unsigned long)TLMM_NORTH_PHYS);
++	tlmm_base = ml_io_map(TLMM_NORTH_PHYS, TLMM_SIZE);
++	if (!tlmm_base) {
++		pmsg_log("[PONG_USB] fail: ml_io_map(TLMM_NORTH)\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	cfg_sda = rd(GPIO_CFG(tlmm_base, PIN_SDA)) & ~(CFG_FUNCTION | CFG_OUTPUT_ENABLE);
++	cfg_scl = rd(GPIO_CFG(tlmm_base, PIN_SCL)) & ~(CFG_FUNCTION | CFG_OUTPUT_ENABLE);
++	wr(GPIO_CFG(tlmm_base, PIN_SDA), cfg_sda);
++	wr(GPIO_CFG(tlmm_base, PIN_SCL), cfg_scl);
++	spin_us(100);
++
++	pmsg_log("[PONG_USB] step 2b: routing MAX77705 MUIC...\n");
++	if (pong_muic_route()) {
++		pmsg_log("[PONG_USB] muic: i2c slave 0x25 route ok\n");
++	} else {
++		pmsg_log("[PONG_USB] muic: warning route no ack\n");
++	}
++
++	pmsg_log("[PONG_USB] step 3: checking Apps SMMU 0x%lx (read-only)...\n", (unsigned long)APPS_SMMU_PHYS);
++	smmu_base = ml_io_map(APPS_SMMU_PHYS, APPS_SMMU_SIZE);
++	if (smmu_base) {
++		pong_smmu_check_sid0_bypass(smmu_base);
++	}
++
++	pmsg_log("[PONG_USB] step 4: allocating DMA contiguous buffer (32 KiB)...\n");
++	dma_phys = 0;
++	dma_virt = IOMallocContiguous(USB_DMA_BYTES, 4096, &dma_phys);
++	if (!dma_virt || !dma_phys) {
++		pmsg_log("[PONG_USB] fail: IOMallocContiguous 32K\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	dma_wcomb = ml_io_map_wcomb((vm_offset_t)dma_phys, USB_DMA_BYTES);
++	if (!dma_wcomb) {
++		pmsg_log("[PONG_USB] fail: ml_io_map_wcomb DMA\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	memset((void *)dma_wcomb, 0, USB_DMA_BYTES);
++	__asm__ volatile("dsb sy" ::: "memory");
++	pmsg_log("[PONG_USB] dma: allocated phys=0x%llx\n", (uint64_t)dma_phys);
++
++	pmsg_log("[PONG_USB] step 5: mapping DWC3 core 0x%lx and QSCRATCH 0x%lx...\n",
++	    (unsigned long)DWC3_CORE_PHYS, (unsigned long)QSCRATCH_PHYS);
++	core_base = ml_io_map(DWC3_CORE_PHYS, DWC3_CORE_SIZE);
++	qscratch_base = ml_io_map(QSCRATCH_PHYS, QSCRATCH_SIZE);
++	if (!core_base || !qscratch_base) {
++		pmsg_log("[PONG_USB] fail: ml_io_map core/qscratch\n");
++		thread_terminate(current_thread());
++		return;
++	}
++
++	pmsg_log("[PONG_USB] step 6: reading DWC3 core ID...\n");
++	uint32_t gsnpsid = core_r(DWC3_GSNPSID);
++	pmsg_log("[PONG_USB] dwc3: core id=0x%08x\n", gsnpsid);
++	uint32_t id = gsnpsid & 0xffff0000;
++	if (id != 0x55330000 && id != 0x55340000 && id != 0x33310000) {
++		pmsg_log("[PONG_USB] fail: unexpected core id 0x%08x\n", gsnpsid);
++		thread_terminate(current_thread());
++		return;
++	}
++
++	pmsg_log("[PONG_USB] step 7: reading GCTL, DCTL, DSTS...\n");
++	uint32_t gctl = core_r(DWC3_GCTL);
++	uint32_t dctl = core_r(DWC3_DCTL);
++	uint32_t dsts = core_r(DWC3_DSTS);
++	pmsg_log("[PONG_USB] dwc3: initial GCTL=0x%08x DCTL=0x%08x DSTS=0x%08x\n", gctl, dctl, dsts);
++
++	pmsg_log("[PONG_USB] step 8: stopping controller (DCTL & ~RUN_STOP)...\n");
++	core_w(DWC3_DCTL, dctl & ~DWC3_DCTL_RUN_STOP);
++
++	pmsg_log("[PONG_USB] step 9: polling DSTS.DEVCTRLHLT...\n");
++	for (unsigned i = 0; i < 25000; i++) {
++		if (core_r(DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) break;
++		spin_us(10);
++	}
++	pmsg_log("[PONG_USB] dwc3: halt poll done (DSTS=0x%08x)\n", core_r(DWC3_DSTS));
++
++	pmsg_log("[PONG_USB] step 10: clearing DEVTEN and DALEPENA...\n");
++	core_w(DWC3_DEVTEN, 0);
++	core_w(DWC3_DALEPENA, 0);
++
++	/* Soft reset is SKIPPED to preserve UEFI PHY clocks and state */
++	pmsg_log("[PONG_USB] step 11: skipping CSFTRST (preserving UEFI PHY/core state)\n");
++
++	pmsg_log("[PONG_USB] step 12: writing GUSB2PHYCFG0 (clearing SUSPHY/ENBLSLPM)...\n");
++	core_w(DWC3_GUSB2PHYCFG(0), core_r(DWC3_GUSB2PHYCFG(0)) & ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM));
++
++	pmsg_log("[PONG_USB] step 13: writing DCFG (device speed=high/full)...\n");
++	core_w(DWC3_DCFG, (core_r(DWC3_DCFG) & ~0x3ffu) | 0);
++
++	pmsg_log("[PONG_USB] step 14: setting event ring (phys=0x%llx, size=4096)...\n", (uint64_t)dma_phys);
++	core_w(DWC3_GEVNTADRLO(0), (uint32_t)dma_phys);
++	core_w(DWC3_GEVNTADRHI(0), (uint32_t)(dma_phys >> 32));
++	core_w(DWC3_GEVNTSIZ(0), 4096u | (1u << 31));
++	core_w(DWC3_GEVNTCOUNT(0), 0);
++	ctl_event_offset = 0;
++
++	pmsg_log("[PONG_USB] step 15: writing GCTL (PRTCAPDIR=device, DSBLCLKGTNG)...\n");
++	core_w(DWC3_GCTL, (core_r(DWC3_GCTL) & ~(3u << 12)) | (2u << 12) | DWC3_GCTL_DSBLCLKGTNG);
++
++	pmsg_log("[PONG_USB] step 16: calling reset_endpoints (DEPSTARTCFG/SETEPCONFIG)...\n");
++	reset_endpoints();
++
++	pmsg_log("[PONG_USB] step 17: writing DEVTEN=0x0f...\n");
++	core_w(DWC3_DEVTEN, 0x0f);
++
++	pmsg_log("[PONG_USB] step 18: applying QSCRATCH VBUS override...\n");
++	qs_w(0x30, qs_r(0x30) | (1u << 24));
++	qs_w(0x10, qs_r(0x10) | (1u << 20) | (1u << 28));
++	pmsg_log("[PONG_USB] qscratch: override latched (0x10=0x%08x 0x30=0x%08x)\n",
++	    qs_r(0x10), qs_r(0x30));
++
++	pmsg_log("[PONG_USB] step 19: starting controller (DCTL | RUN_STOP)...\n");
++	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
++
++	pmsg_log("[PONG_USB] step 20: ready: listening on CDC-ACM\n");
++	printf("Pong USB: ready, listening on CDC-ACM\n");
++
 +	while (1) {
 +		process_events();
 +		if (ctl_configured && ctl_dtr && !ctl_rx_active) {
@@ -1109,7 +1287,7 @@ index 0000000..2222222
 +	}
 +}
 +
-+/* Public Initialization Routine */
++/* Public Initialization Routine (Called from bsd_init) */
 +void
 +pong_usb_ctl_init(void)
 +{
@@ -1118,114 +1296,18 @@ index 0000000..2222222
 +		return;
 +	}
 +	ctl_enabled = true;
-+	pmsg_log("[PONG_USB] init: starting SM-T970 USB CDC-ACM control channel\n");
 +
-+	/* 1. Map TLMM and route MAX77705 MUIC */
-+	tlmm_base = ml_io_map(TLMM_NORTH_PHYS, TLMM_SIZE);
-+	if (!tlmm_base) {
-+		pmsg_log("[PONG_USB] fail: ml_io_map(TLMM_NORTH)\n");
-+		return;
-+	}
-+	cfg_sda = rd(GPIO_CFG(tlmm_base, PIN_SDA)) & ~(CFG_FUNCTION | CFG_OUTPUT_ENABLE);
-+	cfg_scl = rd(GPIO_CFG(tlmm_base, PIN_SCL)) & ~(CFG_FUNCTION | CFG_OUTPUT_ENABLE);
-+	wr(GPIO_CFG(tlmm_base, PIN_SDA), cfg_sda);
-+	wr(GPIO_CFG(tlmm_base, PIN_SCL), cfg_scl);
-+	spin_us(100);
++	uint32_t delay_sec = 45;
++	PE_parse_boot_argn("pong_usb_delay", &delay_sec, sizeof(delay_sec));
 +
-+	if (pong_muic_route()) {
-+		pmsg_log("[PONG_USB] muic: i2c slave 0x25 route ok\n");
-+	} else {
-+		pmsg_log("[PONG_USB] muic: warning route no ack\n");
-+	}
++	pmsg_log("[PONG_USB] init: queued SM-T970 USB CDC-ACM control channel (delay=%u sec)\n", delay_sec);
++	printf("Pong USB: queued CDC-ACM control channel init (delay=%u sec)\n", delay_sec);
 +
-+	/* 2. Configure SMMU SID 0 Bypass */
-+	smmu_base = ml_io_map(APPS_SMMU_PHYS, APPS_SMMU_SIZE);
-+	if (smmu_base) {
-+		pong_smmu_setup_sid0_bypass(smmu_base);
-+	}
-+
-+	/* 3. Allocate DMA contiguous buffer (32 KiB) */
-+	dma_phys = 0;
-+	dma_virt = IOMallocContiguous(USB_DMA_BYTES, 4096, &dma_phys);
-+	if (!dma_virt || !dma_phys) {
-+		pmsg_log("[PONG_USB] fail: IOMallocContiguous 32K\n");
-+		return;
-+	}
-+	dma_wcomb = ml_io_map_wcomb((vm_offset_t)dma_phys, USB_DMA_BYTES);
-+	if (!dma_wcomb) {
-+		pmsg_log("[PONG_USB] fail: ml_io_map_wcomb DMA\n");
-+		return;
-+	}
-+	memset((void *)dma_wcomb, 0, USB_DMA_BYTES);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	pmsg_log("[PONG_USB] dma: allocated phys=0x%llx\n", (uint64_t)dma_phys);
-+
-+	/* 4. Map DWC3 Core and QSCRATCH */
-+	core_base = ml_io_map(DWC3_CORE_PHYS, DWC3_CORE_SIZE);
-+	qscratch_base = ml_io_map(QSCRATCH_PHYS, QSCRATCH_SIZE);
-+	if (!core_base || !qscratch_base) {
-+		pmsg_log("[PONG_USB] fail: ml_io_map core/qscratch\n");
-+		return;
-+	}
-+
-+	uint32_t id = core_r(DWC3_GSNPSID) & 0xffff0000;
-+	pmsg_log("[PONG_USB] dwc3: core id=0x%08x\n", core_r(DWC3_GSNPSID));
-+	if (id != 0x55330000 && id != 0x55340000 && id != 0x33310000) {
-+		pmsg_log("[PONG_USB] fail: unexpected core id\n");
-+		return;
-+	}
-+
-+	/* Stop controller */
-+	core_w(DWC3_DCTL, core_r(DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
-+	for (unsigned i = 0; i < 250; i++) {
-+		if (core_r(DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) break;
-+		delay_for_interval(1, NSEC_PER_MSEC);
-+	}
-+	core_w(DWC3_DEVTEN, 0);
-+	core_w(DWC3_DALEPENA, 0);
-+
-+	/* Soft reset core */
-+	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_CSFTRST);
-+	for (unsigned i = 0; i < 250; i++) {
-+		if (!(core_r(DWC3_DCTL) & DWC3_DCTL_CSFTRST)) break;
-+		delay_for_interval(1, NSEC_PER_MSEC);
-+	}
-+
-+	/* Setup PHY and DCFG */
-+	core_w(DWC3_GUSB2PHYCFG(0), core_r(DWC3_GUSB2PHYCFG(0)) & ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM));
-+	core_w(DWC3_DCFG, (core_r(DWC3_DCFG) & ~0x3ffu) | 0);
-+
-+	/* Event Ring */
-+	core_w(DWC3_GEVNTADRLO(0), (uint32_t)dma_phys);
-+	core_w(DWC3_GEVNTADRHI(0), (uint32_t)(dma_phys >> 32));
-+	core_w(DWC3_GEVNTSIZ(0), 4096u | (1u << 31));
-+	core_w(DWC3_GEVNTCOUNT(0), 0);
-+	ctl_event_offset = 0;
-+
-+	/* Force Device Mode and disable clock gating */
-+	core_w(DWC3_GCTL, (core_r(DWC3_GCTL) & ~(3u << 12)) | (2u << 12) | DWC3_GCTL_DSBLCLKGTNG);
-+
-+	/* Reset Endpoints and arm EP0 SETUP */
-+	reset_endpoints();
-+
-+	/* Enable Events */
-+	core_w(DWC3_DEVTEN, 0x0f);
-+
-+	/* 5. QSCRATCH VBUS Override */
-+	qs_w(0x30, qs_r(0x30) | (1u << 24));
-+	qs_w(0x10, qs_r(0x10) | (1u << 20) | (1u << 28));
-+	if ((qs_r(0x10) & ((1u << 20) | (1u << 28))) == ((1u << 20) | (1u << 28))) {
-+		pmsg_log("[PONG_USB] qscratch: vbus override latched\n");
-+	}
-+
-+	/* Start Controller */
-+	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
-+
-+	/* Start worker thread */
-+	thread_t t = NULL;
-+	if (kernel_thread_start(pong_usb_ctl_worker, NULL, &t) == KERN_SUCCESS) {
-+		thread_deallocate(t);
++	thread_t th = THREAD_NULL;
++	if (kernel_thread_start(pong_usb_ctl_thread, (void *)(uintptr_t)delay_sec, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
 +	} else {
 +		pmsg_log("[PONG_USB] fail: kernel_thread_start\n");
++		printf("Pong USB: fail: kernel_thread_start\n");
 +	}
 +}
