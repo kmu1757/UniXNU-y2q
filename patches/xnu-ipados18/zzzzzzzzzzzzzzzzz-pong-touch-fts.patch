@@ -34,7 +34,7 @@ new file mode 100644
 index 0000000..1234567
 --- /dev/null
 +++ b/bsd/dev/pong_fts.c
-@@ -0,0 +1,742 @@
+@@ -0,0 +1,848 @@
 +/* STM FTS Touchscreen Driver (Samsung TSP, fts1ba90a) for SM-T970 (SM8250).
 + * Implements I2C via TLMM North Tile GPIO bit-banging (GPIO 12 SCL, GPIO 13 SDA, GPIO 15 INT).
 + * Powers on AVDD (3.3V) via PM8150 ldoa13 and DVDD (1.8V) via PM8150 ldoa14 using RPMh VRM voting.
@@ -158,6 +158,7 @@ index 0000000..1234567
 +static int pong_touch_fts = 0;
 +static int pong_touch_rot = 3; /* bit 0: Swap XY (1), bit 1: Invert X (2), bit 2: Invert Y (4) */
 +static int pong_touch_delay_sec = 20; /* Default 20s delay after boot before touch HW init */
++static uint32_t i2c_delay_us = 4; /* Default ~100 kHz (4 us half-cycle) */
 +
 +static inline uint32_t
 +rd(vm_offset_t address)
@@ -209,13 +210,13 @@ index 0000000..1234567
 +{
 +	vm_offset_t db_vaddr = ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
 +	if (!db_vaddr) {
-+		pmsg_log("[PONG_FTS] cmd_db: ml_io_map failed\n");
++		pmsg_log("[PONG_FTS] cmd_db: map FAIL\n");
 +		return 0;
 +	}
 +	const struct cmd_db_header *hdr = (const struct cmd_db_header *)db_vaddr;
 +	if (hdr->magic[0] != 0xdb || hdr->magic[1] != 0x30 ||
 +	    hdr->magic[2] != 0x03 || hdr->magic[3] != 0x0c) {
-+		pmsg_log("[PONG_FTS] cmd_db: bad magic %02x %02x %02x %02x\n",
++		pmsg_log("[PONG_FTS] cmd_db: bad magic %02x%02x%02x%02x\n",
 +		    hdr->magic[0], hdr->magic[1], hdr->magic[2], hdr->magic[3]);
 +		return 0;
 +	}
@@ -251,31 +252,25 @@ index 0000000..1234567
 +	uint32_t ldo13_addr = cmd_db_query_resource("ldoa13");
 +	uint32_t ldo14_addr = cmd_db_query_resource("ldoa14");
 +
-+	pmsg_log("[PONG_FTS] rpmh: res ldoa13=0x%x ldoa14=0x%x\n", ldo13_addr, ldo14_addr);
++	pmsg_log("[PONG_FTS] pwr: res l13=0x%x l14=0x%x\n", ldo13_addr, ldo14_addr);
 +
 +	if (!ldo13_addr || !ldo14_addr) {
-+		pmsg_log("[PONG_FTS] rpmh: ldoa13/14 not found in cmd-db (SKIP POWER)\n");
++		pmsg_log("[PONG_FTS] pwr: res missing (SKIP)\n");
 +		printf("Pong FTS touch: ldoa13/ldoa14 not found in cmd-db; SKIP power on\n");
 +		return false;
 +	}
 +
 +	vm_offset_t rsc_vaddr = ml_io_map(RSC_PHYS, RSC_SIZE);
 +	if (!rsc_vaddr) {
-+		pmsg_log("[PONG_FTS] rpmh: ml_io_map(RSC_PHYS) failed\n");
++		pmsg_log("[PONG_FTS] pwr: map RSC FAIL\n");
 +		return false;
 +	}
 +
 +	/* Find an idle active TCS in DRV 2 (TCS 0 or 1) */
-+	int tcs_idx = -1;
-+	for (int t = 0; t < 2; t++) {
-+		if (rd(rsc_vaddr + RSC_TCS(t) + TCS_STATUS) != 0) {
-+			tcs_idx = t;
-+			break;
-+		}
-+	}
-+	if (tcs_idx < 0) {
-+		pmsg_log("[PONG_FTS] rpmh: no idle active TCS (SKIP POWER)\n");
-+		return false;
++	int tcs_idx = 0;
++	if (rd(rsc_vaddr + RSC_TCS(0) + TCS_STATUS) != 0 &&
++	    rd(rsc_vaddr + RSC_TCS(1) + TCS_STATUS) == 0) {
++		tcs_idx = 1;
 +	}
 +
 +	vm_offset_t tcs_vaddr = rsc_vaddr + RSC_TCS(tcs_idx);
@@ -321,31 +316,39 @@ index 0000000..1234567
 +
 +	/* Wait for completion with timeout (~50 ms) */
 +	bool done = false;
++	uint32_t cmd_stat[6] = { 0 };
++	uint32_t irq_stat = 0;
 +	for (int w = 0; w < 1000; w++) {
++		irq_stat = rd(rsc_vaddr + RSC_IRQ_STATUS);
 +		uint32_t completed = 0;
 +		for (int i = 0; i < 6; i++) {
-+			completed += (rd(tcs_vaddr + TCS_COMMAND(i) + 12) >> 16) & 1;
++			cmd_stat[i] = rd(tcs_vaddr + TCS_COMMAND(i) + 12);
++			if ((cmd_stat[i] >> 16) & 1) {
++				completed++;
++			}
 +		}
-+		if ((rd(rsc_vaddr + RSC_IRQ_STATUS) & (1u << tcs_idx)) || (completed == 6)) {
++		if ((irq_stat & (1u << tcs_idx)) || (completed == 6)) {
 +			done = true;
 +			break;
 +		}
 +		sleep_us(50);
 +	}
 +
-+	uint32_t irq_stat = rd(rsc_vaddr + RSC_IRQ_STATUS);
-+	pmsg_log("[PONG_FTS] rpmh: vote done=%d (tcs=%d irq_stat=0x%x)\n", done, tcs_idx, irq_stat);
-+
 +	wr(rsc_vaddr + RSC_IRQ_CLEAR, 1u << tcs_idx);
 +	wr(tcs_vaddr + TCS_CONTROL, rd(tcs_vaddr + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 +	wr(tcs_vaddr + TCS_ENABLED, 0);
 +
 +	if (done) {
++		pmsg_log("[PONG_FTS] pwr: vote ok tcs=%d irq=0x%x c0=0x%x c3=0x%x\n",
++		    tcs_idx, irq_stat, cmd_stat[0], cmd_stat[3]);
 +		printf("Pong FTS touch: powered on ldoa13 (%u mV) & ldoa14 (%u mV) via RPMh\n",
 +		    FTS_AVDD_MV, FTS_DVDD_MV);
-+		/* Wait for power rails and chip POR to stabilize */
-+		sleep_ms(50);
++		/* Wait at least 350 ms for PMIC ramp-up and touch IC POR stabilization */
++		sleep_ms(350);
++		pmsg_log("[PONG_FTS] pwr: wait 350ms ok\n");
 +	} else {
++		pmsg_log("[PONG_FTS] pwr: vote FAIL tcs=%d irq=0x%x c0=0x%x c3=0x%x\n",
++		    tcs_idx, irq_stat, cmd_stat[0], cmd_stat[3]);
 +		printf("Pong FTS touch: RPMh power vote timed out\n");
 +	}
 +
@@ -407,7 +410,7 @@ index 0000000..1234567
 +static inline void
 +i2c_delay(void)
 +{
-+	sleep_us(4);
++	sleep_us(i2c_delay_us);
 +}
 +
 +static void
@@ -481,56 +484,106 @@ index 0000000..1234567
 +	return byte;
 +}
 +
++/* 0x03..0x77 address scan. Sends only address byte (write), no data. */
 +static int
-+fts_write(const uint8_t *buf, int len)
++fts_i2c_scan(uint8_t *first_hit)
++{
++	int hits = 0;
++	if (first_hit) {
++		*first_hit = 0;
++	}
++	pmsg_log("[PONG_FTS] scan: 0x03-0x77 start\n");
++	for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
++		if (!scl_get() || !sda_get()) {
++			pmsg_log("[PONG_FTS] scan: bus low at 0x%02x (SCL=%d SDA=%d)\n",
++			    addr, scl_get(), sda_get());
++			break;
++		}
++		i2c_start();
++		int ack = i2c_write_byte((addr << 1) | 0);
++		i2c_stop();
++		if (ack == 0) {
++			hits++;
++			pmsg_log("[PONG_FTS] scan: hit 0x%02x\n", addr);
++			printf("Pong FTS touch: found I2C slave 0x%02x\n", addr);
++			if (first_hit && *first_hit == 0) {
++				*first_hit = addr;
++			}
++		}
++		sleep_us(20);
++	}
++	pmsg_log("[PONG_FTS] scan: done hits=%d\n", hits);
++	return hits;
++}
++
++static int
++fts_write_to(uint8_t addr, const uint8_t *buf, int len)
 +{
 +	if (!scl_get() || !sda_get()) {
-+		pmsg_log("[PONG_FTS] fts_write: bus stuck low before START (SCL=%d SDA=%d)\n",
-+		    scl_get(), sda_get());
++		pmsg_log("[PONG_FTS] write: bus low (SCL=%d SDA=%d)\n", scl_get(), sda_get());
 +		return -1;
 +	}
 +
 +	i2c_start();
-+	if (i2c_write_byte((FTS_I2C_ADDR << 1) | 0) != 0) {
++	if (i2c_write_byte((addr << 1) | 0) != 0) {
 +		i2c_stop();
-+		return -1;
++		return -2;
 +	}
 +	for (int i = 0; i < len; i++) {
 +		if (i2c_write_byte(buf[i]) != 0) {
 +			i2c_stop();
-+			return -1;
++			return -3;
 +		}
 +	}
 +	i2c_stop();
 +	return 0;
 +}
 +
-+static int
-+fts_read(uint8_t reg, uint8_t *buf, int len)
++static inline int
++fts_write(const uint8_t *buf, int len)
 +{
++	return fts_write_to(FTS_I2C_ADDR, buf, len);
++}
++
++/*
++ * fts_read_from: reads len bytes from reg at slave addr.
++ * err_step output:
++ *   1: NACK on write address (addr | 0)
++ *   2: NACK on register address
++ *   3: NACK on read address (addr | 1)
++ */
++static int
++fts_read_from(uint8_t addr, uint8_t reg, uint8_t *buf, int len, int *err_step)
++{
++	if (err_step) {
++		*err_step = 0;
++	}
 +	if (!scl_get() || !sda_get()) {
-+		pmsg_log("[PONG_FTS] fts_read: bus stuck low before START (SCL=%d SDA=%d)\n",
-+		    scl_get(), sda_get());
++		if (err_step) *err_step = -1;
++		pmsg_log("[PONG_FTS] read: bus low (SCL=%d SDA=%d)\n", scl_get(), sda_get());
 +		return -1;
 +	}
 +
 +	i2c_start();
-+	int ack_addr_w = i2c_write_byte((FTS_I2C_ADDR << 1) | 0);
++	int ack_addr_w = i2c_write_byte((addr << 1) | 0);
 +	if (ack_addr_w != 0) {
 +		i2c_stop();
++		if (err_step) *err_step = 1;
 +		return -1;
 +	}
 +
 +	int ack_reg = i2c_write_byte(reg);
 +	if (ack_reg != 0) {
 +		i2c_stop();
++		if (err_step) *err_step = 2;
 +		return -1;
 +	}
 +
 +	i2c_start(); /* Repeated start */
-+	int ack_addr_r = i2c_write_byte((FTS_I2C_ADDR << 1) | 1);
++	int ack_addr_r = i2c_write_byte((addr << 1) | 1);
 +	if (ack_addr_r != 0) {
 +		i2c_stop();
++		if (err_step) *err_step = 3;
 +		return -1;
 +	}
 +
@@ -539,6 +592,13 @@ index 0000000..1234567
 +	}
 +	i2c_stop();
 +	return 0;
++}
++
++static inline int
++fts_read(uint8_t reg, uint8_t *buf, int len)
++{
++	int step = 0;
++	return fts_read_from(FTS_I2C_ADDR, reg, buf, len, &step);
 +}
 +
 +static void
@@ -582,44 +642,92 @@ index 0000000..1234567
 +{
 +	uint8_t id[5] = { 0 };
 +	bool probed = false;
++	uint8_t hit_addr = 0;
++	uint8_t active_addr = FTS_I2C_ADDR;
 +
-+	pmsg_log("[PONG_FTS] fts_hw_init: probe starting (addr=0x%02x reg=0x%02x SCL=%d SDA=%d)\n",
-+	    FTS_I2C_ADDR, FTS_READ_DEVICE_ID, scl_get(), sda_get());
++	/* 1. Scan bus 0x03..0x77 */
++	fts_i2c_scan(&hit_addr);
 +
++	/* 2. Try probe at ~100 kHz (i2c_delay_us = 4) */
++	i2c_delay_us = 4;
++	pmsg_log("[PONG_FTS] probe: try 100k addr=0x%02x\n", FTS_I2C_ADDR);
 +	for (int retry = 0; retry < 5; retry++) {
-+		if (fts_read(FTS_READ_DEVICE_ID, id, sizeof(id)) == 0) {
-+			pmsg_log("[PONG_FTS] fts_hw_init: read try %d got %02x %02x %02x %02x %02x\n",
-+			    retry, id[0], id[1], id[2], id[3], id[4]);
++		int step = 0;
++		if (fts_read_from(FTS_I2C_ADDR, FTS_READ_DEVICE_ID, id, sizeof(id), &step) == 0) {
++			pmsg_log("[PONG_FTS] probe: 100k got %02x %02x %02x %02x %02x\n",
++			    id[0], id[1], id[2], id[3], id[4]);
 +			if ((id[2] == FTS_ID0 || id[2] == FTS_ID0_1BA90A) && id[3] == FTS_ID1) {
 +				probed = true;
++				active_addr = FTS_I2C_ADDR;
 +				break;
 +			}
 +		} else {
-+			pmsg_log("[PONG_FTS] fts_hw_init: read try %d failed (NACK/timeout)\n", retry);
++			pmsg_log("[PONG_FTS] probe: 100k try %d nack step=%d (SCL=%d SDA=%d INT=%d)\n",
++			    retry, step, scl_get(), sda_get(), int_get());
 +		}
 +		sleep_ms(20);
 +	}
 +
++	/* 3. If failed, lower speed to ~10 kHz (i2c_delay_us = 45) and retry */
 +	if (!probed) {
-+		pmsg_log("[PONG_FTS] probe failed: chip_id=%02x %02x %02x %02x %02x (bus: SCL=%d SDA=%d) (SKIP)\n",
-+		    id[0], id[1], id[2], id[3], id[4], scl_get(), sda_get());
++		i2c_delay_us = 45;
++		pmsg_log("[PONG_FTS] probe: try 10k addr=0x%02x\n", FTS_I2C_ADDR);
++		for (int retry = 0; retry < 5; retry++) {
++			int step = 0;
++			if (fts_read_from(FTS_I2C_ADDR, FTS_READ_DEVICE_ID, id, sizeof(id), &step) == 0) {
++				pmsg_log("[PONG_FTS] probe: 10k got %02x %02x %02x %02x %02x\n",
++				    id[0], id[1], id[2], id[3], id[4]);
++				if ((id[2] == FTS_ID0 || id[2] == FTS_ID0_1BA90A) && id[3] == FTS_ID1) {
++					probed = true;
++					active_addr = FTS_I2C_ADDR;
++					break;
++				}
++			} else {
++				pmsg_log("[PONG_FTS] probe: 10k try %d nack step=%d (SCL=%d SDA=%d INT=%d)\n",
++				    retry, step, scl_get(), sda_get(), int_get());
++			}
++			sleep_ms(20);
++		}
++	}
++
++	/* 4. If probe failed on 0x49 but scan found another slave, try that address once */
++	if (!probed && hit_addr != 0 && hit_addr != FTS_I2C_ADDR) {
++		pmsg_log("[PONG_FTS] probe: try alt addr=0x%02x\n", hit_addr);
++		int step = 0;
++		if (fts_read_from(hit_addr, FTS_READ_DEVICE_ID, id, sizeof(id), &step) == 0) {
++			pmsg_log("[PONG_FTS] probe: alt got %02x %02x %02x %02x %02x\n",
++			    id[0], id[1], id[2], id[3], id[4]);
++			if ((id[2] == FTS_ID0 || id[2] == FTS_ID0_1BA90A) && id[3] == FTS_ID1) {
++				probed = true;
++				active_addr = hit_addr;
++			}
++		} else {
++			pmsg_log("[PONG_FTS] probe: alt nack step=%d\n", step);
++		}
++	}
++
++	if (!probed) {
++		pmsg_log("[PONG_FTS] probe: FAIL chip=%02x%02x (SCL=%d SDA=%d INT=%d) (SKIP)\n",
++		    id[2], id[3], scl_get(), sda_get(), int_get());
 +		printf("Pong FTS touch: unexpected or missing chip id: %02x %02x %02x %02x %02x; SKIP\n",
 +		    id[0], id[1], id[2], id[3], id[4]);
 +		return false;
 +	}
 +
-+	pmsg_log("[PONG_FTS] probe chip_id=0x%02x%02x rev=0x%02x\n", id[2], id[3], id[4]);
-+	printf("Pong FTS touch: found STM FTS chip 0x%02x%02x rev 0x%02x\n", id[2], id[3], id[4]);
++	pmsg_log("[PONG_FTS] probe: MATCH id=0x%02x%02x rev=0x%02x addr=0x%02x spd=%uk\n",
++	    id[2], id[3], id[4], active_addr, i2c_delay_us == 45 ? 10 : 100);
++	printf("Pong FTS touch: found STM FTS chip 0x%02x%02x rev 0x%02x (addr 0x%02x)\n",
++	    id[2], id[3], id[4], active_addr);
 +
 +	/* System reset */
 +	static const uint8_t rst_cmd[] = { 0xfa, 0x20, 0x00, 0x00, 0x24, 0x81 };
-+	fts_write(rst_cmd, sizeof(rst_cmd));
++	fts_write_to(active_addr, rst_cmd, sizeof(rst_cmd));
 +	sleep_ms(10);
 +
 +	/* Wait for ready event */
 +	for (int retry = 0; retry < 50; retry++) {
 +		uint8_t ev[FTS_EVENT_SIZE];
-+		if (fts_read(FTS_READ_ONE_EVENT, ev, sizeof(ev)) == 0) {
++		if (fts_read_from(active_addr, FTS_READ_ONE_EVENT, ev, sizeof(ev), NULL) == 0) {
 +			if ((ev[0] & 0x03) == FTS_EV_STATUS &&
 +			    ((ev[0] >> 2) & 0x0f) == FTS_STYPE_INFO &&
 +			    ev[1] == FTS_INFO_READY) {
@@ -631,22 +739,22 @@ index 0000000..1234567
 +
 +	/* Clear events */
 +	static const uint8_t clr_cmd = FTS_CMD_CLEAR_ALL_EVENT;
-+	fts_write(&clr_cmd, 1);
++	fts_write_to(active_addr, &clr_cmd, 1);
 +
 +	/* Touch type: TOUCH | PALM | WET */
 +	static const uint8_t tt_cmd[] = { FTS_CMD_SET_TOUCHTYPE,
 +		(uint8_t)(FTS_TOUCHTYPE_DEFAULT & 0xff),
 +		(uint8_t)(FTS_TOUCHTYPE_DEFAULT >> 8) };
-+	fts_write(tt_cmd, sizeof(tt_cmd));
++	fts_write_to(active_addr, tt_cmd, sizeof(tt_cmd));
 +
 +	/* Interrupt on */
 +	static const uint8_t int_on[] = { 0xa4, 0x01, 0x01 };
-+	fts_write(int_on, sizeof(int_on));
++	fts_write_to(active_addr, int_on, sizeof(int_on));
 +	sleep_ms(10);
 +
 +	/* Scan on */
 +	static const uint8_t scan_on[] = { 0xa0, 0x00, 0x01 };
-+	fts_write(scan_on, sizeof(scan_on));
++	fts_write_to(active_addr, scan_on, sizeof(scan_on));
 +	sleep_ms(50);
 +
 +	pmsg_log("[PONG_FTS] init ok (rot=%d)\n", pong_touch_rot);
@@ -658,7 +766,7 @@ index 0000000..1234567
 +fts_touch_thread(__unused void *param, __unused wait_result_t wr)
 +{
 +	if (pong_touch_delay_sec > 0) {
-+		pmsg_log("[PONG_FTS] delaying touch init by %d sec...\n", pong_touch_delay_sec);
++		pmsg_log("[PONG_FTS] delay init %ds\n", pong_touch_delay_sec);
 +		printf("Pong FTS touch: delaying init by %d sec\n", pong_touch_delay_sec);
 +		for (int s = 0; s < pong_touch_delay_sec; s++) {
 +			sleep_ms(1000);
@@ -668,16 +776,14 @@ index 0000000..1234567
 +	/* Turn on touch power rails via RPMh VRM */
 +	rpmh_power_on_touch();
 +
-+	pmsg_log("[PONG_FTS] mapping TLMM North 0x%08lx (size 0x%lx)...\n",
-+	    (unsigned long)TLMM_NORTH_PHYS, (unsigned long)TLMM_MAP_SIZE);
++	pmsg_log("[PONG_FTS] map TLMM 0x%08lx\n", (unsigned long)TLMM_NORTH_PHYS);
 +	tlmm_vaddr = ml_io_map(TLMM_NORTH_PHYS, TLMM_MAP_SIZE);
 +	if (!tlmm_vaddr) {
-+		pmsg_log("[PONG_FTS] ml_io_map(TLMM North) failed (SKIP)\n");
++		pmsg_log("[PONG_FTS] map TLMM FAIL (SKIP)\n");
 +		printf("Pong FTS touch: ml_io_map failed; SKIP\n");
 +		thread_terminate(current_thread());
 +		return;
 +	}
-+	pmsg_log("[PONG_FTS] TLMM North mapped to 0x%lx\n", (unsigned long)tlmm_vaddr);
 +
 +	gpio_init_pins();
 +
@@ -687,7 +793,7 @@ index 0000000..1234567
 +	}
 +
 +	if (!pong_touch_device_ready()) {
-+		pmsg_log("[PONG_FTS] pong_touch_device_ready failed (SKIP)\n");
++		pmsg_log("[PONG_FTS] pong_touch_device_ready FAIL (SKIP)\n");
 +		printf("Pong FTS touch: cannot ready /dev/pong-touch; SKIP\n");
 +		thread_terminate(current_thread());
 +		return;
