@@ -1,0 +1,271 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1111111..2222222 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -404,5 +404,6 @@
+ bsd/dev/pong_goodix.c			standard
+ bsd/dev/pong_buttons.c			standard
+ bsd/dev/pong_fts.c			standard
+ bsd/dev/pong_usb_ctl.c			standard
++bsd/dev/pong_cpu_perf.c			standard
+ bsd/pthread/pthread_kext.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 1111111..2222222 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1174,5 +1174,7 @@
+ 	extern void pong_fts_init(void);
+ 	pong_fts_init();
+ 	extern void pong_usb_ctl_init(void);
+ 	pong_usb_ctl_init();
++	extern void pong_cpu_perf_init(void);
++	pong_cpu_perf_init();
+ #endif
+diff --git a/bsd/sys/pong_cpu_perf.h b/bsd/sys/pong_cpu_perf.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/bsd/sys/pong_cpu_perf.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#ifndef _SYS_PONG_CPU_PERF_H_
++#define _SYS_PONG_CPU_PERF_H_
++
++#include <sys/cdefs.h>
++
++__BEGIN_DECLS
++
++void pong_cpu_perf_init(void);
++
++__END_DECLS
++
++#endif /* _SYS_PONG_CPU_PERF_H_ */
+diff --git a/bsd/dev/pong_cpu_perf.c b/bsd/dev/pong_cpu_perf.c
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/bsd/dev/pong_cpu_perf.c
+@@ -0,0 +1,223 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * Qualcomm SM8250 (SM-T970, gts7xlwifi) EPSS CPU Performance Scaling Driver
++ * for iPadOS 18 (Darwin 24 / XNU 11417).
++ *
++ * Hardware facts and DTB verification:
++ *  - Compatible: qcom,cpufreq-hw-epss
++ *  - Domains: 3 frequency domains, size 0x1000 each:
++ *      Domain 0: 0x18591000 (Silver / Little: Cortex-A55 x4, CPU 0..3)
++ *      Domain 1: 0x18592000 (Gold / Big: Cortex-A77 x3, CPU 4..6)
++ *      Domain 2: 0x18593000 (Prime: Cortex-A77 x1, CPU 7)
++ *  - EPSS Registers:
++ *      0x000: REG_ENABLE (bit 0 = domain enable)
++ *      0x100: REG_FREQ_LUT (LUT base, 4 bytes/row: [31:30] src, [7:0] multiplier of 19.2 MHz)
++ *      0x320: REG_PERF_STATE (target / current row index)
++ *
++ * Safety & Rules:
++ *  - Runs ONLY when boot-arg pong_cpu_perf=N (N > 0) is present.
++ *  - If absent or N <= 0, EPSS MMIO is NEVER mapped or touched.
++ *  - Reads domain enable, full LUT (kHz), and current PERF_STATE to pmsg.
++ *  - Skips domains that are disabled (ENABLE=0) or have invalid LUTs.
++ *  - Mode 1: Moderate (Silver max, Gold & Prime closest to ~1.8 GHz).
++ *  - Mode 2: Max (All domains max frequency row).
++ *  - Writes ONLY REG_PERF_STATE (row index from LUT, not raw value).
++ *  - NEVER touches voltage, PLL, regulator, LMh, or thermal limit registers.
++ *  - Non-blocking: executed in a dedicated kernel worker thread.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/pong_cpu_perf.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++extern void thread_deallocate(thread_t thread);
++extern kern_return_t thread_terminate(thread_t thread);
++extern thread_t current_thread(void);
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++
++#define EPSS_NUM_DOMAINS        3
++#define EPSS_DOMAIN_SIZE        0x1000UL
++
++#define EPSS_BASE_PHYS_D0       0x18591000UL
++#define EPSS_BASE_PHYS_D1       0x18592000UL
++#define EPSS_BASE_PHYS_D2       0x18593000UL
++
++#define EPSS_REG_ENABLE         0x000
++#define EPSS_REG_FREQ_LUT       0x100
++#define EPSS_REG_PERF_STATE     0x320
++
++#define EPSS_LUT_MAX_ROWS       40
++#define EPSS_XO_KHZ             19200
++#define EPSS_ALTERNATE_KHZ      300000
++#define MODERATE_TARGET_KHZ     1800000
++
++static const vm_offset_t epss_phys_bases[EPSS_NUM_DOMAINS] = {
++	EPSS_BASE_PHYS_D0,
++	EPSS_BASE_PHYS_D1,
++	EPSS_BASE_PHYS_D2
++};
++
++static void
++cpu_perf_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++cpu_perf_log(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		int len = (n < (int)sizeof(line)) ? n : (int)sizeof(line) - 1;
++		pong_ramoops_diagnostic_write(line, len);
++		printf("%s", line);
++	}
++}
++
++static void
++pong_cpu_perf_worker(void *param, __unused wait_result_t result)
++{
++	int perf_mode = (int)(uintptr_t)param;
++
++	/* Small delay to let scheduler and SMP bringup fully settle */
++	delay_for_interval(100, NSEC_PER_MSEC);
++
++	cpu_perf_log("[PONG_CPU] init: mode=%d (1=moderate 1.8G, 2=max)\n", perf_mode);
++
++	for (uint32_t domain = 0; domain < EPSS_NUM_DOMAINS; domain++) {
++		vm_offset_t phys = epss_phys_bases[domain];
++		vm_offset_t base = ml_io_map(phys, EPSS_DOMAIN_SIZE);
++		if (!base) {
++			cpu_perf_log("[PONG_CPU] D%u SKIP: ml_io_map(0x%lx) failed\n",
++			    domain, (unsigned long)phys);
++			continue;
++		}
++
++		/* 1. Read domain ENABLE bit */
++		uint32_t en_val = *(volatile uint32_t *)(base + EPSS_REG_ENABLE);
++		uint32_t is_enabled = en_val & 1;
++
++		/* 2. Read current PERF_STATE */
++		uint32_t cur_row = *(volatile uint32_t *)(base + EPSS_REG_PERF_STATE);
++
++		/* 3. Read LUT all rows */
++		uint32_t lut_khz[EPSS_LUT_MAX_ROWS] = { 0 };
++		uint32_t num_rows = 0;
++		for (uint32_t r = 0; r < EPSS_LUT_MAX_ROWS; r++) {
++			uint32_t entry = *(volatile uint32_t *)(base + EPSS_REG_FREQ_LUT + 4 * r);
++			uint32_t src = (entry >> 30) & 0x3;
++			uint32_t l_val = entry & 0xff;
++			uint32_t khz = src ? (EPSS_XO_KHZ * l_val) : EPSS_ALTERNATE_KHZ;
++
++			if (r > 0 && (entry == 0 || khz <= lut_khz[r - 1])) {
++				break;
++			}
++			lut_khz[r] = khz;
++			num_rows = r + 1;
++		}
++
++		/* Check ENABLE and LUT validity */
++		if (!is_enabled) {
++			cpu_perf_log("[PONG_CPU] D%u SKIP: domain disabled (en_reg=0x%x)\n",
++			    domain, en_val);
++			continue;
++		}
++
++		if (num_rows == 0 || lut_khz[0] == 0) {
++			cpu_perf_log("[PONG_CPU] D%u SKIP: invalid LUT (num_rows=%u)\n",
++			    domain, num_rows);
++			continue;
++		}
++
++		/* Report current state and LUT summary to pmsg */
++		uint32_t cur_khz = (cur_row < num_rows) ? lut_khz[cur_row] : 0;
++		cpu_perf_log("[PONG_CPU] D%u: en=1 cur_row=%u (%u kHz) rows=%u (%u..%u kHz)\n",
++		    domain, cur_row, cur_khz, num_rows, lut_khz[0], lut_khz[num_rows - 1]);
++
++		/* Report all LUT rows in compact lines to pmsg */
++		char lut_line[128];
++		int offset = 0;
++		for (uint32_t r = 0; r < num_rows; r++) {
++			if (r % 4 == 0) {
++				if (offset > 0) {
++					cpu_perf_log("%s\n", lut_line);
++				}
++				offset = snprintf(lut_line, sizeof(lut_line), "[PONG_CPU] D%u LUT: [%u]=%u",
++				    domain, r, lut_khz[r]);
++			} else {
++				if (offset < (int)sizeof(lut_line) - 20) {
++					offset += snprintf(lut_line + offset, sizeof(lut_line) - offset, " [%u]=%u",
++					    r, lut_khz[r]);
++				}
++			}
++		}
++		if (offset > 0) {
++			cpu_perf_log("%s\n", lut_line);
++		}
++
++		/* 4. Calculate target row:
++		 * Mode 1 (Moderate):
++		 *   - Domain 0 (Silver): max frequency row
++		 *   - Domain 1 (Gold) & 2 (Prime): closest row to ~1.8 GHz (MODERATE_TARGET_KHZ)
++		 * Mode 2 (Max):
++		 *   - All domains: max frequency row
++		 */
++		uint32_t target_row = num_rows - 1;
++		if (perf_mode == 1 && domain > 0) {
++			uint32_t best_row = 0;
++			uint32_t best_diff = (uint32_t)-1;
++			for (uint32_t r = 0; r < num_rows; r++) {
++				uint32_t diff = (lut_khz[r] >= MODERATE_TARGET_KHZ) ?
++				    (lut_khz[r] - MODERATE_TARGET_KHZ) : (MODERATE_TARGET_KHZ - lut_khz[r]);
++				if (diff < best_diff) {
++					best_diff = diff;
++					best_row = r;
++				}
++			}
++			target_row = best_row;
++		}
++
++		/* 5. Write ONLY REG_PERF_STATE */
++		*(volatile uint32_t *)(base + EPSS_REG_PERF_STATE) = target_row;
++		delay_for_interval(20, NSEC_PER_MSEC);
++
++		/* 6. Read back and verify */
++		uint32_t readback_row = *(volatile uint32_t *)(base + EPSS_REG_PERF_STATE);
++		uint32_t readback_khz = (readback_row < num_rows) ? lut_khz[readback_row] : 0;
++		cpu_perf_log("[PONG_CPU] D%u: row %u -> %u (%u kHz), readback row %u (%u kHz)%s\n",
++		    domain, cur_row, target_row, lut_khz[target_row],
++		    readback_row, readback_khz,
++		    (readback_row == target_row) ? " [OK]" : " [MISMATCH]");
++	}
++
++	cpu_perf_log("[PONG_CPU] cpu_perf complete\n");
++	thread_terminate(current_thread());
++}
++
++void
++pong_cpu_perf_init(void)
++{
++	int perf_arg = 0;
++	/* If pong_cpu_perf boot-arg is absent or <= 0, do not touch EPSS MMIO at all */
++	if (!PE_parse_boot_argn("pong_cpu_perf", &perf_arg, sizeof(perf_arg)) || perf_arg <= 0) {
++		return;
++	}
++
++	thread_t th = THREAD_NULL;
++	if (kernel_thread_start(pong_cpu_perf_worker, (void *)(uintptr_t)perf_arg, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++
++#endif /* PONG */
