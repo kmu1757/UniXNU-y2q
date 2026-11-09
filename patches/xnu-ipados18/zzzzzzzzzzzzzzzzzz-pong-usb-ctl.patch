@@ -1,0 +1,905 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -404,4 +404,5 @@
+ bsd/dev/pong_goodix.c			standard
+ bsd/dev/pong_buttons.c			standard
+ bsd/dev/pong_fts.c			standard
++bsd/dev/pong_usb_ctl.c			standard
+ bsd/pthread/pthread_kext.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1174,5 +1174,7 @@
+ 		extern void pong_buttons_init(void);
+ 		pong_buttons_init();
+ 	extern void pong_fts_init(void);
+ 	pong_fts_init();
++	extern void pong_usb_ctl_init(void);
++	pong_usb_ctl_init();
+ #endif
+diff --git a/bsd/sys/pong_usb_ctl.h b/bsd/sys/pong_usb_ctl.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/bsd/sys/pong_usb_ctl.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#ifndef _SYS_PONG_USB_CTL_H_
++#define _SYS_PONG_USB_CTL_H_
++
++#include <sys/cdefs.h>
++
++__BEGIN_DECLS
++
++void pong_usb_ctl_init(void);
++
++__END_DECLS
++
++#endif /* _SYS_PONG_USB_CTL_H_ */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -0,0 +1,858 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
++ *
++ * Hardware facts and precedents:
++ *  - MUIC: MAX77705 I2C slave 0x25 via TLMM North GPIO 28 (SDA) / 29 (SCL)
++ *    (ref/gts7xl-mainline/tools/usbroute.c, MIT; ref/G986N-iOS, BSD-2-Clause)
++ *  - DWC3 core: 0x0a600000, QSCRATCH glue: 0x0a6f8800 (ref/UniXNU-pong, BSD-2-Clause-Patent)
++ *  - Apps SMMU: 0x15000000, SID 0 bypass configuration
++ *  - Standard USB CDC-ACM: driverless on Windows 10/11 (usbser.sys)
++ */
++
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/pong_usb_ctl.h>
++#include <IOKit/IOLib.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++
++/* Diagnostic pmsg output */
++static void
++pmsg_log(const char *fmt, ...)
++{
++	char buf[128];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(buf, n);
++	}
++}
++
++/* TLMM North Tile: GPIO 28 (SDA), GPIO 29 (SCL) */
++#define TLMM_NORTH_PHYS         0x0f900000UL
++#define TLMM_SIZE               0x100000UL
++#define PIN_SDA                 28
++#define PIN_SCL                 29
++#define GPIO_CFG(tlmm, n)       ((tlmm) + 0x1000UL * (n))
++#define GPIO_IO(tlmm, n)        ((tlmm) + 0x1000UL * (n) + 4)
++#define CFG_FUNCTION            (0xfu << 2)
++#define CFG_OUTPUT_ENABLE       (1u << 9)
++#define HALF_BIT_US             5
++#define STRETCH_US              1000
++#define MUIC_I2C_ADDR           0x25
++
++/* SMMUv2 Base */
++#define APPS_SMMU_PHYS          0x15000000UL
++#define APPS_SMMU_SIZE          0x100000UL
++
++/* DWC3 and QSCRATCH MMIO Bases */
++#define DWC3_CORE_PHYS          0x0a600000UL
++#define DWC3_CORE_SIZE          0x10000UL
++#define QSCRATCH_PHYS           0x0a6f8800UL
++#define QSCRATCH_SIZE           0x400UL
++
++/* DWC3 Register Offsets */
++#define DWC3_GCTL               0xC110
++#define DWC3_GSNPSID            0xC120
++#define DWC3_GUSB2PHYCFG(n)     (0xC200 + ((n) * 4))
++#define DWC3_GEVNTADRLO(n)      (0xC400 + ((n) * 0x10))
++#define DWC3_GEVNTADRHI(n)      (0xC404 + ((n) * 0x10))
++#define DWC3_GEVNTSIZ(n)        (0xC408 + ((n) * 0x10))
++#define DWC3_GEVNTCOUNT(n)      (0xC40C + ((n) * 0x10))
++#define DWC3_DCFG               0xC700
++#define DWC3_DCTL               0xC704
++#define DWC3_DEVTEN             0xC708
++#define DWC3_DSTS               0xC70C
++#define DWC3_DALEPENA           0xC720
++#define DWC3_DEPCMDPAR2(n)      (0xC800 + ((n) * 0x10))
++#define DWC3_DEPCMDPAR1(n)      (0xC804 + ((n) * 0x10))
++#define DWC3_DEPCMDPAR0(n)      (0xC808 + ((n) * 0x10))
++#define DWC3_DEPCMD(n)          (0xC80C + ((n) * 0x10))
++
++#define DWC3_DCTL_RUN_STOP      (1u << 31)
++#define DWC3_DCTL_CSFTRST       (1u << 30)
++#define DWC3_DSTS_DEVCTRLHLT    (1u << 22)
++#define DWC3_DSTS_CONNECTSPD(n) ((n) & 7u)
++#define DWC3_GCTL_DSBLCLKGTNG   (1u << 0)
++#define DWC3_GUSB2PHYCFG_SUSPHY (1u << 6)
++#define DWC3_GUSB2PHYCFG_ENBLSLPM (1u << 8)
++
++#define DWC3_DEPCMD_DEPSTARTCFG         (9u | (1u << 10))
++#define DWC3_DEPCMD_SETEPCONFIG         (1u | (1u << 10))
++#define DWC3_DEPCMD_SETTRANSFRESOURCE   (2u | (1u << 10))
++#define DWC3_DEPCMD_STARTTRANSFER       (6u | (1u << 10))
++#define DWC3_DEPCMD_CLEARSTALL          (5u | (1u << 10))
++#define DWC3_DEPCMD_SETSTALL            (4u | (1u << 10))
++#define DWC3_DEPCMD_CMDACT              (1u << 10)
++#define DWC3_DEPCMD_STATUS(x)           (((x) >> 12) & 0x0Fu)
++
++#define DWC3_DEPCFG_EP_TYPE(x)          ((x) << 1)
++#define DWC3_DEPCFG_MAX_PACKET_SIZE(x)  ((x) << 3)
++#define DWC3_DEPCFG_FIFO_NUMBER(x)      ((x) << 17)
++#define DWC3_DEPCFG_EP_NUMBER(x)        ((x) << 1)
++#define DWC3_DEPCFG_XFER_COMPLETE_EN    (1u << 8)
++#define DWC3_DEPCFG_XFER_NOT_READY_EN   (1u << 10)
++
++#define DWC3_TRBCTL_NORMAL              1u
++#define DWC3_TRBCTL_CONTROL_SETUP       2u
++#define DWC3_TRBCTL_CONTROL_STATUS2     3u
++#define DWC3_TRBCTL_CONTROL_STATUS3     4u
++#define DWC3_TRBCTL_CONTROL_DATA        5u
++
++#define DWC3_TRB_CTRL_HWO               (1u << 0)
++#define DWC3_TRB_CTRL_LST               (1u << 1)
++#define DWC3_TRB_CTRL_IOC               (1u << 11)
++
++#define DWC3_DEPEVT_XFERCOMPLETE        1u
++#define DWC3_DEPEVT_XFERNOTREADY        3u
++
++/* DMA Buffer Offsets inside 32 KiB Allocation */
++#define USB_DMA_BYTES           32768
++#define OFF_EVT_RING            0x0000
++#define OFF_EP_TRB              0x1000
++#define OFF_EP_DATA             0x1100
++#define OFF_RX_TRB              0x2000
++#define OFF_RX_DATA             0x2100
++#define OFF_TX_TRB              0x3000
++#define OFF_TX_DATA             0x3100
++
++/* State Variables */
++static vm_offset_t tlmm_base;
++static uint32_t cfg_sda, cfg_scl;
++static vm_offset_t core_base;
++static vm_offset_t qscratch_base;
++static vm_offset_t smmu_base;
++static vm_offset_t dma_wcomb;
++static void *dma_virt;
++static IOPhysicalAddress dma_phys;
++
++static bool ctl_enabled;
++static bool ctl_configured;
++static bool ctl_dtr;
++static bool ctl_tx_active;
++static bool ctl_rx_active;
++static unsigned ctl_stage;
++static unsigned ctl_control_bytes;
++static unsigned ctl_status_dep;
++static unsigned ctl_event_offset;
++static unsigned ctl_packet_size = 64;
++
++static char cmd_buf[128];
++static unsigned cmd_len;
++
++/* Low-level MMIO helpers */
++static inline uint32_t rd(vm_offset_t a) { return *(volatile uint32_t *)a; }
++static inline void wr(vm_offset_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
++
++static inline uint32_t core_r(unsigned o) {
++	uint32_t v = *(volatile uint32_t *)(core_base + o);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++static inline void core_w(unsigned o, uint32_t v) {
++	*(volatile uint32_t *)(core_base + o) = v;
++	__asm__ volatile("dsb oshst" ::: "memory");
++}
++static inline uint32_t qs_r(unsigned o) {
++	uint32_t v = *(volatile uint32_t *)(qscratch_base + o);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++static inline void qs_w(unsigned o, uint32_t v) {
++	*(volatile uint32_t *)(qscratch_base + o) = v;
++	__asm__ volatile("dsb oshst" ::: "memory");
++}
++
++/* Microsecond spin loop using mach_absolute_time */
++static void
++spin_us(uint32_t us)
++{
++	uint64_t interval = 0, deadline = 0;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &interval);
++	deadline = mach_absolute_time() + interval;
++	while (mach_absolute_time() < deadline) {
++	}
++}
++
++/* Open-drain bit-bang I2C */
++static void
++line(unsigned pin, uint32_t cfg, bool high)
++{
++	if (high) {
++		wr(GPIO_CFG(tlmm_base, pin), cfg & ~CFG_OUTPUT_ENABLE);
++	} else {
++		wr(GPIO_IO(tlmm_base, pin), 0);
++		wr(GPIO_CFG(tlmm_base, pin), cfg | CFG_OUTPUT_ENABLE);
++	}
++	spin_us(HALF_BIT_US);
++}
++
++static bool
++scl_release(void)
++{
++	line(PIN_SCL, cfg_scl, true);
++	for (unsigned waited = 0; !(rd(GPIO_IO(tlmm_base, PIN_SCL)) & 1); waited++) {
++		if (waited >= STRETCH_US) {
++			return false;
++		}
++		spin_us(1);
++	}
++	return true;
++}
++
++static void sda(bool high) { line(PIN_SDA, cfg_sda, high); }
++static void scl_low(void) { line(PIN_SCL, cfg_scl, false); }
++
++static void
++bus_start(void)
++{
++	sda(true);
++	scl_release();
++	sda(false);
++	scl_low();
++}
++
++static void
++bus_stop(void)
++{
++	sda(false);
++	scl_release();
++	sda(true);
++}
++
++static bool
++bus_recover(void)
++{
++	unsigned pulses = 0;
++	if ((rd(GPIO_IO(tlmm_base, PIN_SDA)) & 1) && (rd(GPIO_IO(tlmm_base, PIN_SCL)) & 1)) {
++		return true;
++	}
++	if (!(rd(GPIO_IO(tlmm_base, PIN_SCL)) & 1)) {
++		return false;
++	}
++	while (!(rd(GPIO_IO(tlmm_base, PIN_SDA)) & 1) && pulses < 9) {
++		scl_low();
++		scl_release();
++		pulses++;
++	}
++	bus_stop();
++	return (rd(GPIO_IO(tlmm_base, PIN_SDA)) & 1) && (rd(GPIO_IO(tlmm_base, PIN_SCL)) & 1);
++}
++
++static bool
++bus_put(uint8_t byte)
++{
++	for (int bit = 7; bit >= 0; bit--) {
++		sda((byte >> bit) & 1);
++		if (!scl_release()) return false;
++		scl_low();
++	}
++	sda(true);
++	if (!scl_release()) return false;
++	bool ack = !(rd(GPIO_IO(tlmm_base, PIN_SDA)) & 1);
++	scl_low();
++	return ack;
++}
++
++static bool
++muic_write_reg(uint8_t slave_addr, uint8_t reg, const uint8_t *val, unsigned len)
++{
++	if (!bus_recover()) return false;
++	bus_start();
++	if (!bus_put(slave_addr << 1)) { bus_stop(); return false; }
++	if (!bus_put(reg)) { bus_stop(); return false; }
++	for (unsigned i = 0; i < len; i++) {
++		if (!bus_put(val[i])) { bus_stop(); return false; }
++	}
++	bus_stop();
++	return true;
++}
++
++static bool
++pong_muic_route(void)
++{
++	uint8_t cmd1[2] = {0x06, 0x09};
++	uint8_t cmd2[1] = {0x00};
++	bool ok1 = muic_write_reg(MUIC_I2C_ADDR, 0x21, cmd1, 2);
++	bool ok2 = muic_write_reg(MUIC_I2C_ADDR, 0x41, cmd2, 1);
++	return ok1 && ok2;
++}
++
++/* SMMUv2 SID 0 Bypass */
++static bool
++pong_smmu_setup_sid0_bypass(vm_offset_t smmu)
++{
++	uint32_t idr0 = *(volatile uint32_t *)(smmu + 0x20);
++	unsigned count = idr0 & 0xff;
++	if (count > 128) count = 128;
++	int sid0_slot = -1;
++	int free_slot = -1;
++
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t smr = *(volatile uint32_t *)(smmu + 0x800 + 4 * i);
++		if (!(smr & 0x80000000U)) {
++			if (free_slot < 0) free_slot = (int)i;
++			continue;
++		}
++		if ((smr & 0x7fff) == 0) {
++			sid0_slot = (int)i;
++			break;
++		}
++	}
++
++	if (sid0_slot >= 0) {
++		uint32_t s2cr = *(volatile uint32_t *)(smmu + 0xc00 + 4 * sid0_slot);
++		if (((s2cr >> 16) & 3) != 1) {
++			*(volatile uint32_t *)(smmu + 0xc00 + 4 * sid0_slot) = (s2cr & ~(3u << 16)) | (1u << 16);
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++		pmsg_log("[PONG_USB] smmu: SID 0 bypass slot=%d
++", sid0_slot);
++		return true;
++	} else if (free_slot >= 0) {
++		*(volatile uint32_t *)(smmu + 0xc00 + 4 * free_slot) = (1u << 16);
++		*(volatile uint32_t *)(smmu + 0x800 + 4 * free_slot) = 0x80000000U | 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		pmsg_log("[PONG_USB] smmu: SID 0 bypass free_slot=%d
++", free_slot);
++		return true;
++	} else {
++		pmsg_log("[PONG_USB] smmu: warning no free stream slot
++");
++		return false;
++	}
++}
++
++/* DWC3 Endpoint Commands and Transfers */
++static bool
++ep_cmd(unsigned ep, unsigned command, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	core_w(DWC3_DEPCMDPAR0(ep), p0);
++	core_w(DWC3_DEPCMDPAR1(ep), p1);
++	core_w(DWC3_DEPCMDPAR2(ep), p2);
++	core_w(DWC3_DEPCMD(ep), command | DWC3_DEPCMD_CMDACT);
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t v = core_r(DWC3_DEPCMD(ep));
++		if (!(v & DWC3_DEPCMD_CMDACT)) {
++			return (DWC3_DEPCMD_STATUS(v) == 0);
++		}
++		spin_us(1);
++	}
++	return false;
++}
++
++static bool
++ep_transfer(unsigned ep, unsigned trb_off, unsigned buf_off, unsigned size, unsigned type)
++{
++	volatile uint32_t *p = (volatile uint32_t *)(dma_wcomb + trb_off);
++	uint64_t addr = dma_phys + buf_off;
++	p[0] = (uint32_t)addr;
++	p[1] = (uint32_t)(addr >> 32);
++	p[2] = size;
++	__asm__ volatile("dsb sy" ::: "memory");
++	p[3] = type | DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_IOC | DWC3_TRB_CTRL_HWO;
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t trb_addr = dma_phys + trb_off;
++	return ep_cmd(ep, DWC3_DEPCMD_STARTTRANSFER, (uint32_t)(trb_addr >> 32), (uint32_t)trb_addr, 0);
++}
++
++static bool
++ep_config(unsigned ep, unsigned type, unsigned max_pkt)
++{
++	unsigned p0 = DWC3_DEPCFG_EP_TYPE(type) | DWC3_DEPCFG_MAX_PACKET_SIZE(max_pkt);
++	if (ep & 1) p0 |= DWC3_DEPCFG_FIFO_NUMBER(ep >> 1);
++	unsigned p1 = DWC3_DEPCFG_EP_NUMBER(ep) | DWC3_DEPCFG_XFER_COMPLETE_EN | DWC3_DEPCFG_XFER_NOT_READY_EN;
++	return ep_cmd(ep, DWC3_DEPCMD_SETEPCONFIG, p0, p1, 0) &&
++	       ep_cmd(ep, DWC3_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
++}
++
++static void
++arm_setup(void)
++{
++	ctl_stage = 0;
++	ep_transfer(0, OFF_EP_TRB, OFF_EP_DATA, 8, DWC3_TRBCTL_CONTROL_SETUP);
++}
++
++static void
++stall_control(void)
++{
++	ep_cmd(0, DWC3_DEPCMD_SETSTALL, 0, 0, 0);
++	arm_setup();
++}
++
++static void
++status_stage(unsigned ep)
++{
++	ctl_stage = 3;
++	ep_transfer(ep, OFF_EP_TRB, OFF_EP_DATA, 0,
++	    ctl_control_bytes ? DWC3_TRBCTL_CONTROL_STATUS3 : DWC3_TRBCTL_CONTROL_STATUS2);
++}
++
++static void
++control_data(unsigned ep, unsigned length)
++{
++	ctl_stage = 1;
++	ep_transfer(ep, OFF_EP_TRB, OFF_EP_DATA + 0x100, ep ? length : 64, DWC3_TRBCTL_CONTROL_DATA);
++}
++
++static void
++reset_endpoints(void)
++{
++	ctl_configured = false;
++	ctl_dtr = false;
++	ctl_tx_active = false;
++	ctl_rx_active = false;
++	cmd_len = 0;
++	core_w(DWC3_DALEPENA, 0);
++	if (!ep_cmd(0, DWC3_DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    !ep_config(0, 0, 64) || !ep_config(1, 0, 64)) {
++		return;
++	}
++	core_w(DWC3_DALEPENA, 3);
++	arm_setup();
++}
++
++/* Descriptors: Standard CDC-ACM */
++static const uint8_t dev_desc[18] = {
++	18, 1, 0x00, 0x02,  /* bcdUSB 2.0 */
++	2, 0, 0,            /* Class 2 (CDC), SubClass 0, Protocol 0 */
++	64,                 /* bMaxPacketSize0 = 64 */
++	0x09, 0x12,         /* idVendor = 0x1209 (pid.codes open source) */
++	0x6d, 0x31,         /* idProduct = 0x316d */
++	0x00, 0x01,         /* bcdDevice = 1.00 */
++	1, 2, 3,            /* iManufacturer, iProduct, iSerialNumber */
++	1                   /* bNumConfigurations = 1 */
++};
++
++static uint8_t cfg_desc[67] = {
++	9, 2, 67, 0, 2, 1, 0, 0xc0, 50, /* 67 bytes, 2 ifaces, self-powered, 100mA */
++	/* Interface 0: CDC Communication */
++	9, 4, 0, 0, 1, 2, 2, 1, 0,
++	5, 0x24, 0x00, 0x10, 0x01,       /* Header: CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 0x01,       /* Call Management: Data iface 1 */
++	4, 0x24, 0x02, 0x02,             /* ACM: Support Set/Get Line Coding */
++	5, 0x24, 0x06, 0x00, 0x01,       /* Union: Master if 0, Slave if 1 */
++	7, 5, 0x82, 3, 16, 0, 16,        /* EP2 IN (Interrupt), 16B, 16ms */
++	/* Interface 1: CDC Data */
++	9, 4, 1, 0, 2, 10, 0, 0, 0,      /* if 1, 2 endpoints, Class 10 */
++	7, 5, 0x81, 2, 64, 0, 0,         /* EP1 IN (Bulk) */
++	7, 5, 0x01, 2, 64, 0, 0          /* EP1 OUT (Bulk) */
++};
++
++static unsigned
++string_descriptor(unsigned index, uint8_t *out)
++{
++	if (index == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
++		return 4;
++	}
++	const char *str = (index == 1) ? "UniXNU" :
++	                  (index == 2) ? "SM-T970 iOS Control Port" :
++	                  (index == 3) ? "SM8250-GTS7XLWIFI" : "";
++	unsigned len = (unsigned)strlen(str);
++	if (len > 32) len = 32;
++	out[0] = (uint8_t)(2 + 2 * len);
++	out[1] = 3;
++	for (unsigned i = 0; i < len; i++) {
++		out[2 + 2 * i] = (uint8_t)str[i];
++		out[3 + 2 * i] = 0;
++	}
++	return out[0];
++}
++
++/* Command Dispatcher (Stage 1: ping only) */
++static void
++handle_command(const char *cmd)
++{
++	if (strcmp(cmd, "ping") == 0) {
++		pmsg_log("[PONG_USB] cmd: ping -> pong
++");
++		if (!ctl_tx_active) {
++			volatile uint8_t *tx_buf = (volatile uint8_t *)(dma_wcomb + OFF_TX_DATA);
++			tx_buf[0] = 'p'; tx_buf[1] = 'o'; tx_buf[2] = 'n'; tx_buf[3] = 'g'; tx_buf[4] = '
++';
++			ctl_tx_active = true;
++			ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, 5, DWC3_TRBCTL_NORMAL);
++		}
++	} else {
++		pmsg_log("[PONG_USB] unknown cmd: %s
++", cmd);
++	}
++}
++
++static void
++feed_input(const uint8_t *data, unsigned size)
++{
++	for (unsigned i = 0; i < size; i++) {
++		char c = (char)data[i];
++		if (c == '\r' || c == '\n') {
++			if (cmd_len > 0) {
++				cmd_buf[cmd_len] = '\0';
++				handle_command(cmd_buf);
++				cmd_len = 0;
++			}
++		} else if (c >= 32 && c <= 126 && cmd_len < sizeof(cmd_buf) - 1) {
++			cmd_buf[cmd_len++] = c;
++		}
++	}
++}
++
++/* Control Pipe Request Handler */
++static void
++handle_setup(void)
++{
++	volatile uint8_t *in = (volatile uint8_t *)(dma_wcomb + OFF_EP_DATA);
++	uint8_t type = in[0];
++	uint8_t req = in[1];
++	uint16_t val = (uint16_t)(in[2] | (in[3] << 8));
++	uint16_t idx = (uint16_t)(in[4] | (in[5] << 8));
++	uint16_t len = (uint16_t)(in[6] | (in[7] << 8));
++	ctl_control_bytes = len;
++	ctl_status_dep = (type & 0x80) ? 0 : 1;
++
++	uint8_t *out = (uint8_t *)(dma_wcomb + OFF_EP_DATA + 0x100);
++	unsigned resp_len = 0;
++
++	if ((type & 0x60) == 0 && req == 6 && (type & 0x80)) {
++		/* GET_DESCRIPTOR */
++		switch (val >> 8) {
++		case 1: /* Device */
++			memcpy(out, dev_desc, sizeof(dev_desc));
++			resp_len = sizeof(dev_desc);
++			break;
++		case 2: /* Configuration */
++			memcpy(out, cfg_desc, sizeof(cfg_desc));
++			resp_len = sizeof(cfg_desc);
++			break;
++		case 3: /* String */
++			resp_len = string_descriptor(val & 0xff, out);
++			break;
++		case 6: { /* Device Qualifier */
++			uint8_t q[10] = {10, 6, 0x00, 0x02, dev_desc[4], dev_desc[5], dev_desc[6], 64, 1, 0};
++			memcpy(out, q, 10);
++			resp_len = 10;
++			break;
++		}
++		default:
++			stall_control();
++			return;
++		}
++	} else if (type == 0 && req == 5 && !len && val < 128) {
++		/* SET_ADDRESS */
++		core_w(DWC3_DCFG, (core_r(DWC3_DCFG) & ~(127u << 3)) | ((uint32_t)val << 3));
++		status_stage(1);
++		return;
++	} else if (type == 0 && req == 9 && !len && val <= 1) {
++		/* SET_CONFIGURATION */
++		if (ctl_configured && val == 1) {
++			status_stage(1);
++			return;
++		}
++		ctl_configured = (val != 0);
++		if (ctl_configured) {
++			if (!ep_config(2, 2, ctl_packet_size) ||
++			    !ep_config(3, 2, ctl_packet_size) ||
++			    !ep_config(5, 3, 16)) {
++				stall_control();
++				return;
++			}
++			core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << 2) | (1u << 3) | (1u << 5));
++			pmsg_log("[PONG_USB] configured: speed=%s packet=%u
++",
++			    (ctl_packet_size == 512) ? "HS" : "FS", ctl_packet_size);
++		} else {
++			ctl_dtr = false;
++		}
++		status_stage(1);
++		return;
++	} else if (type == 0x02 && req == 1 && !len) {
++		/* CLEAR_FEATURE (ENDPOINT_HALT) */
++		unsigned ep = ((idx & 15) << 1) | ((idx >> 7) & 1);
++		if (ep == 2 || ep == 3 || ep == 5) {
++			ep_cmd(ep, DWC3_DEPCMD_CLEARSTALL, 0, 0, 0);
++		}
++		status_stage(1);
++		return;
++	} else if (type == 0x80 && req == 0 && len == 2) {
++		/* GET_STATUS (DEVICE) */
++		out[0] = 1; out[1] = 0; /* Self-powered */
++		resp_len = 2;
++	} else if (type == 0x81 && req == 0 && len == 2) {
++		/* GET_STATUS (INTERFACE) */
++		out[0] = 0; out[1] = 0;
++		resp_len = 2;
++	} else if (type == 0x82 && req == 0 && len == 2) {
++		/* GET_STATUS (ENDPOINT) */
++		out[0] = 0; out[1] = 0;
++		resp_len = 2;
++	} else if (type == 0xa1 && req == 0x21 && len == 7) {
++		/* CDC: GET_LINE_CODING */
++		uint8_t coding[7] = {0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08}; /* 115200 8N1 */
++		memcpy(out, coding, 7);
++		resp_len = 7;
++	} else if (type == 0x21 && req == 0x20 && len == 7) {
++		/* CDC: SET_LINE_CODING */
++		control_data(0, 7);
++		return;
++	} else if (type == 0x21 && req == 0x22 && !len) {
++		/* CDC: SET_CONTROL_LINE_STATE */
++		ctl_dtr = (val & 1) != 0;
++		cmd_len = 0;
++		status_stage(1);
++		if (ctl_configured && ctl_dtr && !ctl_rx_active) {
++			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
++		}
++		return;
++	} else if (type == 0x21 && req == 0x23 && !len) {
++		/* CDC: SEND_BREAK */
++		status_stage(1);
++		return;
++	} else {
++		stall_control();
++		return;
++	}
++
++	if (resp_len > len) resp_len = len;
++	if (len > 0) control_data(1, resp_len);
++	else status_stage(ctl_status_dep);
++}
++
++/* Endpoint Event Handler */
++static void
++handle_ep_event(uint32_t event)
++{
++	unsigned ep = (event >> 1) & 31;
++	unsigned kind = (event >> 6) & 15;
++	unsigned status = (event >> 12) & 15;
++
++	if (ep >= 2) {
++		if (kind == DWC3_DEPEVT_XFERCOMPLETE) {
++			if (ep == 3) {
++				ctl_tx_active = false;
++			}
++			if (ep == 2 && ctl_rx_active) {
++				__asm__ volatile("dsb sy" ::: "memory");
++				uint32_t residual = *(volatile uint32_t *)(dma_wcomb + OFF_RX_TRB + 8) & 0xffffff;
++				if (!(status & 1) && residual <= ctl_packet_size) {
++					unsigned rcvd = ctl_packet_size - residual;
++					if (rcvd > 0) {
++						feed_input((const uint8_t *)(dma_wcomb + OFF_RX_DATA), rcvd);
++					}
++				}
++				ctl_rx_active = false;
++				if (ctl_configured && ctl_dtr) {
++					ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
++				}
++			}
++		}
++		return;
++	}
++
++	/* Control EP0/EP1 */
++	if (kind == DWC3_DEPEVT_XFERNOTREADY && ctl_stage == 2 && status == 1) {
++		status_stage(ep);
++		return;
++	}
++	if (kind != DWC3_DEPEVT_XFERCOMPLETE) return;
++
++	if (ctl_stage == 0) {
++		handle_setup();
++		return;
++	}
++	if (ctl_stage == 1) {
++		ctl_stage = 2;
++		return;
++	}
++	if (ctl_stage == 3) {
++		arm_setup();
++		return;
++	}
++}
++
++/* Event Ring Processing */
++static void
++process_events(void)
++{
++	unsigned count = core_r(DWC3_GEVNTCOUNT(0)) & 0xfffc;
++	if (count > 4096) {
++		pmsg_log("[PONG_USB] event ring overflow\n");
++		return;
++	}
++	for (unsigned done = 0; done < count; done += 4) {
++		uint32_t event = *(volatile uint32_t *)(dma_wcomb + OFF_EVT_RING + ctl_event_offset);
++		ctl_event_offset = (ctl_event_offset + 4) & 4095;
++		if (!(event & 1)) {
++			handle_ep_event(event);
++		} else {
++			unsigned dev_evt = (event >> 8) & 15;
++			switch (dev_evt) {
++			case 0: /* Disconnect */
++				ctl_configured = false;
++				ctl_dtr = false;
++				break;
++			case 1: /* USB Reset */
++				pmsg_log("[PONG_USB] usb_reset\n");
++				core_w(DWC3_DCFG, core_r(DWC3_DCFG) & ~(127u << 3));
++				reset_endpoints();
++				break;
++			case 2: { /* Connection speed done */
++				uint32_t spd = DWC3_DSTS_CONNECTSPD(core_r(DWC3_DSTS));
++				ctl_packet_size = (spd == 0) ? 512 : 64;
++				cfg_desc[57] = cfg_desc[64] = (uint8_t)ctl_packet_size;
++				cfg_desc[58] = cfg_desc[65] = (uint8_t)(ctl_packet_size >> 8);
++				break;
++			}
++			default:
++				break;
++			}
++		}
++	}
++	if (count > 0) {
++		core_w(DWC3_GEVNTCOUNT(0), count);
++	}
++}
++
++/* Worker Thread */
++static void
++pong_usb_ctl_worker(__unused void *param, __unused wait_result_t wr)
++{
++	pmsg_log("[PONG_USB] ready: listening on CDC-ACM\n");
++	while (1) {
++		process_events();
++		if (ctl_configured && ctl_dtr && !ctl_rx_active) {
++			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
++		}
++		delay_for_interval(2, NSEC_PER_MSEC);
++	}
++}
++
++/* Public Initialization Routine */
++void
++pong_usb_ctl_init(void)
++{
++	uint32_t enabled = 0;
++	if (!PE_parse_boot_argn("pong_usb_ctl", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	ctl_enabled = true;
++	pmsg_log("[PONG_USB] init: starting SM-T970 USB CDC-ACM control channel\n");
++
++	/* 1. Map TLMM and route MAX77705 MUIC */
++	tlmm_base = ml_io_map(TLMM_NORTH_PHYS, TLMM_SIZE);
++	if (!tlmm_base) {
++		pmsg_log("[PONG_USB] fail: ml_io_map(TLMM_NORTH)\n");
++		return;
++	}
++	cfg_sda = rd(GPIO_CFG(tlmm_base, PIN_SDA)) & ~(CFG_FUNCTION | CFG_OUTPUT_ENABLE);
++	cfg_scl = rd(GPIO_CFG(tlmm_base, PIN_SCL)) & ~(CFG_FUNCTION | CFG_OUTPUT_ENABLE);
++	wr(GPIO_CFG(tlmm_base, PIN_SDA), cfg_sda);
++	wr(GPIO_CFG(tlmm_base, PIN_SCL), cfg_scl);
++	spin_us(100);
++
++	if (pong_muic_route()) {
++		pmsg_log("[PONG_USB] muic: i2c slave 0x25 route ok\n");
++	} else {
++		pmsg_log("[PONG_USB] muic: warning route no ack\n");
++	}
++
++	/* 2. Configure SMMU SID 0 Bypass */
++	smmu_base = ml_io_map(APPS_SMMU_PHYS, APPS_SMMU_SIZE);
++	if (smmu_base) {
++		pong_smmu_setup_sid0_bypass(smmu_base);
++	}
++
++	/* 3. Allocate DMA contiguous buffer (32 KiB) */
++	dma_phys = 0;
++	dma_virt = IOMallocContiguous(USB_DMA_BYTES, 4096, &dma_phys);
++	if (!dma_virt || !dma_phys) {
++		pmsg_log("[PONG_USB] fail: IOMallocContiguous 32K\n");
++		return;
++	}
++	dma_wcomb = ml_io_map_wcomb((vm_offset_t)dma_phys, USB_DMA_BYTES);
++	if (!dma_wcomb) {
++		pmsg_log("[PONG_USB] fail: ml_io_map_wcomb DMA\n");
++		return;
++	}
++	memset((void *)dma_wcomb, 0, USB_DMA_BYTES);
++	__asm__ volatile("dsb sy" ::: "memory");
++	pmsg_log("[PONG_USB] dma: allocated phys=0x%llx\n", (uint64_t)dma_phys);
++
++	/* 4. Map DWC3 Core and QSCRATCH */
++	core_base = ml_io_map(DWC3_CORE_PHYS, DWC3_CORE_SIZE);
++	qscratch_base = ml_io_map(QSCRATCH_PHYS, QSCRATCH_SIZE);
++	if (!core_base || !qscratch_base) {
++		pmsg_log("[PONG_USB] fail: ml_io_map core/qscratch\n");
++		return;
++	}
++
++	uint32_t id = core_r(DWC3_GSNPSID) & 0xffff0000;
++	pmsg_log("[PONG_USB] dwc3: core id=0x%08x\n", core_r(DWC3_GSNPSID));
++	if (id != 0x55330000 && id != 0x55340000 && id != 0x33310000) {
++		pmsg_log("[PONG_USB] fail: unexpected core id\n");
++		return;
++	}
++
++	/* Stop controller */
++	core_w(DWC3_DCTL, core_r(DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
++	for (unsigned i = 0; i < 250; i++) {
++		if (core_r(DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) break;
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	core_w(DWC3_DEVTEN, 0);
++	core_w(DWC3_DALEPENA, 0);
++
++	/* Soft reset core */
++	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_CSFTRST);
++	for (unsigned i = 0; i < 250; i++) {
++		if (!(core_r(DWC3_DCTL) & DWC3_DCTL_CSFTRST)) break;
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++
++	/* Setup PHY and DCFG */
++	core_w(DWC3_GUSB2PHYCFG(0), core_r(DWC3_GUSB2PHYCFG(0)) & ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM));
++	core_w(DWC3_DCFG, (core_r(DWC3_DCFG) & ~0x3ffu) | 0);
++
++	/* Event Ring */
++	core_w(DWC3_GEVNTADRLO(0), (uint32_t)dma_phys);
++	core_w(DWC3_GEVNTADRHI(0), (uint32_t)(dma_phys >> 32));
++	core_w(DWC3_GEVNTSIZ(0), 4096u | (1u << 31));
++	core_w(DWC3_GEVNTCOUNT(0), 0);
++	ctl_event_offset = 0;
++
++	/* Force Device Mode and disable clock gating */
++	core_w(DWC3_GCTL, (core_r(DWC3_GCTL) & ~(3u << 12)) | (2u << 12) | DWC3_GCTL_DSBLCLKGTNG);
++
++	/* Reset Endpoints and arm EP0 SETUP */
++	reset_endpoints();
++
++	/* Enable Events */
++	core_w(DWC3_DEVTEN, 0x0f);
++
++	/* 5. QSCRATCH VBUS Override */
++	qs_w(0x30, qs_r(0x30) | (1u << 24));
++	qs_w(0x10, qs_r(0x10) | (1u << 20) | (1u << 28));
++	if ((qs_r(0x10) & ((1u << 20) | (1u << 28))) == ((1u << 20) | (1u << 28))) {
++		pmsg_log("[PONG_USB] qscratch: vbus override latched\n");
++	}
++
++	/* Start Controller */
++	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
++
++	/* Start worker thread */
++	thread_t t = NULL;
++	if (kernel_thread_start(pong_usb_ctl_worker, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	} else {
++		pmsg_log("[PONG_USB] fail: kernel_thread_start\n");
++	}
++}
