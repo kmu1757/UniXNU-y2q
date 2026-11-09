@@ -44,7 +44,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -0,0 +1,1440 @@
+@@ -0,0 +1,1457 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * SM-T970 (SM8250/kona) USB CDC-ACM Control Channel Driver for iPadOS 18.
@@ -644,6 +644,13 @@ index 0000000..2222222
 +static void process_events(void);
 +
 +/* Bulk IN Transmission Helper (synchronous wait for transfer complete) */
++/* Device mappings must be read through volatile byte accesses. */
++static void
++copy_from_device(uint8_t *dst, const volatile uint8_t *src, unsigned len)
++{
++	for (unsigned i = 0; i < len; i++) dst[i] = src[i];
++}
++
 +static void
 +send_response(const void *data, unsigned len)
 +{
@@ -745,7 +752,7 @@ index 0000000..2222222
 +		return;
 +	}
 +
-+	struct pong_ramoops_header *hdr = (struct pong_ramoops_header *)ramoops_console_base;
++	volatile struct pong_ramoops_header *hdr = (volatile struct pong_ramoops_header *)ramoops_console_base;
 +	if (hdr->sig != PONG_RAMOOPS_MAGIC) {
 +		send_str("ERROR: ramoops console bad magic\n");
 +		return;
@@ -759,15 +766,23 @@ index 0000000..2222222
 +		return;
 +	}
 +
++	/* Bound one log request so USB polling yields regularly on a busy console. */
++	const uint32_t max_log_bytes = 65536;
++	uint32_t skip = (size > max_log_bytes) ? size - max_log_bytes : 0;
++	uint32_t remaining = size - skip;
++	uint32_t pos = (size == capacity) ? (start + skip) % capacity : skip;
++	uint8_t staging[4096];
 +	send_str("[LOG_START]\n");
-+	const char *buffer = (const char *)(ramoops_console_base + PONG_RAMOOPS_HEADER_BYTES);
-+
-+	if (size == capacity) {
-+		uint32_t tail = capacity - start;
-+		if (tail > 0) send_response(buffer + start, tail);
-+		if (start > 0) send_response(buffer, start);
-+	} else {
-+		if (size > 0) send_response(buffer, size);
++	if (skip) send_str("[LOG_TRUNCATED: newest 65536 bytes]\n");
++	volatile const uint8_t *buffer = (volatile const uint8_t *)(ramoops_console_base + PONG_RAMOOPS_HEADER_BYTES);
++	while (remaining > 0 && ctl_configured) {
++		uint32_t chunk = remaining > sizeof(staging) ? sizeof(staging) : remaining;
++		uint32_t tail = capacity - pos;
++		if (chunk > tail) chunk = tail;
++		copy_from_device(staging, buffer + pos, chunk);
++		send_response(staging, chunk);
++		remaining -= chunk;
++		pos = (pos + chunk) % capacity;
 +	}
 +	send_str("\n[LOG_END]\n");
 +}
@@ -821,11 +836,12 @@ index 0000000..2222222
 +	snprintf(header, sizeof(header), "SCREENSHOT %u %u BGRA %u\n", width, height, total_bytes);
 +	send_str(header);
 +
-+	const uint8_t *fb = (const uint8_t *)vinfo.v_baseaddr;
++	const volatile uint8_t *fb = (const volatile uint8_t *)vinfo.v_baseaddr;
++	uint8_t staging[4096];
 +	unsigned sent = 0;
 +	while (sent < total_bytes && ctl_configured) {
 +		unsigned chunk = total_bytes - sent;
-+		if (chunk > 4096) chunk = 4096;
++		if (chunk > sizeof(staging)) chunk = sizeof(staging);
 +
 +		for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
 +			process_events();
@@ -836,7 +852,8 @@ index 0000000..2222222
 +			return;
 +		}
 +
-+		memcpy((void *)(dma_wcomb + OFF_TX_DATA), fb + sent, chunk);
++		copy_from_device(staging, fb + sent, chunk);
++		memcpy((void *)(dma_wcomb + OFF_TX_DATA), staging, chunk);
 +		ctl_tx_active = true;
 +		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, chunk, DWC3_TRBCTL_NORMAL);
 +		sent += chunk;
