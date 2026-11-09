@@ -45,7 +45,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_cpu_perf.c
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,203 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * Qualcomm SM8250 (SM-T970, gts7xlwifi) EPSS CPU Performance Scaling Driver
@@ -107,7 +107,7 @@ index 0000000..2222222
 +#define EPSS_LUT_MAX_ROWS       40
 +#define EPSS_XO_KHZ             19200
 +#define EPSS_ALTERNATE_KHZ      300000
-+#define MODERATE_TARGET_KHZ     1800000
++#define MODERATE_TARGET_KHZ     2000000
 +
 +static const vm_offset_t epss_phys_bases[EPSS_NUM_DOMAINS] = {
 +	EPSS_BASE_PHYS_D0,
@@ -141,7 +141,7 @@ index 0000000..2222222
 +	/* Small delay to let scheduler and SMP bringup fully settle */
 +	delay_for_interval(100, NSEC_PER_MSEC);
 +
-+	cpu_perf_log("[PONG_CPU] init: mode=%d (1=moderate 1.8G, 2=max)\n", perf_mode);
++	cpu_perf_log("[PONG_CPU] init: mode=%d (1=Silver max, Gold/Prime >=2.0G; 2=all max)\n", perf_mode);
 +
 +	for (uint32_t domain = 0; domain < EPSS_NUM_DOMAINS; domain++) {
 +		vm_offset_t phys = epss_phys_bases[domain];
@@ -184,39 +184,15 @@ index 0000000..2222222
 +			continue;
 +		}
 +
-+		/* Report current state and LUT summary to pmsg */
++		/* Keep the original row as a floor: never request below boot state. */
 +		uint32_t cur_khz = (cur_row < num_rows) ? lut_khz[cur_row] : 0;
-+		cpu_perf_log("[PONG_CPU] D%u: en=%u cur_row=%u (%u kHz) rows=%u (%u..%u kHz)\n",
-+		    domain, is_enabled, cur_row, cur_khz, num_rows, lut_khz[0], lut_khz[num_rows - 1]);
-+
-+		/* Report all LUT rows in compact lines to pmsg */
-+		char lut_line[128];
-+		int offset = 0;
-+		for (uint32_t r = 0; r < num_rows; r++) {
-+			if (r % 4 == 0) {
-+				if (offset > 0) {
-+					cpu_perf_log("%s\n", lut_line);
-+				}
-+				offset = snprintf(lut_line, sizeof(lut_line), "[PONG_CPU] D%u LUT: [%u]=%u",
-+				    domain, r, lut_khz[r]);
-+			} else {
-+				if (offset < (int)sizeof(lut_line) - 20) {
-+					offset += snprintf(lut_line + offset, sizeof(lut_line) - offset, " [%u]=%u",
-+					    r, lut_khz[r]);
-+				}
-+			}
-+		}
-+		if (offset > 0) {
-+			cpu_perf_log("%s\n", lut_line);
++		if (!is_enabled) {
++			cpu_perf_log("[PONG_CPU] D%u skip en=0 cur=r%u\n", domain, cur_row);
++			continue;
 +		}
 +
-+		/* 4. Calculate target row:
-+		 * Mode 1 (Moderate):
-+		 *   - Domain 0 (Silver): max frequency row
-+		 *   - Domain 1 (Gold) & 2 (Prime): closest row to ~1.8 GHz (MODERATE_TARGET_KHZ)
-+		 * Mode 2 (Max):
-+		 *   - All domains: max frequency row
-+		 */
++
++		/* Mode 1 raises Silver to max; Gold/Prime use max(current, ~2 GHz). */
 +		uint32_t target_row = num_rows - 1;
 +		if (perf_mode == 1 && domain > 0) {
 +			uint32_t best_row = 0;
@@ -229,7 +205,7 @@ index 0000000..2222222
 +					best_row = r;
 +				}
 +			}
-+			target_row = best_row;
++			target_row = (cur_row < num_rows && cur_khz > lut_khz[best_row]) ? cur_row : best_row;
 +		}
 +
 +		/* 5. Write ONLY REG_PERF_STATE */
@@ -239,12 +215,20 @@ index 0000000..2222222
 +		/* 6. Read back and verify */
 +		uint32_t readback_row = *(volatile uint32_t *)(base + EPSS_REG_PERF_STATE);
 +		uint32_t readback_khz = (readback_row < num_rows) ? lut_khz[readback_row] : 0;
-+		cpu_perf_log("[PONG_CPU] D%u: row %u -> %u (%u kHz), readback row %u (%u kHz)%s\n",
-+		    domain, cur_row, target_row, lut_khz[target_row],
-+		    readback_row, readback_khz,
-+		    (readback_row == target_row) ? " [OK]" : " [MISMATCH]");
++		cpu_perf_log("[PONG_CPU] D%u r%u->r%u %u->%u %s\n",
++		    domain, cur_row, target_row, cur_khz, readback_khz,
++		    (readback_row == target_row) ? "ok" : "mismatch");
 +	}
 +
++	/* One delayed state readback catches policy changes after boot. */
++	delay_for_interval(60, NSEC_PER_SEC);
++	for (uint32_t domain = 0; domain < EPSS_NUM_DOMAINS; domain++) {
++		vm_offset_t base = ml_io_map(epss_phys_bases[domain], EPSS_DOMAIN_SIZE);
++		if (base) {
++			uint32_t row = *(volatile uint32_t *)(base + EPSS_REG_PERF_STATE);
++			cpu_perf_log("[PONG_CPU] D%u state: r%u after60s\n", domain, row);
++		}
++	}
 +	cpu_perf_log("[PONG_CPU] cpu_perf complete\n");
 +	thread_terminate(current_thread());
 +}

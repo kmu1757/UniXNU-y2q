@@ -13,7 +13,7 @@ index fd213cf..cf3d053 100644
  #include <pexpert/arm64/board_config.h>
  #if defined(PONG)
  #include <kern/clock.h>
-@@ -11,236 +12,293 @@
+@@ -11,236 +12,311 @@
  #include <pexpert/pexpert.h>
  #include <sys/pong_input.h>
  #include <sys/systm.h>
@@ -52,6 +52,7 @@ index fd213cf..cf3d053 100644
 +};
 +
 +static uint32_t log_count[3];
++static bool buttons_init_started;
 +
 +static void pmsg_log(const char *fmt, ...)
 +{
@@ -394,6 +395,8 @@ index fd213cf..cf3d053 100644
 +           keys[0].usable, keys[1].usable, keys[2].usable, buttons_mask);
 +
 +    unsigned failures = 0;
++    uint64_t start_time = mach_absolute_time();
++    bool summary_logged = false;
 +    bool gen3 = (id[1] == 9);
 +    uint8_t pwr_mask = gen3 ? 0x80 : 0x01;
 +    uint8_t voldn_mask = gen3 ? 0x40 : 0x02;
@@ -437,6 +440,16 @@ index fd213cf..cf3d053 100644
 -            printf("Pong keys: repeated observer read failure; stop optional polling\n");break;
 +
 +        failures = good ? 0 : failures + 1;
++        if (!summary_logged) {
++            uint64_t elapsed_ns = 0;
++            absolutetime_to_nanoseconds(mach_absolute_time() - start_time, &elapsed_ns);
++            if (elapsed_ns >= 60ULL * NSEC_PER_SEC) {
++                pmsg_log("[PONG_KEYS] state: pwr=%u/%u up=%u/%u dn=%u/%u fail=%u\n",
++                         keys[0].usable, keys[0].down, keys[1].usable, keys[1].down,
++                         keys[2].usable, keys[2].down, failures);
++                summary_logged = true;
++            }
++        }
 +        if (failures >= 8) {
 +            for (unsigned i = 0; i < 3; i++) {
 +                if (keys[i].down) pong_touch_post(PONG_BUTTON_UP, keys[i].code, 0, 0);
@@ -487,7 +500,12 @@ index fd213cf..cf3d053 100644
 -    if (!PE_parse_boot_argn("pong_buttons",&enabled,sizeof(enabled)) || !enabled) return;
 -    if (kernel_thread_start(keys_thread,NULL,&t)==KERN_SUCCESS) thread_deallocate(t);
 +    thread_t th = THREAD_NULL;
-+    if (!PE_parse_boot_argn("pong_buttons", &buttons_mask, sizeof(buttons_mask)) || (buttons_mask & 3) == 0) return;
++    bool parsed = PE_parse_boot_argn("pong_buttons", &buttons_mask, sizeof(buttons_mask));
++    pmsg_log("[PONG_KEYS] init: parsed=%u mask=0x%x started=%u\n", parsed, buttons_mask, buttons_init_started);
++    if (!parsed || (buttons_mask & 3) == 0) return;
++    if (buttons_init_started) return;
++    buttons_init_started = true;
 +    if (kernel_thread_start(keys_thread, NULL, &th) == KERN_SUCCESS) thread_deallocate(th);
++    else pmsg_log("[PONG_KEYS] fail: kernel_thread_start\n");
  }
  #endif
