@@ -1,0 +1,304 @@
+diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
+index 2c7a6e1..d45e1c3 100644
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -1528,5 +1528,6 @@
+ #define kRootDomainSettingsCount           20
+ #define kRootDomainNoPublishSettingsCount  4
++extern "C" void pong_battery_start(IOService *);
+ 
+ bool
+ IOPMrootDomain::start( IOService * nub )
+@@ -1818,4 +1819,5 @@ IOPMrootDomain::start( IOService * nub )
+ 	registerService();                  // let clients find us
+ 
++	pong_battery_start(this);
+ 	return true;
+ }
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index 9c8aa45..d369251 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -31,5 +31,9 @@
+ #include <IOKit/IOLib.h>
+ #include <os/log.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <libkern/c++/OSNumber.h>
++#include <stdint.h>
+ 
+ #define super IOService
+ 
+@@ -580,5 +584,272 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+ OSDictionary *
+ IOPMPowerSource::legacyIOBatteryInfo(void)
+ {
+ 	return OSDynamicCast(OSDictionary, properties->getObject(batteryInfoKey));
+ }
++
++/*
++ * SM-T970 MAX77705 telemetry. All transactions below are I2C reads. The
++ * charger is observed for input/charge state; no charger configuration,
++ * watchdog, regulator, or MUIC command is written by this feature.
++ *
++ * DT evidence: work/gts7xlwifi.dtb, /soc/i2c@980000 (QUP SE0, Linux bus 2),
++ * with North TLMM GPIO 28 SDA / 29 SCL. Fuel gauge 0x36 and charger 0x69
++ * share this bus with the MAX77705 companion PMIC at 0x66. GPIO 19-23 and
++ * 40-42 are not used. The bus is enabled only by pong_battery=1.
++ */
++namespace {
++constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
++constexpr vm_size_t kT970TlmmBytes = 0x100000;
++constexpr unsigned kT970Sda = 28, kT970Scl = 29;
++constexpr uint8_t kT970Gauge = 0x36, kT970Charger = 0x69;
++constexpr unsigned kT970RsenseMilliOhm = 5;
++constexpr uint32_t kT970OutEnable = 1u << 9;
++constexpr uint32_t kT970FuncMask = 0xfu << 2;
++volatile uint32_t *gT970Tlmm;
++uint32_t gT970SdaCfg, gT970SclCfg;
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" void pong_ramoops_diagnostic_write(const char *, int);
++static void batteryPmsg(const char *fmt, ...) {
++	char buf[128]; va_list ap; va_start(ap, fmt);
++	int n = vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
++	if (n > 0) pong_ramoops_diagnostic_write(buf, n < int(sizeof(buf)) ? n : int(sizeof(buf)) - 1);
++}
++
++static inline uint32_t gpioCfg(unsigned pin) { return 0x1000u * pin; }
++static inline uint32_t gpioIo(unsigned pin) { return 0x1000u * pin + 4; }
++static inline void gpioWrite(uint32_t off, uint32_t v) {
++	gT970Tlmm[off / 4] = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static inline uint32_t gpioRead(uint32_t off) { return gT970Tlmm[off / 4]; }
++static inline void delayHalf(void) { IODelay(5); }
++static void line(unsigned pin, bool release) {
++	const uint32_t cfg = pin == kT970Sda ? gT970SdaCfg : gT970SclCfg;
++	if (release) {
++		gpioWrite(gpioCfg(pin), cfg & ~kT970OutEnable);
++	} else {
++		gpioWrite(gpioIo(pin), 0);
++		gpioWrite(gpioCfg(pin), cfg | kT970OutEnable);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static bool sclRelease(void) {
++	line(kT970Scl, true);
++	for (unsigned us = 0; us < 1000; ++us) {
++		if (gpioRead(gpioIo(kT970Scl)) & 1) return true;
++		IODelay(1);
++	}
++	return false;
++}
++static bool busStart(void) {
++	line(kT970Sda, true);
++	if (!sclRelease()) return false;
++	delayHalf();
++	if (!(gpioRead(gpioIo(kT970Sda)) & 1)) return false;
++	line(kT970Sda, false);
++	delayHalf();
++	line(kT970Scl, false);
++	delayHalf();
++	return true;
++}
++static void busStop(void) {
++	line(kT970Sda, false);
++	(void)sclRelease();
++	delayHalf();
++	line(kT970Sda, true);
++	delayHalf();
++}
++static bool putByte(uint8_t value) {
++	for (int bit = 7; bit >= 0; --bit) {
++		line(kT970Sda, (value & (1u << bit)) != 0);
++		delayHalf();
++		if (!sclRelease()) return false;
++		delayHalf();
++		line(kT970Scl, false);
++	}
++	line(kT970Sda, true);
++	delayHalf();
++	if (!sclRelease()) return false;
++	const bool ack = (gpioRead(gpioIo(kT970Sda)) & 1) == 0;
++	delayHalf();
++	line(kT970Scl, false);
++	return ack;
++}
++static bool getByte(uint8_t *value, bool ack) {
++	uint8_t byte = 0;
++	line(kT970Sda, true);
++	for (int bit = 7; bit >= 0; --bit) {
++		delayHalf();
++		if (!sclRelease()) return false;
++		if (gpioRead(gpioIo(kT970Sda)) & 1) byte |= uint8_t(1u << bit);
++		delayHalf();
++		line(kT970Scl, false);
++	}
++	line(kT970Sda, !ack);
++	delayHalf();
++	if (!sclRelease()) return false;
++	delayHalf();
++	line(kT970Scl, false);
++	line(kT970Sda, true);
++	*value = byte;
++	return true;
++}
++
++/* Returns 0 on success, negative stage on failure; never issues a write. */
++static int readReg(uint8_t address, uint8_t reg, uint8_t *out, unsigned count) {
++	if (!gT970Tlmm) return -1;
++	if (!count || count > 2 || !busStart()) { busStop(); return -2; }
++	if (!putByte(uint8_t(address << 1))) { busStop(); return -3; }
++	if (!putByte(reg)) { busStop(); return -4; }
++	if (!busStart()) { busStop(); return -5; }
++	if (!putByte(uint8_t((address << 1) | 1))) { busStop(); return -6; }
++	for (unsigned i = 0; i < count; ++i) {
++		if (!getByte(&out[i], i + 1 < count)) { busStop(); return -7; }
++	}
++	busStop();
++	return 0;
++}
++static int readWord(uint8_t address, uint8_t reg, uint16_t *value) {
++	uint8_t b[2] = {};
++	const int rc = readReg(address, reg, b, 2);
++	if (!rc) *value = uint16_t(b[0] | uint16_t(b[1]) << 8);
++	return rc;
++}
++struct BatterySample {
++	unsigned permille, voltageMv, fullMah, designMah, cycles;
++	int currentMa;
++	int chargerRc;
++	bool chargerValid, external, charging, full;
++};
++static int sample(BatterySample *s) {
++	uint16_t soc = 0, vcell = 0, current = 0, full = 0, design = 0, cycles = 0;
++	int rc;
++	if ((rc = readWord(kT970Gauge, 0x06, &soc))) return -10 + rc;
++	if ((rc = readWord(kT970Gauge, 0x09, &vcell))) return -20 + rc;
++	if ((rc = readWord(kT970Gauge, 0x0a, &current))) return -30 + rc;
++	if ((rc = readWord(kT970Gauge, 0x35, &full))) return -40 + rc;
++	if ((rc = readWord(kT970Gauge, 0x18, &design))) return -50 + rc;
++	if ((rc = readWord(kT970Gauge, 0x17, &cycles))) return -60 + rc;
++	s->permille = ((unsigned(soc >> 8) * 100 + unsigned(soc & 0xff) * 100 / 256) / 10);
++	if (s->permille > 1000 || !full) return -70;
++	s->voltageMv = unsigned(vcell & 0x0fff) * 78125u / 1000000u +
++		((((unsigned(vcell & 0xf000) >> 4) * 78125u / 1000000u) << 4));
++	s->currentMa = int(int16_t(current)) * 15625 * int(kT970RsenseMilliOhm) / 100000;
++	s->fullMah = unsigned(full) * kT970RsenseMilliOhm / 2;
++	s->designMah = unsigned(design) * kT970RsenseMilliOhm / 2;
++	s->cycles = unsigned(cycles) / 100;
++	uint8_t intOk = 0, details = 0;
++	const int irc = readReg(kT970Charger, 0xb2, &intOk, 1);
++	const int drc = irc ? irc : readReg(kT970Charger, 0xb4, &details, 1);
++	s->chargerRc = drc;
++	s->chargerValid = !drc;
++	if (s->chargerValid) {
++		const unsigned state = details & 0x0f;
++		s->external = (intOk & 0x40) != 0;
++		s->charging = s->external && state <= 3;
++		s->full = s->external && state == 4;
++	}
++	return 0;
++}
++static void setNumber(IOPMPowerSource *ps, const char *key, uint64_t value) {
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n) { ps->setProperty(key, n); n->release(); }
++}
++static void setBoolean(IOPMPowerSource *ps, const char *key, bool value) {
++	ps->setProperty(key, value ? kOSBooleanTrue : kOSBooleanFalse);
++}
++static void publish(IOPMPowerSource *ps, const BatterySample &s) {
++	const unsigned capacityMah = unsigned(uint64_t(s.fullMah) * s.permille / 1000);
++	ps->setBatteryInstalled(true);
++	ps->setCurrentCapacity(capacityMah);
++	ps->setMaxCapacity(s.fullMah);
++	ps->setAtWarnLevel(s.permille <= 150);
++	ps->setAtCriticalLevel(s.permille <= 50);
++	ps->setVoltage(s.voltageMv);
++	ps->setAmperage(s.currentMa);
++	ps->setCycleCount(s.cycles);
++	ps->setTimeRemaining(-1);
++	setBoolean(ps, "HasBattery", true);
++	setBoolean(ps, "GasGaugeCapability", true);
++	setNumber(ps, "BatteryCurrentCapacity", s.permille / 10);
++	setNumber(ps, "DesignCapacity", s.designMah);
++	setNumber(ps, "AppleRawMaxCapacity", s.fullMah);
++	setNumber(ps, "InstantAmperage", uint32_t(s.currentMa));
++	if (s.chargerValid) {
++		ps->setExternalConnected(s.external);
++		ps->setExternalChargeCapable(s.external);
++		ps->setIsCharging(s.charging);
++		setBoolean(ps, "FullyCharged", s.full);
++		setBoolean(ps, "BatteryIsCharging", s.charging);
++		setBoolean(ps, "BatteryIsFullyCharged", s.full);
++		setBoolean(ps, "ExternalPowerSourceConnected", s.external);
++		setBoolean(ps, "ExternalChargeCapability", s.external);
++	}
++	ps->updateStatus();
++}
++static void batteryWorker(void *arg, wait_result_t) {
++	IOService *provider = static_cast<IOService *>(arg);
++	thread_set_thread_name(current_thread(), "pong-battery");
++	gT970Tlmm = reinterpret_cast<volatile uint32_t *>(ml_io_map(kT970TlmmNorth, kT970TlmmBytes));
++	if (!gT970Tlmm) {
++		batteryPmsg("PONG_BATT fail tlmm-map\n");
++		provider->release(); return;
++	}
++	gT970SdaCfg = gpioRead(gpioCfg(kT970Sda)) & ~(kT970FuncMask | kT970OutEnable);
++	gT970SclCfg = gpioRead(gpioCfg(kT970Scl)) & ~(kT970FuncMask | kT970OutEnable);
++	gpioWrite(gpioCfg(kT970Sda), gT970SdaCfg);
++	gpioWrite(gpioCfg(kT970Scl), gT970SclCfg);
++	IODelay(100);
++	IOPMPowerSource *ps = nullptr;
++	unsigned failures = 0;
++	for (;;) {
++		BatterySample s = {};
++		const int rc = sample(&s);
++		if (rc) {
++			++failures;
++			batteryPmsg("PONG_BATT fail gauge rc=%d n=%u\n", rc, failures);
++		} else {
++			if (!s.chargerValid) batteryPmsg("PONG_BATT fail charger rc=%d\n", s.chargerRc);
++			if (!ps) {
++				ps = IOPMPowerSource::powerSource();
++				const bool attached = ps && ps->attach(provider);
++				if (!attached || !ps->start(provider)) {
++					batteryPmsg("PONG_BATT fail service-start\n");
++					if (ps) { if (attached) ps->detach(provider); ps->release(); ps = nullptr; }
++				} else {
++					ps->setName("T970Battery");
++					ps->setProperty("Built-In", kOSBooleanTrue);
++					ps->setProperty("DeviceName", "MAX77705 Battery");
++				}
++			}
++			if (ps) {
++				publish(ps, s);
++				if (!ps->getProperty("PongBatteryPublished")) {
++					ps->setProperty("PongBatteryPublished", kOSBooleanTrue);
++					ps->registerService();
++					batteryPmsg("PONG_BATT ok soc=%u.%u%% mv=%u cap=%u ext=%u chg=%u\n",
++						s.permille / 10, s.permille % 10, s.voltageMv, s.fullMah,
++						s.chargerValid ? s.external : 0, s.chargerValid ? s.charging : 0);
++				}
++			}
++		}
++		IOSleep(60000);
++	}
++}
++} // namespace
++
++extern "C" void pong_battery_start(IOService *provider) {
++	uint32_t enabled = 0;
++	if (!PE_parse_boot_argn("pong_battery", &enabled, sizeof(enabled)) || enabled != 1) return;
++	static uint32_t started;
++	if (!__atomic_exchange_n(&started, 1u, __ATOMIC_ACQ_REL)) {
++		thread_t thread = nullptr;
++		provider->retain();
++		if (kernel_thread_start(batteryWorker, provider, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			provider->release();
++			batteryPmsg("PONG_BATT fail thread-start\n");
++		}
++	}
++}
