@@ -894,8 +894,8 @@ def compile_ui(out, developer):
     sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], env=env, text=True).strip()
     destination = out / 'libpong-ui.dylib'
     cmd = ['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64-apple-ios18.0',
-           '-isysroot', sdk, '-Os', '-fblocks', '-dynamiclib', '-Wall', '-Wextra', '-Werror',
-           '-Wl,-no_fixup_chains', '-install_name', '/pong/libpong-ui18.dylib',
+           '-isysroot', sdk, '-Oz', '-fblocks', '-dynamiclib', '-Wall', '-Wextra', '-Werror',
+           '-Wl,-no_fixup_chains', '-Wl,-dead_strip', '-install_name', '/pong/libpong-ui18.dylib',
            '-framework', 'CoreFoundation', '-framework', 'CoreGraphics', '-lobjc',
            str(PROJECT / 'userland/ui_compat18.c'),
            str(PROJECT / 'userland/settings_compat18.c'),
@@ -904,7 +904,12 @@ def compile_ui(out, developer):
            str(PROJECT / 'userland/sileo_spawn.c'),
            '-o', str(destination)]
     run(cmd, env=env)
+    run(['strip', '-x', destination])
     run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', destination])
+    size = destination.stat().st_size
+    print(f"libpong-ui.dylib size: {size} bytes (limit: 174960)")
+    if size > 174960:
+        raise RuntimeError(f"libpong-ui.dylib size {size} exceeds 174960 bytes limit")
     (out / 'ui-compile-command.json').write_text(json.dumps(cmd, indent=2) + '\n')
     return destination
 
@@ -1075,8 +1080,7 @@ def helper(a):
     if getattr(a, 'only_ui', False):
         ui_library = compile_ui(out, a.developer)
         dest18 = out / 'libpong-ui18.dylib'
-        if not dest18.exists():
-            shutil.copyfile(ui_library, dest18)
+        shutil.copyfile(ui_library, dest18)
         print(dest18)
         return
     signature = compile_init(out, a.developer, out / 'init')
@@ -1113,8 +1117,7 @@ def ui(a):
         developer = Path(dev_str)
     ui_library = compile_ui(out, developer)
     dest18 = out / 'libpong-ui18.dylib'
-    if not dest18.exists():
-        shutil.copyfile(ui_library, dest18)
+    shutil.copyfile(ui_library, dest18)
     print(dest18)
 
 

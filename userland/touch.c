@@ -16,6 +16,7 @@
 #include <notify.h>
 #include <signal.h>
 #include <limits.h>
+#include <sys/sysctl.h>
 #include "touch.h"
 #define say(...) fprintf(stderr,__VA_ARGS__)
 /* IOKit's HID event system, the part that has no public header on iOS (prototypes checked against 20F66) */
@@ -51,11 +52,17 @@ static IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEvent)(CFAllocatorRef allo
     uint32_t options);
 static IOHIDEventRef (*IOHIDEventCreateKeyboardEvent)(CFAllocatorRef allocator, uint64_t time,
     uint32_t usage_page,uint32_t usage,Boolean down,uint32_t options);
+static IOHIDEventRef (*IOHIDEventCreateMouseEvent)(CFAllocatorRef allocator, uint64_t time,
+    double x, double y, double z, uint32_t buttonMask, uint32_t options);
 static void (*IOHIDEventAppendEvent)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
 static void (*IOHIDEventSetIntegerValue)(IOHIDEventRef event, uint32_t field, CFIndex value);
 
 #define HID_CLIENT_SIMPLE               4       /* a client that only sends */
 #define HID_CLIENT_RATE_CONTROLLED      3       /* what IOHIDEventSystemClientCreate() makes */
+#define HID_PAGE_GENERIC_DESKTOP        0x01
+#define HID_USAGE_MOUSE                 0x02
+#define HID_PAGE_KEYBOARD               0x07
+#define HID_USAGE_KEYBOARD_OR_KEYPAD    0x06
 #define HID_PAGE_DIGITIZER              0x0d
 #define HID_USAGE_TOUCH_SCREEN          0x04
 #define HID_PAGE_CONSUMER               0x0c
@@ -63,6 +70,7 @@ static void (*IOHIDEventSetIntegerValue)(IOHIDEventRef event, uint32_t field, CF
 #define HID_USAGE_POWER                 0x30    /* the lock button */
 #define HID_USAGE_MENU                  0x40    /* the home button */
 #define HID_USAGE_VOLUME_UP             0xe9
+#define HID_USAGE_VOLUME_DOWN           0xea
 #define HID_USAGE_VOLUME_DOWN           0xea
 #define DIGITIZER_HAND                  3       /* kIOHIDDigitizerTransducerTypeHand */
 #define DIGITIZER_RANGE                 0x1     /* event mask: what has changed */
@@ -298,10 +306,25 @@ release_contacts(IOHIDServiceClientRef screen,uint64_t time)
     }
 }
 
+static int tp_rot = 0; /* bit 0: invert X, bit 1: invert Y, bit 2: swap XY */
+static void init_tp_rot(void)
+{
+    char bootargs[512] = {0};
+    size_t len = sizeof(bootargs) - 1;
+    if (sysctlbyname("kern.bootargs", bootargs, &len, NULL, 0) == 0) {
+        char *p = strstr(bootargs, "pong_pogo_rot=");
+        if (p) {
+            tp_rot = atoi(p + 14);
+            say("Pong touch HID: pogo trackpad rotation flag=%d\n", tp_rot);
+        }
+    }
+}
+
 static void *
 input_thread(void *unused)
 {
     (void)unused;pthread_setname_np("Pong touch HID");
+    init_tp_rot();
     int device=-1;
     for (unsigned i=0;i<30 && device<0;i++) {
         device=open("/dev/pong-touch",O_RDONLY);
@@ -309,6 +332,8 @@ input_thread(void *unused)
     }
     if (device<0) {say("Pong touch HID: real touch device unavailable (%s); SKIP\n",strerror(errno));return NULL;}
     IOHIDEventSystemClientRef client=NULL;IOHIDServiceClientRef screen=NULL,wake_control=NULL;
+    IOHIDServiceClientRef pogo_keyboard=NULL,pogo_trackpad=NULL;
+    bool trackpad_button_down=false;
     const int types[]={HID_CLIENT_SIMPLE,HID_CLIENT_RATE_CONTROLLED};
     /* Register during BackBoard's main-screen digitizer initialization.
      * make_service already retries a server that is not ready yet. */
@@ -327,7 +352,82 @@ input_thread(void *unused)
     struct pong_touch sample;unsigned count=0,waking=0;ssize_t length;
     while ((length=read(device,&sample,sizeof(sample)))>0 || (length<0 && errno==EINTR)) {
         if (length<0) continue;
-        if (length!=(ssize_t)sizeof(sample) || sample.type<PONG_TOUCH_DOWN || sample.type>PONG_TOUCH_UP) continue;
+        if (length!=(ssize_t)sizeof(sample)) continue;
+        if (sample.type<PONG_TOUCH_DOWN || sample.type>PONG_CONN_CHANGE) continue;
+
+        if (sample.type == PONG_CONN_CHANGE) {
+            if (sample.x) {
+                say("Pong touch HID: Pogo connected; opening keyboard & trackpad\n");
+                if (!pogo_keyboard && IOHIDEventCreateKeyboardEvent)
+                    pogo_keyboard = make_service(client, "Pong Pogo Keyboard", HID_PAGE_KEYBOARD, HID_USAGE_KEYBOARD_OR_KEYPAD, false);
+                if (!pogo_trackpad && IOHIDEventCreateMouseEvent)
+                    pogo_trackpad = make_service(client, "Pong Pogo Trackpad", HID_PAGE_GENERIC_DESKTOP, HID_USAGE_MOUSE, false);
+            } else {
+                say("Pong touch HID: Pogo disconnected; removing keyboard & trackpad\n");
+                if (pogo_keyboard) {
+                    IOHIDVirtualServiceClientRemove(pogo_keyboard);
+                    CFRelease(pogo_keyboard);
+                    pogo_keyboard = NULL;
+                }
+                if (pogo_trackpad) {
+                    IOHIDVirtualServiceClientRemove(pogo_trackpad);
+                    CFRelease(pogo_trackpad);
+                    pogo_trackpad = NULL;
+                }
+                trackpad_button_down = false;
+            }
+            continue;
+        }
+
+        if (sample.type == PONG_KEY_DOWN || sample.type == PONG_KEY_UP) {
+            if (pogo_keyboard && IOHIDEventCreateKeyboardEvent) {
+                bool down = (sample.type == PONG_KEY_DOWN);
+                IOHIDServiceClientRef target = (sample.finger == HID_PAGE_CONSUMER && wake_control) ? wake_control : pogo_keyboard;
+                IOHIDEventRef event = IOHIDEventCreateKeyboardEvent(NULL, sample.time, sample.finger, sample.x, down, 0);
+                if (event) {
+                    IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+                    IOHIDVirtualServiceClientDispatchEvent(target, event);
+                    CFRelease(event);
+                }
+            }
+            continue;
+        }
+
+        if (sample.type == PONG_POINTER_MOVE) {
+            if (pogo_trackpad && IOHIDEventCreateMouseEvent) {
+                int32_t raw_dx = (int32_t)sample.x;
+                int32_t raw_dy = (int32_t)sample.y;
+                /* Report §1.6 orientation: X_screen = 1600 - 1 - Y_raw, Y_screen = X_raw */
+                int32_t dx = -raw_dy;
+                int32_t dy = raw_dx;
+                if (tp_rot & 1) dx = -dx;
+                if (tp_rot & 2) dy = -dy;
+                if (tp_rot & 4) { int32_t tmp = dx; dx = dy; dy = tmp; }
+                uint32_t btn_mask = (sample.finger != 0 || trackpad_button_down) ? 1 : 0;
+                IOHIDEventRef event = IOHIDEventCreateMouseEvent(NULL, sample.time, (double)dx, (double)dy, 0.0, btn_mask, 0);
+                if (event) {
+                    IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+                    IOHIDVirtualServiceClientDispatchEvent(pogo_trackpad, event);
+                    CFRelease(event);
+                }
+            }
+            continue;
+        }
+
+        if (sample.type == PONG_POINTER_BUTTON) {
+            trackpad_button_down = (sample.x != 0);
+            if (pogo_trackpad && IOHIDEventCreateMouseEvent) {
+                uint32_t btn_mask = trackpad_button_down ? 1 : 0;
+                IOHIDEventRef event = IOHIDEventCreateMouseEvent(NULL, sample.time, 0.0, 0.0, 0.0, btn_mask, 0);
+                if (event) {
+                    IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+                    IOHIDVirtualServiceClientDispatchEvent(pogo_trackpad, event);
+                    CFRelease(event);
+                }
+            }
+            continue;
+        }
+
         if (sample.finger>=MAX_FINGERS) continue;
         if (count++<4) say("Pong touch HID: type=%u finger=%u xy=%u,%u\n",sample.type,sample.finger,sample.x,sample.y);
         unsigned mode=(unsigned)__atomic_load_n(&touch_mode,__ATOMIC_RELAXED)&0xff;
@@ -344,6 +444,16 @@ input_thread(void *unused)
     }
     /* Release outstanding contacts if the physical source goes away. */
     release_contacts(screen,mach_absolute_time());
+    if (pogo_keyboard) {
+        IOHIDVirtualServiceClientRemove(pogo_keyboard);
+        CFRelease(pogo_keyboard);
+        pogo_keyboard = NULL;
+    }
+    if (pogo_trackpad) {
+        IOHIDVirtualServiceClientRemove(pogo_trackpad);
+        CFRelease(pogo_trackpad);
+        pogo_trackpad = NULL;
+    }
     if (wake_control) {IOHIDVirtualServiceClientRemove(wake_control);CFRelease(wake_control);}
     close(device);IOHIDVirtualServiceClientRemove(screen);CFRelease(screen);CFRelease(client);
     return NULL;
@@ -439,6 +549,7 @@ pong_touch_start(void)
     RESOLVE(IOHIDEventCreateDigitizerFingerEvent);
     /* Physical touches remain available if this optional wake API is absent. */
     IOHIDEventCreateKeyboardEvent=(__typeof__(IOHIDEventCreateKeyboardEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateKeyboardEvent");
+    IOHIDEventCreateMouseEvent=(__typeof__(IOHIDEventCreateMouseEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateMouseEvent");
     IOHIDUserDeviceCreate=(__typeof__(IOHIDUserDeviceCreate))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceCreate");
     IOHIDUserDeviceHandleReportWithTimeStamp=(__typeof__(IOHIDUserDeviceHandleReportWithTimeStamp))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceHandleReportWithTimeStamp");
     RESOLVE(IOHIDEventAppendEvent);

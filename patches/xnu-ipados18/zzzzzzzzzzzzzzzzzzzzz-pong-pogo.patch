@@ -1,0 +1,693 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -406,4 +406,5 @@
+ bsd/dev/pong_fts.c			standard
+ bsd/dev/pong_usb_ctl.c			standard
+ bsd/dev/pong_cpu_perf.c			standard
++bsd/dev/pong_pogo.c			standard
+ bsd/pthread/pthread_kext.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1178,5 +1178,7 @@
+ 	extern void pong_usb_ctl_init(void);
+ 	pong_usb_ctl_init();
+ 	extern void pong_cpu_perf_init(void);
+ 	pong_cpu_perf_init();
++	extern void pong_pogo_init(void);
++	pong_pogo_init();
+ #endif
+diff --git a/bsd/sys/pong_input.h b/bsd/sys/pong_input.h
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/sys/pong_input.h
++++ b/bsd/sys/pong_input.h
+@@ -8,4 +8,9 @@
+ #define PONG_BUTTON_DOWN 4
+ #define PONG_BUTTON_UP 5
++#define PONG_KEY_DOWN 6
++#define PONG_KEY_UP 7
++#define PONG_POINTER_MOVE 8
++#define PONG_POINTER_BUTTON 9
++#define PONG_CONN_CHANGE 10
+ #define PONG_BUTTON_POWER 0
+ #define PONG_BUTTON_VOLUME_UP 1
+@@ -21,4 +26,5 @@
+ void pong_buttons_init(void);
+ void pong_fts_init(void);
++void pong_pogo_init(void);
+ #endif
+ #endif
+diff --git a/bsd/dev/pong_input.c b/bsd/dev/pong_input.c
+index a1b2c3d..e4f5a6b 100644
+--- a/bsd/dev/pong_input.c
++++ b/bsd/dev/pong_input.c
+@@ -29,13 +29,18 @@
+ void
+ pong_touch_post(uint32_t type,uint32_t finger,uint32_t x,uint32_t y)
+ {
+-    if (type<PONG_TOUCH_DOWN || type>PONG_BUTTON_UP ||
+-        finger>=(type>=PONG_BUTTON_DOWN?3u:10u)) return;
+-    struct input_queue *q=&queues[type>=PONG_BUTTON_DOWN];
++    if (type<PONG_TOUCH_DOWN || type>PONG_CONN_CHANGE) return;
++    if (type==PONG_BUTTON_DOWN || type==PONG_BUTTON_UP) {
++        if (finger>=3u) return;
++    } else if (type<=PONG_TOUCH_UP) {
++        if (finger>=10u) return;
++        if (x>65535) x=65535;
++        if (y>65535) y=65535;
++    }
++    struct input_queue *q=&queues[type==PONG_BUTTON_DOWN || type==PONG_BUTTON_UP];
+     lck_mtx_lock(&touch_lock);
+     if (q->tail-q->head==QUEUE_SIZE) q->head++;
+-    q->samples[q->tail++%QUEUE_SIZE]=(struct pong_touch){mach_absolute_time(),type,finger,
+-        x>65535?65535:x,y>65535?65535:y};
++    q->samples[q->tail++%QUEUE_SIZE]=(struct pong_touch){mach_absolute_time(),type,finger,x,y};
+     lck_mtx_unlock(&touch_lock);
+     wakeup(q);
+ }
+diff --git a/bsd/dev/pong_pogo.c b/bsd/dev/pong_pogo.c
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/bsd/dev/pong_pogo.c
+@@ -0,0 +1,617 @@
++/* Pong Pogo Keyboard & Touchpad Driver for SM-T970 (SM8250 / Kona).
++ * Communicates with STM32 MCU at I2C 0x2a via TLMM South Tile bit-banging:
++ *   GPIO 43:  CONN detect (Input, Active-High)
++ *   GPIO 70:  VDD_EN power (Output, Active-High, 3.3V LDO)
++ *   GPIO 125: I2C SDA
++ *   GPIO 126: I2C SCL
++ * TLMM North Tile:
++ *   GPIO 31:  INT (Input, Active-Low, pull-up)
++ *
++ * Boot argument: pong_pogo=1 (required to enable hardware access)
++ *
++ * Dispatches key presses/releases, touchpad relative movement/clicks,
++ * and connection state changes via pong_touch_post() into /dev/pong-touch.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/pong_input.h>
++#include <kern/sched_prim.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++extern void thread_deallocate(thread_t thread);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++
++#define TLMM_SOUTH_PHYS         0x0f500000UL
++#define TLMM_NORTH_PHYS         0x0f900000UL
++#define TLMM_MAP_SIZE           0x00100000UL
++
++#define GPIO_CFG(base, n)       ((base) + 0x1000UL * (n))
++#define GPIO_IO(base, n)        ((base) + 0x1000UL * (n) + 4)
++
++#define PIN_CONN                43
++#define PIN_VDD_EN              70
++#define PIN_SDA                 125
++#define PIN_SCL                 126
++#define PIN_INT                 31
++
++#define POGO_I2C_ADDR           0x2a
++#define POGO_HDR_SIZE           3
++
++#define POGO_ID_MCU             1
++#define POGO_ID_TOUCHPAD        2
++#define POGO_ID_KEYPAD          3
++#define POGO_ID_HALL            4
++
++#define POGO_CMD_GET_MODE       0x01
++#define POGO_CMD_GET_FW_VERSION 0x02
++#define POGO_CMD_GET_CRC        0x03
++#define POGO_CMD_ABORT          0x17
++#define POGO_CMD_TC_VERSION     0x18
++#define POGO_CMD_TC_CRC         0x19
++#define POGO_CMD_TC_RESOLUTION  0x1a
++
++#define POGO_MODE_APP           1
++#define POGO_MODE_EXCEPTION     3
++
++#define POGO_TP_MAX_X           2560
++#define POGO_TP_MAX_Y           1600
++#define POGO_TP_ICON_EVENT      0x8000
++#define POGO_TP_ICON_DOWN       0x0001
++#define POGO_TP_FINGER_EXIST    0x01
++
++static vm_offset_t tlmm_south_vaddr = 0;
++static vm_offset_t tlmm_north_vaddr = 0;
++static int pong_pogo_enabled = 0;
++static uint32_t pogo_i2c_delay_us = 4; /* ~100 kHz */
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	assert_wait_deadline((event_t)&tlmm_south_vaddr, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++pmsg_log(const char *fmt, ...)
++{
++	char buf[128];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		if (n >= (int)sizeof(buf)) {
++			n = (int)sizeof(buf) - 1;
++		}
++		pong_ramoops_diagnostic_write(buf, n);
++	}
++}
++
++/* GPIO accessors */
++static inline int
++conn_get(void)
++{
++	return rd(GPIO_IO(tlmm_south_vaddr, PIN_CONN)) & 1;
++}
++
++static inline int
++int_get(void)
++{
++	return rd(GPIO_IO(tlmm_north_vaddr, PIN_INT)) & 1;
++}
++
++static inline int
++scl_get(void)
++{
++	return rd(GPIO_IO(tlmm_south_vaddr, PIN_SCL)) & 1;
++}
++
++static inline int
++sda_get(void)
++{
++	return rd(GPIO_IO(tlmm_south_vaddr, PIN_SDA)) & 1;
++}
++
++static inline void
++scl_set(int hi)
++{
++	if (hi) {
++		/* Float high via pull-up */
++		wr(GPIO_CFG(tlmm_south_vaddr, PIN_SCL), rd(GPIO_CFG(tlmm_south_vaddr, PIN_SCL)) & ~(1u << 9));
++		/* Bounded clock stretching wait (max 40 us) */
++		for (int i = 0; i < 20; i++) {
++			if (scl_get()) {
++				break;
++			}
++			sleep_us(2);
++		}
++	} else {
++		/* Drive low */
++		wr(GPIO_IO(tlmm_south_vaddr, PIN_SCL), rd(GPIO_IO(tlmm_south_vaddr, PIN_SCL)) & ~2u);
++		wr(GPIO_CFG(tlmm_south_vaddr, PIN_SCL), rd(GPIO_CFG(tlmm_south_vaddr, PIN_SCL)) | (1u << 9));
++	}
++}
++
++static inline void
++sda_set(int hi)
++{
++	if (hi) {
++		/* Float high via pull-up */
++		wr(GPIO_CFG(tlmm_south_vaddr, PIN_SDA), rd(GPIO_CFG(tlmm_south_vaddr, PIN_SDA)) & ~(1u << 9));
++	} else {
++		/* Drive low */
++		wr(GPIO_IO(tlmm_south_vaddr, PIN_SDA), rd(GPIO_IO(tlmm_south_vaddr, PIN_SDA)) & ~2u);
++		wr(GPIO_CFG(tlmm_south_vaddr, PIN_SDA), rd(GPIO_CFG(tlmm_south_vaddr, PIN_SDA)) | (1u << 9));
++	}
++}
++
++static inline void
++pwr_set(int on)
++{
++	if (on) {
++		wr(GPIO_IO(tlmm_south_vaddr, PIN_VDD_EN), rd(GPIO_IO(tlmm_south_vaddr, PIN_VDD_EN)) | 2u);
++	} else {
++		wr(GPIO_IO(tlmm_south_vaddr, PIN_VDD_EN), rd(GPIO_IO(tlmm_south_vaddr, PIN_VDD_EN)) & ~2u);
++	}
++}
++
++static inline void
++i2c_delay(void)
++{
++	sleep_us(pogo_i2c_delay_us);
++}
++
++static void
++i2c_start(void)
++{
++	sda_set(1);
++	scl_set(1);
++	i2c_delay();
++	sda_set(0);
++	i2c_delay();
++	scl_set(0);
++	i2c_delay();
++}
++
++static void
++i2c_stop(void)
++{
++	sda_set(0);
++	i2c_delay();
++	scl_set(1);
++	i2c_delay();
++	sda_set(1);
++	i2c_delay();
++}
++
++static int
++i2c_write_byte(uint8_t byte)
++{
++	for (int i = 7; i >= 0; i--) {
++		sda_set((byte >> i) & 1);
++		i2c_delay();
++		scl_set(1);
++		i2c_delay();
++		scl_set(0);
++		i2c_delay();
++	}
++	/* Read ACK from slave */
++	sda_set(1);
++	i2c_delay();
++	scl_set(1);
++	i2c_delay();
++	int ack = sda_get() == 0 ? 0 : -1;
++	scl_set(0);
++	i2c_delay();
++	return ack;
++}
++
++static uint8_t
++i2c_read_byte(int send_ack)
++{
++	uint8_t byte = 0;
++	sda_set(1);
++	for (int i = 7; i >= 0; i--) {
++		i2c_delay();
++		scl_set(1);
++		i2c_delay();
++		if (sda_get()) {
++			byte |= (1u << i);
++		}
++		scl_set(0);
++		i2c_delay();
++	}
++	/* Send ACK (0) or NAK (1) */
++	sda_set(send_ack ? 0 : 1);
++	i2c_delay();
++	scl_set(1);
++	i2c_delay();
++	scl_set(0);
++	i2c_delay();
++	sda_set(1);
++	return byte;
++}
++
++static int
++pogo_xfer(const uint8_t *tx, int txlen, uint8_t *rx, int rxlen)
++{
++	if (!scl_get() || !sda_get()) {
++		pmsg_log("[PONG_POGO] bus low (SCL=%d SDA=%d)\n", scl_get(), sda_get());
++		return -1;
++	}
++
++	if (tx && txlen > 0) {
++		i2c_start();
++		if (i2c_write_byte((POGO_I2C_ADDR << 1) | 0) != 0) {
++			i2c_stop();
++			pmsg_log("[PONG_POGO] i2c nak addr=0x%02x write\n", POGO_I2C_ADDR);
++			return -2;
++		}
++		for (int i = 0; i < txlen; i++) {
++			if (i2c_write_byte(tx[i]) != 0) {
++				i2c_stop();
++				return -3;
++			}
++		}
++		i2c_stop();
++	}
++
++	if (rx && rxlen > 0) {
++		i2c_start();
++		if (i2c_write_byte((POGO_I2C_ADDR << 1) | 1) != 0) {
++			i2c_stop();
++			pmsg_log("[PONG_POGO] i2c nak addr=0x%02x read\n", POGO_I2C_ADDR);
++			return -4;
++		}
++		for (int i = 0; i < rxlen; i++) {
++			rx[i] = i2c_read_byte(i < rxlen - 1);
++		}
++		i2c_stop();
++	}
++
++	return 0;
++}
++
++static int
++pogo_reg_read(uint8_t id, uint8_t reg, uint8_t *val, uint32_t len)
++{
++	uint8_t req[3] = { 4, 0, id };
++	if (pogo_xfer(req, 3, NULL, 0) != 0) return -1;
++	if (pogo_xfer(&reg, 1, NULL, 0) != 0) return -2;
++	uint8_t hdr[3] = { 0 };
++	if (pogo_xfer(NULL, 0, hdr, 3) != 0) return -3;
++	uint32_t size = hdr[0] | (hdr[1] << 8);
++	if (size <= 3 || size - 3 > len) return -4;
++	if (pogo_xfer(NULL, 0, val, size - 3) != 0) return -5;
++	return (int)(size - 3);
++}
++
++static int
++pogo_reg_write(uint8_t id, uint8_t reg)
++{
++	uint8_t req[3] = { 4, 0, id };
++	if (pogo_xfer(req, 3, NULL, 0) != 0) return -1;
++	if (pogo_xfer(&reg, 1, NULL, 0) != 0) return -2;
++	return 0;
++}
++
++static const uint16_t pogo_keymap[8][24] = {
++	{ 0x0000, 0x0000, 0x0000, 0x0000, 0x071d, 0x0764, 0x0000, 0x0719, 0x0710, 0x0751, 0x0000, 0x072c, 0x0752, 0x0000, 0x0000, 0x0000, 0x0729, 0x0cea, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 }, /* row 0 */
++	{ 0x0000, 0x0000, 0x0000, 0x0791, 0x0704, 0x071b, 0x0707, 0x0705, 0x0000, 0x0736, 0x0737, 0x0738, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0ce9, 0x0000, 0x0000, 0x0000, 0x0000, 0x074a, 0x0000 }, /* row 1 */
++	{ 0x0000, 0x0000, 0x0790, 0x0000, 0x0714, 0x0000, 0x0706, 0x0709, 0x070d, 0x070e, 0x070f, 0x0733, 0x0000, 0x0728, 0x0000, 0x0000, 0x0c40, 0x0cb6, 0x0000, 0x0000, 0x0000, 0x0000, 0x074b, 0x0000 }, /* row 2 */
++	{ 0x0000, 0x0000, 0x07e2, 0x0000, 0x072b, 0x071a, 0x0708, 0x070a, 0x070b, 0x070c, 0x0734, 0x0713, 0x0000, 0x0000, 0x0000, 0x0000, 0x0c40, 0x0ccd, 0x0000, 0x0000, 0x0000, 0x0000, 0x074e, 0x0000 }, /* row 3 */
++	{ 0x0739, 0x07e6, 0x0000, 0x0000, 0x071e, 0x071f, 0x0720, 0x0715, 0x0718, 0x0725, 0x0712, 0x0727, 0x0000, 0x0000, 0x0000, 0x0731, 0x0c70, 0x0cb5, 0x0000, 0x0000, 0x0000, 0x0000, 0x074d, 0x0000 }, /* row 4 */
++	{ 0x0000, 0x07e0, 0x0000, 0x074f, 0x0735, 0x073d, 0x0740, 0x0717, 0x071c, 0x0743, 0x072f, 0x072a, 0x0000, 0x072d, 0x0000, 0x0730, 0x0c6f, 0x0ccf, 0x0000, 0x0000, 0x0000, 0x0790, 0x0000, 0x0000 }, /* row 5 */
++	{ 0x07e5, 0x0750, 0x0000, 0x0000, 0x073a, 0x073c, 0x073f, 0x0721, 0x0724, 0x0742, 0x0726, 0x0745, 0x0711, 0x0000, 0x0000, 0x0000, 0x07e3, 0x074c, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 }, /* row 6 */
++	{ 0x07e1, 0x0000, 0x0000, 0x0716, 0x0729, 0x073b, 0x073e, 0x0722, 0x0723, 0x0741, 0x072e, 0x0744, 0x0000, 0x0746, 0x074c, 0x0000, 0x0ce2, 0x0000, 0x07e3, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 }, /* row 7 */
++};
++
++static uint32_t pogo_held_keys[6] = { 0 }; /* 192 bits */
++
++static void
++pogo_release_all_keys(void)
++{
++	for (unsigned r = 0; r < 8; r++) {
++		for (unsigned c = 0; c < 24; c++) {
++			unsigned bit = r * 24 + c;
++			if (pogo_held_keys[bit / 32] & (1u << (bit % 32))) {
++				uint16_t mapped = pogo_keymap[r][c];
++				uint32_t page = mapped >> 8;
++				uint32_t usage = mapped & 0xff;
++				if (page != 0 && usage != 0) {
++					pong_touch_post(PONG_KEY_UP, page, usage, 0);
++				}
++				pogo_held_keys[bit / 32] &= ~(1u << (bit % 32));
++			}
++		}
++	}
++}
++
++static uint32_t tp_prev_x = 0;
++static uint32_t tp_prev_y = 0;
++static bool tp_prev_down = false;
++static bool tp_prev_btn = false;
++
++static void
++pogo_release_trackpad(void)
++{
++	if (tp_prev_btn) {
++		pong_touch_post(PONG_POINTER_BUTTON, 0, 0, 0);
++		tp_prev_btn = false;
++	}
++	tp_prev_down = false;
++}
++
++static void
++pogo_process_keypad(const uint8_t *data, uint32_t len)
++{
++	static uint32_t logged_keys = 0;
++	unsigned num_events = len / 2;
++	for (unsigned i = 0; i < num_events; i++) {
++		uint16_t ev = data[i * 2] | (data[i * 2 + 1] << 8);
++		bool down = (ev & 1) != 0;
++		uint32_t col = (ev >> 1) & 0x1f;
++		uint32_t row = (ev >> 6) & 0x7;
++		if (row < 8 && col < 24) {
++			uint16_t mapped = pogo_keymap[row][col];
++			uint32_t page = mapped >> 8;
++			uint32_t usage = mapped & 0xff;
++			if (page != 0 && usage != 0) {
++				unsigned bit = row * 24 + col;
++				if (down) {
++					pogo_held_keys[bit / 32] |= (1u << (bit % 32));
++				} else {
++					pogo_held_keys[bit / 32] &= ~(1u << (bit % 32));
++				}
++				pong_touch_post(down ? PONG_KEY_DOWN : PONG_KEY_UP, page, usage, 0);
++				if (logged_keys < 4) {
++					logged_keys++;
++					pmsg_log("[PONG_POGO] key#%u: r=%u c=%u dn=%u -> pg=0x%02x us=0x%02x\n",
++					    logged_keys, row, col, down ? 1 : 0, page, usage);
++				}
++			}
++		}
++	}
++}
++
++static void
++pogo_process_touchpad(const uint8_t *data, uint32_t len)
++{
++	if (len != 22) return;
++	static uint32_t logged_tp = 0;
++	uint16_t status = data[0] | (data[1] << 8);
++	bool btn_left = ((status & POGO_TP_ICON_EVENT) != 0) && ((data[3] & POGO_TP_ICON_DOWN) != 0);
++
++	const uint8_t *c = data + 4;
++	bool down = (c[5] & POGO_TP_FINGER_EXIST) != 0;
++	uint32_t raw_x = c[0] | (c[1] << 8);
++	uint32_t raw_y = c[2] | (c[3] << 8);
++
++	if (logged_tp < 4) {
++		logged_tp++;
++		pmsg_log("[PONG_POGO] tp#%u: stat=0x%04x btn=%u raw=(%u,%u) dn=%u\n",
++		    logged_tp, status, btn_left ? 1 : 0, raw_x, raw_y, down ? 1 : 0);
++	}
++
++	if (down && raw_x < POGO_TP_MAX_X && raw_y < POGO_TP_MAX_Y) {
++		if (tp_prev_down) {
++			int32_t dx = (int32_t)raw_x - (int32_t)tp_prev_x;
++			int32_t dy = (int32_t)raw_y - (int32_t)tp_prev_y;
++			if (dx != 0 || dy != 0) {
++				pong_touch_post(PONG_POINTER_MOVE, btn_left ? 1 : 0, (uint32_t)dx, (uint32_t)dy);
++			}
++		}
++		tp_prev_x = raw_x;
++		tp_prev_y = raw_y;
++		tp_prev_down = true;
++	} else {
++		tp_prev_down = false;
++	}
++
++	if (btn_left != tp_prev_btn) {
++		pong_touch_post(PONG_POINTER_BUTTON, 0, btn_left ? 1 : 0, 0);
++		tp_prev_btn = btn_left;
++	}
++}
++
++static bool
++pogo_handshake(void)
++{
++	static const struct {
++		uint8_t id;
++		uint8_t reg;
++		uint8_t len;
++		const char *name;
++	} steps[] = {
++		{ 1, 0x02, 4, "mcu version" },
++		{ 1, 0x01, 1, "mcu mode" },
++		{ 1, 0x03, 4, "mcu crc" },
++		{ 2, 0x18, 6, "touchpad version" },
++		{ 2, 0x19, 2, "touchpad crc" },
++		{ 2, 0x1a, 4, "touchpad resolution" },
++	};
++	uint8_t val[8];
++	bool all_ok = true;
++	for (unsigned i = 0; i < sizeof(steps)/sizeof(steps[0]); i++) {
++		memset(val, 0, sizeof(val));
++		int ret = pogo_reg_read(steps[i].id, steps[i].reg, val, steps[i].len);
++		if (ret < 0) {
++			pmsg_log("[PONG_POGO] hs FAIL: %s err=%d\n", steps[i].name, ret);
++			all_ok = false;
++		} else {
++			pmsg_log("[PONG_POGO] hs: %s ok val=%02x%02x%02x%02x\n",
++			    steps[i].name, val[0], val[1], val[2], val[3]);
++			if (steps[i].reg == POGO_CMD_GET_FW_VERSION && steps[i].id == POGO_ID_MCU) {
++				pmsg_log("[PONG_POGO] mcu ver: %02x.%02x.%02x.%02x\n",
++				    val[0], val[1], val[2], val[3]);
++			}
++		}
++		if (steps[i].reg == POGO_CMD_GET_MODE && steps[i].id == POGO_ID_MCU) {
++			if (ret >= 0 && val[0] != POGO_MODE_APP && val[0] != POGO_MODE_EXCEPTION) {
++				pmsg_log("[PONG_POGO] hs: mode %u != 1/3, sending ABORT\n", val[0]);
++				pogo_reg_write(POGO_ID_MCU, POGO_CMD_ABORT);
++			}
++			sleep_ms(200);
++		}
++	}
++	return all_ok;
++}
++
++static void
++pogo_read_frame(void)
++{
++	uint8_t req[3] = { 3, 0, POGO_ID_MCU };
++	if (pogo_xfer(req, 3, NULL, 0) != 0) {
++		return;
++	}
++	uint8_t hdr[3] = { 0 };
++	if (pogo_xfer(NULL, 0, hdr, 3) != 0) {
++		pmsg_log("[PONG_POGO] read hdr fail\n");
++		return;
++	}
++	uint32_t size = hdr[0] | (hdr[1] << 8);
++	uint8_t id = hdr[2];
++	if (size <= POGO_HDR_SIZE) {
++		pmsg_log("[PONG_POGO] empty frame size=%u id=%u\n", size, id);
++		pogo_handshake();
++		return;
++	}
++	uint32_t payload_len = size - POGO_HDR_SIZE;
++	if (payload_len > 64) {
++		payload_len = 64;
++	}
++	uint8_t data[64];
++	if (pogo_xfer(NULL, 0, data, payload_len) != 0) {
++		pmsg_log("[PONG_POGO] read payload fail id=%u len=%u\n", id, payload_len);
++		return;
++	}
++	if (payload_len >= 3 && data[0] == 0x03 && data[1] == 0x00 && data[2] == 0x05) {
++		return;
++	}
++	if (id == POGO_ID_KEYPAD) {
++		pogo_process_keypad(data, payload_len);
++	} else if (id == POGO_ID_TOUCHPAD) {
++		pogo_process_touchpad(data, payload_len);
++	} else if (id == POGO_ID_HALL) {
++		pogo_release_all_keys();
++		pogo_release_trackpad();
++	}
++}
++
++static void
++pogo_thread(__unused void *param, __unused wait_result_t wr_res)
++{
++	pmsg_log("[PONG_POGO] thread started\n");
++	tlmm_south_vaddr = ml_io_map(TLMM_SOUTH_PHYS, TLMM_MAP_SIZE);
++	tlmm_north_vaddr = ml_io_map(TLMM_NORTH_PHYS, TLMM_MAP_SIZE);
++	if (!tlmm_south_vaddr || !tlmm_north_vaddr) {
++		pmsg_log("[PONG_POGO] map TLMM South/North FAIL\n");
++		printf("Pong Pogo: ml_io_map failed; terminating thread\n");
++		thread_terminate(current_thread());
++		return;
++	}
++
++	wr(GPIO_IO(tlmm_south_vaddr, PIN_VDD_EN), rd(GPIO_IO(tlmm_south_vaddr, PIN_VDD_EN)) & ~2u);
++	wr(GPIO_CFG(tlmm_south_vaddr, PIN_VDD_EN), (rd(GPIO_CFG(tlmm_south_vaddr, PIN_VDD_EN)) & ~0x3ffu) | (1u << 9));
++
++	wr(GPIO_CFG(tlmm_south_vaddr, PIN_CONN), rd(GPIO_CFG(tlmm_south_vaddr, PIN_CONN)) & ~0x3ffu);
++	wr(GPIO_CFG(tlmm_north_vaddr, PIN_INT), (rd(GPIO_CFG(tlmm_north_vaddr, PIN_INT)) & ~0x3ffu) | 3u);
++
++	wr(GPIO_CFG(tlmm_south_vaddr, PIN_SDA), (rd(GPIO_CFG(tlmm_south_vaddr, PIN_SDA)) & ~0x3ffu) | 3u);
++	wr(GPIO_CFG(tlmm_south_vaddr, PIN_SCL), (rd(GPIO_CFG(tlmm_south_vaddr, PIN_SCL)) & ~0x3ffu) | 3u);
++	scl_set(1);
++	sda_set(1);
++
++	pmsg_log("[PONG_POGO] pins ready (CONN=%d INT=%d SCL=%d SDA=%d)\n",
++	    conn_get(), int_get(), scl_get(), sda_get());
++
++	bool connected = false;
++	uint32_t reconnect_count = 0;
++
++	for (;;) {
++		int conn = conn_get();
++		if (!connected) {
++			if (conn) {
++				pwr_set(1);
++				sleep_ms(50);
++				for (int p = 0; p < 9; p++) {
++					scl_set(0); sleep_us(5);
++					scl_set(1); sleep_us(5);
++				}
++				i2c_stop();
++				connected = true;
++				reconnect_count++;
++				pmsg_log("[PONG_POGO] attach: conn=1 pwr=1 renum=%u\n", reconnect_count);
++				pogo_handshake();
++				pong_touch_post(PONG_CONN_CHANGE, 0, 1, 0);
++			} else {
++				sleep_ms(250);
++				continue;
++			}
++		} else {
++			if (!conn) {
++				pmsg_log("[PONG_POGO] detach: conn=0 pwr=0\n");
++				pwr_set(0);
++				connected = false;
++				pogo_release_all_keys();
++				pogo_release_trackpad();
++				pong_touch_post(PONG_CONN_CHANGE, 0, 0, 0);
++				sleep_ms(250);
++				continue;
++			}
++			if (int_get() == 0) {
++				pogo_read_frame();
++			} else {
++				sleep_ms(8);
++			}
++		}
++	}
++}
++
++void
++pong_pogo_init(void)
++{
++	int en = 0;
++	if (PE_parse_boot_argn("pong_pogo", &en, sizeof(en)) && en > 0) {
++		pong_pogo_enabled = en;
++	}
++	if (!pong_pogo_enabled) {
++		return;
++	}
++	printf("Pong Pogo: driver enabled via pong_pogo=%d\n", pong_pogo_enabled);
++	thread_t th = THREAD_NULL;
++	if (kernel_thread_start(pogo_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++#endif /* PONG */

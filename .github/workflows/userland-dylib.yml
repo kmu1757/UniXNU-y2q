@@ -51,6 +51,12 @@ jobs:
 
           SIZE=$(stat -f%z "$DYLIB" 2>/dev/null || wc -c < "$DYLIB" | tr -d ' ')
           SHA=$(shasum -a 256 "$DYLIB" | awk '{print $1}')
+          MAX_SIZE=174960
+          echo "Built dylib size: ${SIZE} bytes (limit: ${MAX_SIZE} bytes)"
+          if [ "${SIZE}" -gt "${MAX_SIZE}" ]; then
+            echo "ERROR: libpong-ui18.dylib size (${SIZE} bytes) exceeds limit (${MAX_SIZE} bytes)" >&2
+            exit 1
+          fi
 
           {
             echo "================================================================"
