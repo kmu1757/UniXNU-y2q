@@ -45,7 +45,7 @@ new file mode 100644
 index 0000000..2222222
 --- /dev/null
 +++ b/bsd/dev/pong_cpu_perf.c
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,219 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
 + * Qualcomm SM8250 (SM-T970, gts7xlwifi) EPSS CPU Performance Scaling Driver
@@ -175,13 +175,9 @@ index 0000000..2222222
 +			num_rows = r + 1;
 +		}
 +
-+		/* Check ENABLE and LUT validity */
-+		if (!is_enabled) {
-+			cpu_perf_log("[PONG_CPU] D%u SKIP: domain disabled (en_reg=0x%x)\n",
-+			    domain, en_val);
-+			continue;
-+		}
-+
++		/* Check LUT validity.
++		 * Note: T970 DTB qcom,cpufreq-hw has 'qcom,skip-enable-check',
++		 * so ENABLE bit is recorded but not required to be set. */
 +		if (num_rows == 0 || lut_khz[0] == 0) {
 +			cpu_perf_log("[PONG_CPU] D%u SKIP: invalid LUT (num_rows=%u)\n",
 +			    domain, num_rows);
@@ -190,8 +186,8 @@ index 0000000..2222222
 +
 +		/* Report current state and LUT summary to pmsg */
 +		uint32_t cur_khz = (cur_row < num_rows) ? lut_khz[cur_row] : 0;
-+		cpu_perf_log("[PONG_CPU] D%u: en=1 cur_row=%u (%u kHz) rows=%u (%u..%u kHz)\n",
-+		    domain, cur_row, cur_khz, num_rows, lut_khz[0], lut_khz[num_rows - 1]);
++		cpu_perf_log("[PONG_CPU] D%u: en=%u cur_row=%u (%u kHz) rows=%u (%u..%u kHz)\n",
++		    domain, is_enabled, cur_row, cur_khz, num_rows, lut_khz[0], lut_khz[num_rows - 1]);
 +
 +		/* Report all LUT rows in compact lines to pmsg */
 +		char lut_line[128];
