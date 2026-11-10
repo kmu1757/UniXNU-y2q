@@ -1,0 +1,261 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 61dd0ef..0e074c8 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -26,6 +26,7 @@
+ #include <sys/reboot.h>
+ #include <console/video_console.h>
+ #include <sys/pong_usb_ctl.h>
++#include <sys/bsdtask_info.h>
+ #include <IOKit/IOLib.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -45,6 +46,8 @@ extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid,
+ extern void pong_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+ extern uint64_t pong_cpu_idle_mach(unsigned int cpu);
+ extern int pong_prefer_cluster;
++extern kern_return_t pong_task_prefer_cluster(task_t task, uint32_t cluster_id);
++extern task_t kernel_task;
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -762,15 +765,20 @@ cmd_handle_reboot(bool to_recovery)
+ 	}
+ 
+ 	delay_for_interval(50, NSEC_PER_MSEC);
+-	if (to_recovery && imem_base) {
+-		/* reboot_kernel() panics here with "Halt/Restart Timed Out" (11-10): no restart handler
+-		 * answers. Ask the firmware directly; /chosen/psci-method is smc on this board. */
+-		register uint64_t x0 __asm__("x0") = 0x84000009; /* PSCI SYSTEM_RESET */
+-		__asm__ volatile ("smc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+-		reboot_kernel(RB_QUICK, "reboot recovery");
+-	} else {
+-		reboot_kernel(RB_AUTOBOOT, NULL);
++	/*
++	 * reboot_kernel() panics here with "Halt/Restart Timed Out" (no restart handler answers), and
++	 * PSCI SYSTEM_RESET returned without a reset (both 11-10). The stock kernel's restart node is
++	 * restart@c264000, "qcom,pshold": drop PS_HOLD and the PMIC resets the board.
++	 */
++	vm_offset_t pshold = ml_io_map(0x0c264000UL, 0x1000);
++	if (pshold) {
++		pmsg_log("[PONG_USB] dropping PS_HOLD\n");
++		*(volatile uint32_t *)pshold = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		delay_for_interval(500, NSEC_PER_MSEC);
++		pmsg_log("[PONG_USB] PS_HOLD dropped, still running\n");
+ 	}
++	reboot_kernel(to_recovery ? RB_QUICK : RB_AUTOBOOT, NULL);
+ }
+ 
+ static void
+@@ -906,6 +914,155 @@ cmd_handle_cpus(void)
+ 	send_str(reply);
+ }
+ 
++/*
++ * top: the processes that used most CPU time since the previous `top` (the first call: since boot),
++ * in milliseconds. Pid 0 is the kernel.
++ */
++#define TOP_SEEN 512
++#define TOP_SHOWN 8
++
++struct top_state {
++	struct { int pid; uint64_t total; } seen[TOP_SEEN];
++	unsigned nseen;
++	struct { int pid; uint64_t delta; char name[20]; } best[TOP_SHOWN];
++	uint64_t sum;
++};
++
++static struct top_state top_state;
++
++static void
++top_account(int pid, const char *name, task_t task)
++{
++	struct proc_taskinfo_internal info;
++	uint64_t total, delta;
++	unsigned i, slot;
++
++	if (task == TASK_NULL) {
++		return;
++	}
++	bzero(&info, sizeof(info));
++	fill_taskprocinfo(task, &info);
++	total = info.pti_total_user + info.pti_total_system;
++	for (i = 0; i < top_state.nseen && top_state.seen[i].pid != pid; i++) {
++	}
++	if (i == top_state.nseen) {
++		if (top_state.nseen == TOP_SEEN) {
++			return;
++		}
++		top_state.seen[top_state.nseen++].pid = pid;
++		top_state.seen[i].total = 0;
++	}
++	delta = total >= top_state.seen[i].total ? total - top_state.seen[i].total : total;
++	top_state.seen[i].total = total;
++	top_state.sum += delta;
++	/* keep the TOP_SHOWN largest: replace the smallest kept one when this is larger */
++	slot = 0;
++	for (i = 1; i < TOP_SHOWN; i++) {
++		if (top_state.best[i].delta < top_state.best[slot].delta) {
++			slot = i;
++		}
++	}
++	if (delta > top_state.best[slot].delta) {
++		top_state.best[slot].pid = pid;
++		top_state.best[slot].delta = delta;
++		strlcpy(top_state.best[slot].name, name ? name : "?", sizeof(top_state.best[slot].name));
++	}
++}
++
++static int
++top_callout(proc_t p, __unused void *arg)
++{
++	if (proc_pid(p) != 0) {
++		top_account(proc_pid(p), proc_best_name(p), proc_task(p));
++	}
++	return 0;
++}
++
++static void
++cmd_handle_top(void)
++{
++	static uint64_t last_time;
++	char reply[400];
++	uint64_t now = mach_absolute_time(), ms = 0, value = 0;
++	int n;
++
++	bzero(top_state.best, sizeof(top_state.best));
++	top_state.sum = 0;
++	top_account(0, "kernel", kernel_task);
++	proc_iterate(PROC_ALLPROCLIST, top_callout, NULL, NULL, NULL);
++	absolutetime_to_nanoseconds(now - last_time, &ms);
++	last_time = now;
++	absolutetime_to_nanoseconds(top_state.sum, &value);
++	n = snprintf(reply, sizeof(reply), "top: %llu ms wall, %llu ms cpu:", ms / NSEC_PER_MSEC, value / NSEC_PER_MSEC);
++	for (unsigned shown = 0; shown < TOP_SHOWN; shown++) {
++		unsigned slot = 0;
++
++		/* largest first */
++		for (unsigned i = 1; i < TOP_SHOWN; i++) {
++			if (top_state.best[i].delta > top_state.best[slot].delta) {
++				slot = i;
++			}
++		}
++		if (top_state.best[slot].delta == 0) {
++			break;
++		}
++		absolutetime_to_nanoseconds(top_state.best[slot].delta, &value);
++		if (n > 0 && n < (int)sizeof(reply) - 40) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " %s[%d]=%llu", top_state.best[slot].name,
++			    top_state.best[slot].pid, value / NSEC_PER_MSEC);
++		}
++		top_state.best[slot].delta = 0;
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
++/* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
++struct tgprefer_state {
++	char name[24];
++	uint32_t cluster;
++	unsigned matched;
++	int result;
++};
++
++static int
++tgprefer_callout(proc_t p, void *arg)
++{
++	struct tgprefer_state *state = (struct tgprefer_state *)arg;
++	const char *name = proc_best_name(p);
++
++	if (name && strcmp(name, state->name) == 0) {
++		state->matched++;
++		state->result = (int)pong_task_prefer_cluster(proc_task(p), state->cluster);
++	}
++	return 0;
++}
++
++static void
++cmd_handle_tgprefer(const char *args)
++{
++	struct tgprefer_state state = { .result = -1 };
++	const char *p = args;
++	char reply[80];
++	unsigned length = 0;
++
++	while (*p == ' ') {
++		p++;
++	}
++	while (*p && *p != ' ' && length < sizeof(state.name) - 1) {
++		state.name[length++] = *p++;
++	}
++	state.name[length] = '\0';
++	state.cluster = parse_uint(&p);
++	proc_iterate(PROC_ALLPROCLIST, tgprefer_callout, &state, NULL, NULL);
++	snprintf(reply, sizeof(reply), "tgprefer: %s cluster=%u matched=%u kr=%d\n", state.name, state.cluster, state.matched,
++	    state.result);
++	send_str(reply);
++}
++
+ /* prefer N: the cluster every thread group prefers (0 Silver, 1 Gold, 2 Prime; 99: as before). */
+ static void
+ cmd_handle_prefer(const char *args)
+@@ -971,8 +1128,12 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_cpus();
+ 	} else if (strncmp(cmd, "prefer ", 7) == 0) {
+ 		cmd_handle_prefer(cmd + 7);
++	} else if (strcmp(cmd, "top") == 0) {
++		cmd_handle_top();
++	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
++		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer\n");
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 8d612bb..a8902fb 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -5182,6 +5182,36 @@ sched_edge_tg_preferred_cluster_change(struct thread_group *tg, uint32_t *tg_buc
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++/*
++ * pong_task_prefer_cluster(): every QoS bucket of the task's thread group prefers this cluster, and
++ * its running and runnable threads move there. The USB command `tgprefer NAME N` calls it.
++ */
++extern struct thread_group *task_coalition_get_thread_group(task_t task);
++kern_return_t pong_task_prefer_cluster(task_t task, uint32_t cluster_id);
++
++kern_return_t
++pong_task_prefer_cluster(task_t task, uint32_t cluster_id)
++{
++	uint32_t preferred[TH_BUCKET_SCHED_MAX];
++	struct thread_group *tg;
++
++	if (task == TASK_NULL || cluster_id >= MAX_PSETS || pset_array[cluster_id] == PROCESSOR_SET_NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	tg = task_coalition_get_thread_group(task);
++	if (tg == NULL) {
++		return KERN_FAILURE;
++	}
++	for (int bucket = 0; bucket < TH_BUCKET_SCHED_MAX; bucket++) {
++		preferred[bucket] = cluster_id;
++	}
++	sched_edge_tg_preferred_cluster_change(tg, preferred,
++	    SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNING | SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNABLE);
++	return KERN_SUCCESS;
++}
++#endif
++
+ /*
+  * sched_edge_pset_made_schedulable()
+  *
