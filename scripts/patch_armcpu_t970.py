@@ -65,6 +65,93 @@ def add_ipi_counters(txt: str) -> str:
     return txt
 
 
+BENCH = (
+    ('volatile uint64_t armcpu_ipi_sent[8], armcpu_ipi_recv[8], armcpu_timer_recv[8];\n',
+     'volatile uint32_t armcpu_ipi_mode;\nvolatile uint64_t armcpu_redist[8];\n'),
+    ('  gSpiIpi = spiIpi == 1;\n',
+     '  uint32_t ipiMode = 0;\n'
+     '  if (PE_parse_boot_argn("armcpu-ipi-mode", &ipiMode, sizeof(ipiMode)) && ipiMode <= 2) armcpu_ipi_mode = ipiMode;\n'),
+    ('    spiIpiConfigure(dist, logicalId, affinity);\n',
+     '    if (logicalId < 8) armcpu_redist[logicalId] = redist;\n'),
+)
+BENCH_SEND_OLD = """  if (gSpiIpi && gDist) {
+    spiIpiSend(gDist, cpu->logicalId & 7);
+    return;
+  }
+"""
+BENCH_SEND_NEW = """  if (gSpiIpi && gDist && armcpu_ipi_mode != 1) {
+    if (armcpu_ipi_mode == 2) {
+      write32(gDist, 0x40, kIpiSpiBase + (cpu->logicalId & 7)); // GICD_SETSPI_NSR
+      __asm__ volatile("dsb sy" ::: "memory");
+    } else {
+      spiIpiSend(gDist, cpu->logicalId & 7);
+    }
+    return;
+  }
+"""
+BENCH_TAIL = """
+// T970 test bench (USB commands gic, gicr, gicw, rdr, rdw, ipimode): raw access to the distributor and to
+// one core's redistributor frames, and the calling core's CPU interface state. armcpu_ipi_mode picks how
+// signalCPU raises an IPI: 0 GICD_ISPENDR on the core's SPI, 1 SGI 0 through ICC_SGI1R_EL1, 2 GICD_SETSPI_NSR.
+extern "C" uint32_t armcpu_ipi_spi_base(void)
+{
+  return kIpiSpiBase;
+}
+
+extern "C" uint32_t armcpu_gic_peek(uint32_t off)
+{
+  return (gDist && off < 0x10000 && (off & 3) == 0) ? read32(gDist, off) : 0xdeadbeefU;
+}
+
+extern "C" void armcpu_gic_poke(uint32_t off, uint32_t value)
+{
+  if (!gDist || off >= 0x10000 || (off & 3) != 0) return;
+  write32(gDist, off, value);
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+
+extern "C" uint32_t armcpu_redist_peek(uint32_t cpu, uint32_t off)
+{
+  if (cpu >= 8 || armcpu_redist[cpu] == 0 || off >= 0x20000 || (off & 3) != 0) return 0xdeadbeefU;
+  return read32(static_cast<uintptr_t>(armcpu_redist[cpu]), off);
+}
+
+extern "C" void armcpu_redist_poke(uint32_t cpu, uint32_t off, uint32_t value)
+{
+  if (cpu >= 8 || armcpu_redist[cpu] == 0 || off >= 0x20000 || (off & 3) != 0) return;
+  write32(static_cast<uintptr_t>(armcpu_redist[cpu]), off, value);
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+
+extern "C" void armcpu_icc_state(uint64_t out[6])
+{
+  uint64_t value;
+  __asm__ volatile("mrs %0, icc_ctlr_el1" : "=r"(value)); out[0] = value;
+  __asm__ volatile("mrs %0, icc_pmr_el1" : "=r"(value)); out[1] = value;
+  __asm__ volatile("mrs %0, icc_igrpen1_el1" : "=r"(value)); out[2] = value;
+  __asm__ volatile("mrs %0, S3_0_C12_C11_3" : "=r"(value)); out[3] = value; // ICC_RPR_EL1
+  __asm__ volatile("mrs %0, S3_0_C12_C12_2" : "=r"(value)); out[4] = value; // ICC_HPPIR1_EL1
+  __asm__ volatile("mrs %0, mpidr_el1" : "=r"(value)); out[5] = value;
+}
+"""
+
+
+def add_gic_bench(txt: str) -> str:
+    """Raw GIC access and a switchable IPI transport (USB commands gic, gicr, gicw, rdr, rdw, ipimode).
+
+    11-10: after start-up no core takes an IPI any more (about 40,000 asked for per Silver core, 1 to 4
+    taken), so every cross-core wake-up waits for the target's next timer interrupt. These let one boot
+    read the state of the IPI SPIs and try the other ways of raising them. Runs after add_ipi_counters.
+    """
+    if 'armcpu_ipi_mode' in txt:
+        return txt
+    for anchor, addition in BENCH:
+        assert txt.count(anchor) == 1, 'expected exactly one: ' + anchor.strip()
+        txt = txt.replace(anchor, anchor + addition)
+    assert txt.count(BENCH_SEND_OLD) == 1, 'expected exactly one SPI IPI send block'
+    return txt.replace(BENCH_SEND_OLD, BENCH_SEND_NEW) + BENCH_TAIL
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
@@ -74,7 +161,7 @@ def patch_armcpu(armcpu_source: Path):
     txt = add_idle_latency_knob(disable_cpu_policy(target.read_text(encoding='utf-8')))
     if 'armcpu-spi-ipi' in txt:
         # already carries the SPI IPI patch; still make sure the policy is off
-        target.write_text(add_ipi_counters(txt), encoding='utf-8')
+        target.write_text(add_gic_bench(add_ipi_counters(txt)), encoding='utf-8')
         return
 
     # 1. Add SPI IPI state and helper functions after gBootAffinity
@@ -179,7 +266,7 @@ static void spiIpiSend(uintptr_t dist, uint32_t core)
       if (ipi_handler) ipi_handler();"""
     txt = txt.replace(needle_irq, replacement_irq)
 
-    txt = add_ipi_counters(txt)
+    txt = add_gic_bench(add_ipi_counters(txt))
     target.write_text(txt, encoding='utf-8')
     print(f'Applied SM-T970 ArmCpu patch to {target}', flush=True)
 

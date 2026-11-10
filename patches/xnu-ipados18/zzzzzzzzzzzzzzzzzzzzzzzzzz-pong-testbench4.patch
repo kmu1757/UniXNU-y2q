@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 55ac8dc..57db6a2 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -50,6 +50,14 @@ extern kern_return_t pong_task_prefer_cluster(task_t task, uint32_t cluster_id);
+ extern task_t kernel_task;
+ /* ArmCpu (T970 patch): per-core IPIs asked for, IPIs taken, timer interrupts taken */
+ extern volatile uint64_t armcpu_ipi_sent[8], armcpu_ipi_recv[8], armcpu_timer_recv[8];
++/* ArmCpu (T970 patch): raw GIC access and the way an IPI is raised (0 ISPENDR, 1 SGI, 2 SETSPI_NSR) */
++extern volatile uint32_t armcpu_ipi_mode;
++extern uint32_t armcpu_ipi_spi_base(void);
++extern uint32_t armcpu_gic_peek(uint32_t off);
++extern void armcpu_gic_poke(uint32_t off, uint32_t value);
++extern uint32_t armcpu_redist_peek(uint32_t cpu, uint32_t off);
++extern void armcpu_redist_poke(uint32_t cpu, uint32_t off, uint32_t value);
++extern void armcpu_icc_state(uint64_t out[6]);
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1054,6 +1062,120 @@ cmd_handle_ipis(void)
+ 	send_str(reply);
+ }
+ 
++/* Unsigned number, decimal or 0x hexadecimal */
++static uint32_t
++parse_num(const char **p)
++{
++	uint32_t val = 0;
++
++	while (**p == ' ') {
++		(*p)++;
++	}
++	if ((*p)[0] != '0' || ((*p)[1] != 'x' && (*p)[1] != 'X')) {
++		return parse_uint(p);
++	}
++	for (*p += 2;; (*p)++) {
++		char c = **p;
++
++		if (c >= '0' && c <= '9') {
++			val = (val << 4) | (uint32_t)(c - '0');
++		} else if (c >= 'a' && c <= 'f') {
++			val = (val << 4) | (uint32_t)(c - 'a' + 10);
++		} else if (c >= 'A' && c <= 'F') {
++			val = (val << 4) | (uint32_t)(c - 'A' + 10);
++		} else {
++			return val;
++		}
++	}
++}
++
++/*
++ * gic: the distributor's view of the eight IPI SPIs (group, enable, pending, active, group modifier, trigger,
++ * priorities, routes as high:low) and the CPU interface of the core that runs this command.
++ */
++static void
++cmd_handle_gic(void)
++{
++	const uint32_t base = armcpu_ipi_spi_base();
++	const uint32_t word = (base / 32) * 4;
++	uint64_t icc[6];
++	char reply[640];
++	int n;
++
++	armcpu_icc_state(icc);
++	n = snprintf(reply, sizeof(reply),
++	    "gic: mode=%u base=%u ctlr=%x typer=%x grp=%x en=%x pend=%x act=%x mod=%x cfg=%x pri=%x/%x rt=",
++	    armcpu_ipi_mode, base, armcpu_gic_peek(0), armcpu_gic_peek(4), armcpu_gic_peek(0x80 + word),
++	    armcpu_gic_peek(0x100 + word), armcpu_gic_peek(0x200 + word), armcpu_gic_peek(0x300 + word),
++	    armcpu_gic_peek(0xd00 + word), armcpu_gic_peek(0xc00 + (base / 16) * 4),
++	    armcpu_gic_peek(0x400 + (base / 4) * 4), armcpu_gic_peek(0x404 + (base / 4) * 4));
++	for (uint32_t c = 0; c < 8; c++) {
++		if (n > 0 && n < (int)sizeof(reply) - 24) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, "%s%x:%x", c ? "," : "",
++			    armcpu_gic_peek(0x6004 + 8 * (base + c)), armcpu_gic_peek(0x6000 + 8 * (base + c)));
++		}
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 130) {
++		n += snprintf(reply + n, sizeof(reply) - (size_t)n,
++		    " | icc mpidr=%llx ctlr=%llx pmr=%llx grpen1=%llx rpr=%llx hppir1=%llx",
++		    icc[5], icc[0], icc[1], icc[2], icc[3], icc[4]);
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
++/*
++ * gicr OFF [N] / gicw OFF VALUE: read N (1..8) words of the GIC distributor at OFF, or write one and read it back.
++ * rdr CPU OFF [N] / rdw CPU OFF VALUE: the same for the redistributor frames of core CPU (SGI frame at 0x10000).
++ */
++static void
++cmd_handle_gic_rw(const char *args, bool redist, bool write)
++{
++	const char *p = args;
++	uint32_t cpu = redist ? parse_num(&p) : 0;
++	uint32_t off = parse_num(&p) & ~3U;
++	uint32_t value = parse_num(&p);
++	uint32_t count = write ? 1 : (value < 1 ? 1 : (value > 8 ? 8 : value));
++	char reply[160];
++	int n;
++
++	if (write && redist) {
++		armcpu_redist_poke(cpu, off, value);
++	} else if (write) {
++		armcpu_gic_poke(off, value);
++	}
++	n = snprintf(reply, sizeof(reply), "%s%u %x:", redist ? "rd" : "gic", cpu, off);
++	for (uint32_t i = 0; i < count; i++) {
++		if (n > 0 && n < (int)sizeof(reply) - 12) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " %x",
++			    redist ? armcpu_redist_peek(cpu, off + 4 * i) : armcpu_gic_peek(off + 4 * i));
++		}
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
++/* ipimode N: how an IPI is raised from now on (0 GICD_ISPENDR, 1 SGI 0, 2 GICD_SETSPI_NSR; anything else: report) */
++static void
++cmd_handle_ipimode(const char *args)
++{
++	const char *p = args;
++	uint32_t mode = parse_num(&p);
++	char reply[48];
++
++	if (mode <= 2) {
++		armcpu_ipi_mode = mode;
++	}
++	snprintf(reply, sizeof(reply), "ipimode: %u\n", armcpu_ipi_mode);
++	send_str(reply);
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1166,10 +1288,22 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_top();
+ 	} else if (strcmp(cmd, "ipis") == 0) {
+ 		cmd_handle_ipis();
++	} else if (strcmp(cmd, "gic") == 0) {
++		cmd_handle_gic();
++	} else if (strncmp(cmd, "gicr ", 5) == 0) {
++		cmd_handle_gic_rw(cmd + 5, false, false);
++	} else if (strncmp(cmd, "gicw ", 5) == 0) {
++		cmd_handle_gic_rw(cmd + 5, false, true);
++	} else if (strncmp(cmd, "rdr ", 4) == 0) {
++		cmd_handle_gic_rw(cmd + 4, true, false);
++	} else if (strncmp(cmd, "rdw ", 4) == 0) {
++		cmd_handle_gic_rw(cmd + 4, true, true);
++	} else if (strncmp(cmd, "ipimode ", 8) == 0) {
++		cmd_handle_ipimode(cmd + 8);
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode\n");
+ 	}
+ }
+ 
