@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 61e897f..1762859 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1924,6 +1924,52 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 	}
+ }
+ 
++/*
++ * IPIs are switched on only here, after the root volume is mounted (bsd_init calls pong_ipi_late_init).
++ * ArmCpu reads its IPI boot arguments after the cores have started, so until now every IPI was pended on an
++ * SPI nobody set up and never arrived. With IPIs live from the start the three SHNGROOT APFS containers open
++ * in parallel and the root volume never appears (11-10, images half14s and half14k; reason unknown), so the
++ * late switch is deliberate until that is understood.
++ *   armcpu-ipi-late=N   N seconds after this point (default 1; 0 = never, the kernel behaves as before)
++ *   pong_prefer_late=C  once IPIs are on, every thread group prefers cluster C (as the USB command `prefer C`).
++ *                       Not before: threads queued for an idle Gold core would wait for an IPI that never comes.
++ */
++extern void armcpu_ipi_enable(void);
++static uint32_t pong_ipi_late_seconds = 1;
++static int pong_prefer_late = -1;
++
++static void
++pong_ipi_late_thread(__unused void *param, __unused wait_result_t wr)
++{
++	delay_for_interval(pong_ipi_late_seconds, NSEC_PER_SEC);
++	armcpu_ipi_enable();
++	if (pong_prefer_late >= 0 && pong_prefer_late <= 2) {
++		pong_prefer_cluster = pong_prefer_late;
++	}
++	pmsg_log("[PONG_IPI] on after %u s (SGI), prefer=%d\n", pong_ipi_late_seconds, pong_prefer_cluster);
++	printf("Pong IPI: on after %u s (SGI), prefer=%d\n", pong_ipi_late_seconds, pong_prefer_cluster);
++	thread_terminate(current_thread());
++}
++
++void pong_ipi_late_init(void);
++void
++pong_ipi_late_init(void)
++{
++	thread_t th = THREAD_NULL;
++
++	(void)PE_parse_boot_argn("armcpu-ipi-late", &pong_ipi_late_seconds, sizeof(pong_ipi_late_seconds));
++	(void)PE_parse_boot_argn("pong_prefer_late", &pong_prefer_late, sizeof(pong_prefer_late));
++	if (pong_ipi_late_seconds == 0 || pong_ipi_late_seconds > 600) {
++		pmsg_log("[PONG_IPI] off (armcpu-ipi-late=%u)\n", pong_ipi_late_seconds);
++		return;
++	}
++	if (kernel_thread_start(pong_ipi_late_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		pmsg_log("[PONG_IPI] fail: kernel_thread_start\n");
++	}
++}
++
+ /* Public Initialization Routine (Called from bsd_init) */
+ void
+ pong_usb_ctl_init(void)
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 91a9fa3..490c851 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1183,6 +1183,8 @@ bsd_init(void)
+ 	pong_pogo_init();
+ 	extern void pong_wifi_survey_init(void);
+ 	pong_wifi_survey_init();
++	extern void pong_ipi_late_init(void);
++	pong_ipi_late_init();
+ #endif
+ #endif /* DEVFS */
+ 

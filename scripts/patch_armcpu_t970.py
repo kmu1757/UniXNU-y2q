@@ -248,6 +248,37 @@ def add_tick_fallback(txt: str) -> str:
     return txt.replace(TICK_CFG_OLD, TICK_CFG_NEW)
 
 
+IPI_LATE_TAIL = """
+// Called once the root volume is mounted (bsd pong_ipi_late_init). Until then no IPI arrives: the IPI boot
+// arguments are read at the end of the boot CPU's start(), after every core has run initCPU, so the cores
+// signal themselves with an SGI and afterwards signalCPU pends SPIs that were never set up. That is kept on
+// purpose for now: with IPIs live from the start the three SHNGROOT APFS containers open in parallel and
+// the root volume never appears (11-10, reason unknown). From here on IPIs are SGIs, and every core is
+// interrupted once: a core that was sent an IPI which never arrived sits idle in the dispatching state and
+// is not signalled again until it takes an interrupt.
+extern "C" void armcpu_ipi_enable(void)
+{
+  armcpu_ipi_mode = 1;
+  for (unsigned i = 0; i < 8; i++) {
+    if (gCpus[i]) gCpus[i]->signalCPU(gCpus[i]);
+  }
+}
+"""
+
+
+def add_ipi_late(txt: str) -> str:
+    """armcpu_ipi_enable(): switch IPIs to SGIs and wake every core, for use after the root is mounted.
+
+    Measured 11-10 on half14: after this (done by hand over USB) received IPIs follow sent ones and dragging
+    the home screen goes from 11-14 to 16-21 frames a second, 42-57 with the display processes on Gold.
+    Runs after add_tick_fallback.
+    """
+    if 'armcpu_ipi_enable' in txt:
+        return txt
+    assert 'volatile uint32_t armcpu_ipi_mode;' in txt, 'add_gic_bench must run first'
+    return txt + IPI_LATE_TAIL
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
@@ -257,7 +288,7 @@ def patch_armcpu(armcpu_source: Path):
     txt = add_idle_latency_knob(disable_cpu_policy(target.read_text(encoding='utf-8')))
     if 'armcpu-spi-ipi' in txt:
         # already carries the SPI IPI patch; still make sure the policy is off
-        target.write_text(add_tick_fallback(add_gic_bench(add_ipi_counters(txt))), encoding='utf-8')
+        target.write_text(add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt)))), encoding='utf-8')
         return
 
     # 1. Add SPI IPI state and helper functions after gBootAffinity
@@ -362,7 +393,7 @@ static void spiIpiSend(uintptr_t dist, uint32_t core)
       if (ipi_handler) ipi_handler();"""
     txt = txt.replace(needle_irq, replacement_irq)
 
-    txt = add_tick_fallback(add_gic_bench(add_ipi_counters(txt)))
+    txt = add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt))))
     target.write_text(txt, encoding='utf-8')
     print(f'Applied SM-T970 ArmCpu patch to {target}', flush=True)
 
