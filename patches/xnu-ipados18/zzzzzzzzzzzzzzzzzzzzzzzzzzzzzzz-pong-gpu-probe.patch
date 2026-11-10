@@ -1,0 +1,438 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index aca8be0..2d7f9fd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -409,6 +409,7 @@ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
++bsd/dev/pong_gpu_probe.c		standard
+ bsd/pthread/pthread_kext.c			standard
+ bsd/kern/source_pthread_bootstrap.c			standard
+ bsd/kern/kern_event.c			standard
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+new file mode 100644
+index 0000000..cf2b5a4
+--- /dev/null
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -0,0 +1,358 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/*
++ * SM-T970 (SM8250 / kona, Adreno 650) read-only staged GPU power/clock/SMMU/RBBM probe.
++ * Runs ONLY when the USB CDC-ACM command `gpuprobe` asks; never runs at boot.
++ * Performs ZERO register writes.
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/GpuPowerBoard.h and package/GpuProbe.cpp (mode 1 read-only snapshot).
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ *
++ * Hardware addresses and bit definitions cross-checked against:
++ *   1. Stock SM-T970 device tree (`work/gts7xlwifi.dts`):
++ *      - `qcom,kgsl-3d0@3d00000`: reg = <0x03d00000 0x40000> (kgsl_3d0_reg_memory, line 32550)
++ *      - `qcom,gmu@3d6a000`:      reg = <0x03d6a000 0x34000> (gmu_reg, line 32333)
++ *      - `gpucc@3d90000`:         clock controller for GX/CX GDSCs and GPU clocks (line 32551)
++ *      - `kgsl-smmu@3da0000`:     reg = <0x03da0000 0x10000> (qcom,kgsl-smmu-v2, lines 32270-32271)
++ *      - `pil_gpu_region@8681a000`: reg = <0x0 0x9031a000 0x0 0x2000> (gpu_zap_shader, lines 34582-34585)
++ *   2. Linux mainline `drivers/clk/qcom/gcc-sm8250.c` and `drivers/clk/qcom/gpucc-sm8250.c`.
++ *   3. Measured SM-T970 mode-1 boot log in `ref/rui-gts7xlwifi/docs/evidence/periph15-bootlog.txt`:
++ *      - GCC: cfg_ahb=0x80002003, memnoc=0x80000000, snoc_dvm=0x80000000, ddrss_axi=0x80002220,
++ *             misc=0x00000000, gpll0=0x00007927
++ *      - GPUCC (before CX_GDSC power-up): cx_gdscr=0x00000001, gx_gdscr=0x00022005,
++ *             ahb=0x80000002, smmu=0x80000001, gmu=0x80000000, cxo=0x80000000, cxo_aon=0x80000001
++ *
++ * Staged gating discipline (prevents unclocked MMIO bus hangs / silent SoC resets):
++ *   Stage 1 (gcc):         Read GCC GPU branch CBCRs (0x00171000) and GPLL0 vote (0x00152000).
++ *                          Gate 1->2: GCC_GPU_CFG_AHB_CBCR bit 0 (CLK_ENABLE) must be 1.
++ *                          (Note: HW_CLK_CTRL bit 1 can hold bit 31 = 1 while idle even when enabled.)
++ *   Stage 2 (gpucc):       Read GPUCC GDSCs and branch CBCRs (0x03d90000).
++ *                          Gate 2->3: GPU_CC_CX_GDSCR bit 31 (PWR_ON) must be 1 AND
++ *                          GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK bit 31 (CLK_OFF) must be 0.
++ *   Stage 3 (smmu_gr0):    Read GPU SMMU global space GR0 (0x03da0000) and, if GPU_CC_AHB_CBCR
++ *                          and GPU_CC_CX_GMU_CBCR have CLK_OFF == 0, GMU status registers (0x03d6a000).
++ *                          Gate 3->4: GPU_CC_AHB_CBCR bit 31 (CLK_OFF) must be 0 AND
++ *                          GPU_CC_GX_GDSCR bit 31 (PWR_ON) must be 1.
++ *   Stage 4 (rbbm_status): Read Adreno 650 RBBM_STATUS (0x03d00840, dword 0x0210).
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++
++int pong_gpu_probe_usb(char *reply, size_t reply_cap);
++
++/* ---- Stage 1: GCC GPU branch clocks (gcc@100000, GpuPowerBoard.h:88-96) ------------------- */
++#define GCC_GPU_PAGE_PHYS               0x00171000UL
++#define GCC_GPU_PAGE_SIZE               0x00001000UL
++#define GCC_GPU_CFG_AHB_CBCR_OFF        0x004u  /* 0x00171004 */
++#define GCC_GPU_MEMNOC_GFX_CBCR_OFF     0x00cu  /* 0x0017100c */
++#define GCC_GPU_SNOC_DVM_GFX_CBCR_OFF   0x018u  /* 0x00171018 */
++#define GCC_GPU_MISC_OFF                0x028u  /* 0x00171028 */
++#define GCC_DDRSS_GPU_AXI_CBCR_OFF      0x154u  /* 0x00171154 */
++
++#define GCC_VOTE_PAGE_PHYS              0x00152000UL
++#define GCC_VOTE_PAGE_SIZE              0x00001000UL
++#define GCC_APCS_GPLL0_ENA_VOTE_OFF     0x000u  /* 0x00152000 */
++
++/* ---- Stage 2: GPUCC GDSCs & branch clocks (gpucc@3d90000, GpuPowerBoard.h:69-86) ---------- */
++#define GPUCC_PHYS_BASE                 0x03d90000UL
++#define GPUCC_MAP_SIZE                  0x00006000UL
++#define GPUCC_PLL1_MODE_OFF             0x0100u
++#define GPUCC_CXO_AON_CBCR_OFF          0x1004u
++#define GPUCC_GX_GDSCR_OFF              0x100cu
++#define GPUCC_CX_GDSCR_OFF              0x106cu
++#define GPUCC_AHB_CBCR_OFF              0x1078u
++#define GPUCC_CX_GMU_CBCR_OFF           0x1098u
++#define GPUCC_CXO_CBCR_OFF              0x109cu
++#define GPUCC_GMU_CMD_RCGR_OFF          0x1120u
++#define GPUCC_GMU_CFG_RCGR_OFF          0x1124u
++#define GPUCC_CX_HWCTRL_OFF             0x1540u
++#define GPUCC_HLOS1_VOTE_SMMU_CLK_OFF   0x5000u
++
++/* Common QCOM GDSC / CBCR bit masks (GpuPowerBoard.h:97-105) */
++#define GDSCR_PWR_ON_BIT                (1u << 31)
++#define CBCR_CLK_OFF_BIT                (1u << 31)
++#define CBCR_CLK_ENABLE_BIT             (1u << 0)
++
++/* ---- Stage 3: GPU SMMU GR0 (kgsl-smmu@3da0000, gts7xlwifi.dts:32270, GpuPowerBoard.h:59-67) */
++#define GPU_SMMU_GR0_PHYS               0x03da0000UL
++#define GPU_SMMU_GR0_SIZE               0x00001000UL
++#define SMMU_GR0_SCR0_OFF               0x000u
++#define SMMU_GR0_SACR_OFF               0x010u
++#define SMMU_GR0_IDR0_OFF               0x020u
++#define SMMU_GR0_IDR1_OFF               0x024u
++#define SMMU_GR0_IDR2_OFF               0x028u
++#define SMMU_GR0_SGFSR_OFF              0x048u
++#define SMMU_GR0_SMR_BASE_OFF           0x800u
++#define SMMU_GR0_S2CR_BASE_OFF          0xc00u
++
++/* GMU status windows inside qcom,gmu@3d6a000 (gts7xlwifi.dts:32333, GpuProbe.cpp:80-92) */
++#define GMU_PAGE_14K_PHYS               (0x03d6a000UL + 0x14000UL)
++#define GMU_PAGE_14K_SIZE               0x00001000UL
++#define GMU_CM3_SYSRESET_OFF            0x000u  /* dword 0x5000 -> byte 0x14000 */
++#define GMU_CM3_FW_INIT_RESULT_OFF      0x070u  /* dword 0x501c -> byte 0x14070 */
++#define GMU_GX_PWR_CLK_STATUS_OFF       0x300u  /* dword 0x50c0 -> byte 0x14300 */
++#define GMU_HFI_CTRL_STATUS_OFF         0x600u  /* dword 0x5180 -> byte 0x14600 */
++
++#define GMU_PAGE_24K_PHYS               (0x03d6a000UL + 0x24000UL)
++#define GMU_PAGE_24K_SIZE               0x00001000UL
++#define GMU_AO_HOST_INT_STATUS_OFF      0xc14u  /* dword 0x9305 -> byte 0x24c14 */
++#define GMU_AHB_FENCE_STATUS_OFF        0xc40u  /* dword 0x9310 -> byte 0x24c40 */
++
++/* ---- Stage 4: GPU RBBM (qcom,kgsl-3d0@3d00000, gts7xlwifi.dts:32550, GpuProbe.cpp:94) ----- */
++#define GPU_RBBM_PAGE_PHYS              0x03d00000UL
++#define GPU_RBBM_PAGE_SIZE              0x00001000UL
++#define GPU_RBBM_HW_VERSION_OFF         0x000u  /* dword 0x0000 */
++#define GPU_RBBM_INT_0_STATUS_OFF       0x804u  /* dword 0x0201 -> byte 0x0804 */
++#define GPU_RBBM_STATUS_OFF             0x840u  /* dword 0x0210 -> byte 0x0840 */
++
++/* Cached small MMIO windows (mapped on demand only when a stage is reached) */
++static vm_offset_t g_gcc_gpu_page;
++static vm_offset_t g_gcc_vote_page;
++static vm_offset_t g_gpucc_page;
++static vm_offset_t g_smmu_gr0_page;
++static vm_offset_t g_gmu_14k_page;
++static vm_offset_t g_gmu_24k_page;
++static vm_offset_t g_gpu_rbbm_page;
++
++/* Strictly read-only 32-bit volatile MMIO helper with load barrier (no memcpy/memmove) */
++static inline uint32_t
++gpu_probe_rd32(vm_offset_t base, unsigned int byte_off)
++{
++	uint32_t val = *(volatile const uint32_t *)(base + byte_off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return val;
++}
++
++static void
++gpu_probe_pmsg(const char *line)
++{
++	if (!line) {
++		return;
++	}
++	int len = (int)strlen(line);
++	if (len > 0) {
++		pong_ramoops_diagnostic_write(line, len);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++int
++pong_gpu_probe_usb(char *reply, size_t reply_cap)
++{
++	if (!reply || reply_cap == 0) {
++		return -1;
++	}
++	reply[0] = '\0';
++
++	/* ---- Stage 1: GCC GPU branch clocks --------------------------------------------------- */
++	gpu_probe_pmsg("[PONG_GPU] P1 gcc\n");
++	if (!g_gcc_gpu_page) {
++		g_gcc_gpu_page = ml_io_map(GCC_GPU_PAGE_PHYS, GCC_GPU_PAGE_SIZE);
++	}
++	if (!g_gcc_vote_page) {
++		g_gcc_vote_page = ml_io_map(GCC_VOTE_PAGE_PHYS, GCC_VOTE_PAGE_SIZE);
++	}
++	if (!g_gcc_gpu_page || !g_gcc_vote_page) {
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=0(map) stop=gcc_map_failed\n");
++		gpu_probe_pmsg(reply);
++		return -1;
++	}
++
++	const uint32_t gcc_cfg_ahb   = gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_CFG_AHB_CBCR_OFF);
++	const uint32_t gcc_memnoc    = gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_MEMNOC_GFX_CBCR_OFF);
++	const uint32_t gcc_snoc_dvm  = gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_SNOC_DVM_GFX_CBCR_OFF);
++	const uint32_t gcc_misc      = gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_MISC_OFF);
++	const uint32_t gcc_ddrss_axi = gpu_probe_rd32(g_gcc_gpu_page, GCC_DDRSS_GPU_AXI_CBCR_OFF);
++	const uint32_t gcc_gpll0     = gpu_probe_rd32(g_gcc_vote_page, GCC_APCS_GPLL0_ENA_VOTE_OFF);
++
++	/*
++	 * Gate 1 -> 2 (GpuProbe.cpp:424):
++	 * GPUCC register space (0x03d90000) is clocked by GCC_GPU_CFG_AHB_CBCR.
++	 * On SM8250, UEFI leaves GCC_GPU_CFG_AHB_CBCR = 0x80002003 (CLK_ENABLE=1, HW_CLK_CTRL=1).
++	 * Require CLK_ENABLE (bit 0) before touching GPUCC.
++	 */
++	if ((gcc_cfg_ahb & CBCR_CLK_ENABLE_BIT) == 0) {
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=1(gcc) stop=gcc_cfg_ahb_off "
++		    "gcc[cfg_ahb=0x%08x memnoc=0x%08x snoc_dvm=0x%08x ddrss_axi=0x%08x misc=0x%08x gpll0=0x%08x]\n",
++		    gcc_cfg_ahb, gcc_memnoc, gcc_snoc_dvm, gcc_ddrss_axi, gcc_misc, gcc_gpll0);
++		gpu_probe_pmsg(reply);
++		return 1;
++	}
++
++	/* ---- Stage 2: GPUCC GDSCs & branch clocks --------------------------------------------- */
++	gpu_probe_pmsg("[PONG_GPU] P2 gpucc\n");
++	if (!g_gpucc_page) {
++		g_gpucc_page = ml_io_map(GPUCC_PHYS_BASE, GPUCC_MAP_SIZE);
++	}
++	if (!g_gpucc_page) {
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=1(gcc) stop=gpucc_map_failed "
++		    "gcc[cfg_ahb=0x%08x memnoc=0x%08x snoc_dvm=0x%08x ddrss_axi=0x%08x misc=0x%08x gpll0=0x%08x]\n",
++		    gcc_cfg_ahb, gcc_memnoc, gcc_snoc_dvm, gcc_ddrss_axi, gcc_misc, gcc_gpll0);
++		gpu_probe_pmsg(reply);
++		return -2;
++	}
++
++	const uint32_t cx_gdscr     = gpu_probe_rd32(g_gpucc_page, GPUCC_CX_GDSCR_OFF);
++	const uint32_t cx_hwctrl    = gpu_probe_rd32(g_gpucc_page, GPUCC_CX_HWCTRL_OFF);
++	const uint32_t gx_gdscr     = gpu_probe_rd32(g_gpucc_page, GPUCC_GX_GDSCR_OFF);
++	const uint32_t cc_ahb       = gpu_probe_rd32(g_gpucc_page, GPUCC_AHB_CBCR_OFF);
++	const uint32_t cc_smmu      = gpu_probe_rd32(g_gpucc_page, GPUCC_HLOS1_VOTE_SMMU_CLK_OFF);
++	const uint32_t cc_gmu       = gpu_probe_rd32(g_gpucc_page, GPUCC_CX_GMU_CBCR_OFF);
++	const uint32_t cc_cxo       = gpu_probe_rd32(g_gpucc_page, GPUCC_CXO_CBCR_OFF);
++	const uint32_t cc_cxo_aon   = gpu_probe_rd32(g_gpucc_page, GPUCC_CXO_AON_CBCR_OFF);
++	const uint32_t gmu_rcgr_cmd = gpu_probe_rd32(g_gpucc_page, GPUCC_GMU_CMD_RCGR_OFF);
++	const uint32_t gmu_rcgr_cfg = gpu_probe_rd32(g_gpucc_page, GPUCC_GMU_CFG_RCGR_OFF);
++	const uint32_t pll1_mode    = gpu_probe_rd32(g_gpucc_page, GPUCC_PLL1_MODE_OFF);
++
++	/*
++	 * Gate 2 -> 3 (GpuProbe.cpp:447):
++	 * GPU SMMU (0x03da0000) and GMU (0x03d6a000) live behind GPU_CC_CX_GDSCR (PWR_ON bit 31)
++	 * and GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK (CLK_OFF bit 31 == 0).
++	 */
++	const bool cx_gdsc_on  = (cx_gdscr & GDSCR_PWR_ON_BIT) != 0;
++	const bool smmu_clk_on = (cc_smmu & CBCR_CLK_OFF_BIT) == 0;
++	if (!cx_gdsc_on || !smmu_clk_on) {
++		const char *why = !cx_gdsc_on ? "cx_gdsc_off" : "smmu_clk_off";
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=2(gpucc) stop=%s "
++		    "gcc[cfg_ahb=0x%08x memnoc=0x%08x snoc_dvm=0x%08x ddrss_axi=0x%08x misc=0x%08x gpll0=0x%08x] "
++		    "gpucc[cx_gdscr=0x%08x cx_hw=0x%08x gx_gdscr=0x%08x ahb=0x%08x smmu=0x%08x gmu=0x%08x "
++		    "cxo=0x%08x cxo_aon=0x%08x rcgr_cmd=0x%08x rcgr_cfg=0x%08x pll1=0x%08x]\n",
++		    why,
++		    gcc_cfg_ahb, gcc_memnoc, gcc_snoc_dvm, gcc_ddrss_axi, gcc_misc, gcc_gpll0,
++		    cx_gdscr, cx_hwctrl, gx_gdscr, cc_ahb, cc_smmu, cc_gmu,
++		    cc_cxo, cc_cxo_aon, gmu_rcgr_cmd, gmu_rcgr_cfg, pll1_mode);
++		gpu_probe_pmsg(reply);
++		return 2;
++	}
++
++	/* ---- Stage 3: GPU SMMU GR0 (+ optional GMU status if GMU/AHB clocks are live) --------- */
++	gpu_probe_pmsg("[PONG_GPU] P3 smmu_gr0\n");
++	if (!g_smmu_gr0_page) {
++		g_smmu_gr0_page = ml_io_map(GPU_SMMU_GR0_PHYS, GPU_SMMU_GR0_SIZE);
++	}
++	if (!g_smmu_gr0_page) {
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=2(gpucc) stop=smmu_map_failed "
++		    "gpucc[cx_gdscr=0x%08x gx_gdscr=0x%08x ahb=0x%08x smmu=0x%08x gmu=0x%08x]\n",
++		    cx_gdscr, gx_gdscr, cc_ahb, cc_smmu, cc_gmu);
++		gpu_probe_pmsg(reply);
++		return -3;
++	}
++
++	const uint32_t smmu_scr0  = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SCR0_OFF);
++	const uint32_t smmu_sacr  = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SACR_OFF);
++	const uint32_t smmu_idr0  = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_IDR0_OFF);
++	const uint32_t smmu_idr1  = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_IDR1_OFF);
++	const uint32_t smmu_idr2  = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_IDR2_OFF);
++	const uint32_t smmu_sgfsr = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SGFSR_OFF);
++
++	uint32_t smr_count = smmu_idr0 & 0xffu;
++	if (smr_count > 128u) {
++		smr_count = 128u;
++	}
++	uint32_t valid_smr = 0;
++	uint32_t smr0 = 0, s2cr0 = 0;
++	for (uint32_t i = 0; i < smr_count; i++) {
++		const uint32_t smr = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SMR_BASE_OFF + i * 4u);
++		if ((smr & 0x80000000u) != 0) {
++			const uint32_t s2cr = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_S2CR_BASE_OFF + i * 4u);
++			if (valid_smr == 0) {
++				smr0 = smr;
++				s2cr0 = s2cr;
++			}
++			valid_smr++;
++		}
++	}
++
++	bool gmu_read = false;
++	uint32_t gmu_rst = 0, gmu_fw = 0, gmu_gx = 0, gmu_hfi = 0, gmu_irq = 0, gmu_fence = 0;
++	if ((cc_ahb & CBCR_CLK_OFF_BIT) == 0 && (cc_gmu & CBCR_CLK_OFF_BIT) == 0) {
++		if (!g_gmu_14k_page) {
++			g_gmu_14k_page = ml_io_map(GMU_PAGE_14K_PHYS, GMU_PAGE_14K_SIZE);
++		}
++		if (!g_gmu_24k_page) {
++			g_gmu_24k_page = ml_io_map(GMU_PAGE_24K_PHYS, GMU_PAGE_24K_SIZE);
++		}
++		if (g_gmu_14k_page && g_gmu_24k_page) {
++			gmu_rst   = gpu_probe_rd32(g_gmu_14k_page, GMU_CM3_SYSRESET_OFF);
++			gmu_fw    = gpu_probe_rd32(g_gmu_14k_page, GMU_CM3_FW_INIT_RESULT_OFF);
++			gmu_gx    = gpu_probe_rd32(g_gmu_14k_page, GMU_GX_PWR_CLK_STATUS_OFF);
++			gmu_hfi   = gpu_probe_rd32(g_gmu_14k_page, GMU_HFI_CTRL_STATUS_OFF);
++			gmu_irq   = gpu_probe_rd32(g_gmu_24k_page, GMU_AO_HOST_INT_STATUS_OFF);
++			gmu_fence = gpu_probe_rd32(g_gmu_24k_page, GMU_AHB_FENCE_STATUS_OFF);
++			gmu_read  = true;
++		}
++	}
++
++	/*
++	 * Gate 3 -> 4:
++	 * Reading Adreno 650 RBBM_STATUS (0x03d00840) requires GPU_CC_AHB_CBCR (CLK_OFF == 0)
++	 * and GPU_CC_GX_GDSCR (PWR_ON == 1).
++	 */
++	const bool gpucc_ahb_on = (cc_ahb & CBCR_CLK_OFF_BIT) == 0;
++	const bool gx_gdsc_on   = (gx_gdscr & GDSCR_PWR_ON_BIT) != 0;
++	if (!gpucc_ahb_on || !gx_gdsc_on) {
++		const char *why = !gpucc_ahb_on ? "gpucc_ahb_off" : "gx_gdsc_off";
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=3(smmu_gr0) stop=%s "
++		    "gcc[cfg_ahb=0x%08x memnoc=0x%08x] "
++		    "gpucc[cx_gdscr=0x%08x gx_gdscr=0x%08x ahb=0x%08x smmu=0x%08x gmu=0x%08x] "
++		    "smmu[scr0=0x%08x sacr=0x%08x id0=0x%08x id1=0x%08x id2=0x%08x gfsr=0x%08x "
++		    "valid=%u smr0=0x%08x s2cr0=0x%08x] "
++		    "gmu[read=%u rst=0x%08x fw=0x%08x gx=0x%08x hfi=0x%08x irq=0x%08x fence=0x%08x]\n",
++		    why,
++		    gcc_cfg_ahb, gcc_memnoc,
++		    cx_gdscr, gx_gdscr, cc_ahb, cc_smmu, cc_gmu,
++		    smmu_scr0, smmu_sacr, smmu_idr0, smmu_idr1, smmu_idr2, smmu_sgfsr,
++		    valid_smr, smr0, s2cr0,
++		    gmu_read ? 1u : 0u, gmu_rst, gmu_fw, gmu_gx, gmu_hfi, gmu_irq, gmu_fence);
++		gpu_probe_pmsg(reply);
++		return 3;
++	}
++
++	/* ---- Stage 4: GPU RBBM_STATUS --------------------------------------------------------- */
++	gpu_probe_pmsg("[PONG_GPU] P4 rbbm_status\n");
++	if (!g_gpu_rbbm_page) {
++		g_gpu_rbbm_page = ml_io_map(GPU_RBBM_PAGE_PHYS, GPU_RBBM_PAGE_SIZE);
++	}
++	if (!g_gpu_rbbm_page) {
++		snprintf(reply, reply_cap,
++		    "gpuprobe: stage=3(smmu_gr0) stop=rbbm_map_failed "
++		    "gpucc[cx_gdscr=0x%08x gx_gdscr=0x%08x ahb=0x%08x] smmu[scr0=0x%08x id0=0x%08x]\n",
++		    cx_gdscr, gx_gdscr, cc_ahb, smmu_scr0, smmu_idr0);
++		gpu_probe_pmsg(reply);
++		return -4;
++	}
++
++	const uint32_t rbbm_hw_ver = gpu_probe_rd32(g_gpu_rbbm_page, GPU_RBBM_HW_VERSION_OFF);
++	const uint32_t rbbm_int0   = gpu_probe_rd32(g_gpu_rbbm_page, GPU_RBBM_INT_0_STATUS_OFF);
++	const uint32_t rbbm_status = gpu_probe_rd32(g_gpu_rbbm_page, GPU_RBBM_STATUS_OFF);
++
++	snprintf(reply, reply_cap,
++	    "gpuprobe: stage=4(rbbm_status) stop=none "
++	    "gcc[cfg_ahb=0x%08x memnoc=0x%08x] "
++	    "gpucc[cx_gdscr=0x%08x gx_gdscr=0x%08x ahb=0x%08x smmu=0x%08x gmu=0x%08x] "
++	    "smmu[scr0=0x%08x id0=0x%08x gfsr=0x%08x valid=%u] "
++	    "gmu[read=%u fw=0x%08x gx=0x%08x hfi=0x%08x] "
++	    "rbbm[status=0x%08x hw_ver=0x%08x int0=0x%08x]\n",
++	    gcc_cfg_ahb, gcc_memnoc,
++	    cx_gdscr, gx_gdscr, cc_ahb, cc_smmu, cc_gmu,
++	    smmu_scr0, smmu_idr0, smmu_sgfsr, valid_smr,
++	    gmu_read ? 1u : 0u, gmu_fw, gmu_gx, gmu_hfi,
++	    rbbm_status, rbbm_hw_ver, rbbm_int0);
++	gpu_probe_pmsg(reply);
++	return 4;
++}
++#endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 1762859..f031398 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -66,6 +66,8 @@ extern uint64_t armcpu_now_ms(void);
+ /* pong_wifi_link.c: PCIe0 power-up and link training to the Wi-Fi chip; one result line each */
+ extern int pong_wifi_link_up(char *reply, size_t reply_len);
+ extern int pong_wifi_link_down(char *reply, size_t reply_len);
++/* pong_gpu_probe.c: staged read-only Adreno 650 power/clock/SMMU/RBBM probe; one result line */
++extern int pong_gpu_probe_usb(char *reply, size_t reply_cap);
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1272,6 +1274,20 @@ cmd_handle_wifi(bool up)
+ 	send_str(reply[0] ? reply : "wifi: no reply\n");
+ }
+ 
++/*
++ * gpuprobe: read-only staged Adreno 650 probe (GCC -> GPUCC -> SMMU GR0 -> RBBM_STATUS).
++ * Only reads the next stage when the previous stage is powered/clocked; zero writes.
++ */
++static void
++cmd_handle_gpuprobe(void)
++{
++	char reply[512];
++
++	reply[0] = '\0';
++	(void)pong_gpu_probe_usb(reply, sizeof(reply));
++	send_str(reply[0] ? reply : "gpuprobe: no reply\n");
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1408,10 +1424,12 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifi(true);
+ 	} else if (strcmp(cmd, "wifidown") == 0) {
+ 		cmd_handle_wifi(false);
++	} else if (strcmp(cmd, "gpuprobe") == 0) {
++		cmd_handle_gpuprobe();
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 27157d6..a8f1025 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2149,7 +2149,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	unsigned int pong_gpu_requested = 0;
+ 	if (PE_parse_boot_argn("pong_adreno_start", &pong_gpu_requested,
+ 	    sizeof(pong_gpu_requested)) && pong_gpu_requested == 1) {
+-		const uint64_t zap = 0x8b91a000ULL, zap_end = zap + 0x2000;
++		/* SM-T970 (SM8250): pil_gpu_region@8681a000 reg = <0x0 0x9031a000 0x0 0x2000> (gts7xlwifi.dts:34582-34585) */
++		const uint64_t zap = 0x9031a000ULL, zap_end = zap + 0x2000;
+ 		if (zap_end <= gPhysBase || zap >= gPhysBase + mem_size) {
+ 			/* Outside this XNU window: the real DT reservation is unmanaged. */
+ 			pong_adreno_zap_reserved = 1;
