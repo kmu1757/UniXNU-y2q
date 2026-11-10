@@ -1,0 +1,116 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 2071407..61dd0ef 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -43,6 +43,8 @@ extern task_t proc_task(proc_t);
+ extern int proc_pid(proc_t);
+ extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec);
+ extern void pong_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
++extern uint64_t pong_cpu_idle_mach(unsigned int cpu);
++extern int pong_prefer_cluster;
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -761,6 +763,10 @@ cmd_handle_reboot(bool to_recovery)
+ 
+ 	delay_for_interval(50, NSEC_PER_MSEC);
+ 	if (to_recovery && imem_base) {
++		/* reboot_kernel() panics here with "Halt/Restart Timed Out" (11-10): no restart handler
++		 * answers. Ask the firmware directly; /chosen/psci-method is smc on this board. */
++		register uint64_t x0 __asm__("x0") = 0x84000009; /* PSCI SYSTEM_RESET */
++		__asm__ volatile ("smc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+ 		reboot_kernel(RB_QUICK, "reboot recovery");
+ 	} else {
+ 		reboot_kernel(RB_AUTOBOOT, NULL);
+@@ -871,6 +877,48 @@ cmd_handle_swipe(const char *args)
+ 	send_str(reply);
+ }
+ 
++/* cpus: how busy each core was since the previous `cpus` (the first call: since boot). */
++static void
++cmd_handle_cpus(void)
++{
++	static uint64_t last_idle[8], last_time;
++	char reply[160];
++	uint64_t now = mach_absolute_time(), elapsed = now - last_time, ms = 0;
++	int n;
++
++	absolutetime_to_nanoseconds(elapsed, &ms);
++	n = snprintf(reply, sizeof(reply), "cpus: %llu ms prefer=%d busy%%:", ms / NSEC_PER_MSEC, pong_prefer_cluster);
++	for (unsigned c = 0; c < 8; c++) {
++		uint64_t idle = pong_cpu_idle_mach(c);
++		uint64_t delta = idle - last_idle[c];
++		unsigned busy = (idle == UINT64_MAX || elapsed == 0 || delta >= elapsed) ? 0 : (unsigned)(100 - delta * 100 / elapsed);
++
++		last_idle[c] = idle;
++		if (n > 0 && n < (int)sizeof(reply) - 6) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " %u", busy);
++		}
++	}
++	last_time = now;
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
++/* prefer N: the cluster every thread group prefers (0 Silver, 1 Gold, 2 Prime; 99: as before). */
++static void
++cmd_handle_prefer(const char *args)
++{
++	const char *p = args;
++	unsigned value = parse_uint(&p);
++	char reply[48];
++
++	pong_prefer_cluster = value <= 2 ? (int)value : -1;
++	snprintf(reply, sizeof(reply), "prefer: %d\n", pong_prefer_cluster);
++	send_str(reply);
++}
++
+ static int
+ proc_thread_snapshot_callout(proc_t p, __unused void *arg)
+ {
+@@ -919,8 +967,12 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_swipe(cmd + 6);
+ 	} else if (strcmp(cmd, "threads") == 0) {
+ 		cmd_handle_threads();
++	} else if (strcmp(cmd, "cpus") == 0) {
++		cmd_handle_cpus();
++	} else if (strncmp(cmd, "prefer ", 7) == 0) {
++		cmd_handle_prefer(cmd + 7);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer\n");
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 5bd9103..8d612bb 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -1448,11 +1448,24 @@ sched_clutch_destroy(
+  * cluster, the logic always goes back to the preference stored at the clutch_bucket_group.
+  */
+ 
++#if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++#include <kern/startup.h>
++/*
++ * pong_prefer_cluster=N (boot-arg; the USB command `prefer N` writes it at run time): every thread
++ * group prefers cluster N. Nothing on this board plays the performance controller's part, so
++ * scbg_preferred_cluster stays at the boot cluster (Silver) for every group. -1: as before.
++ */
++TUNABLE_WRITEABLE(int, pong_prefer_cluster, "pong_prefer_cluster", -1);
++#endif
++
+ static uint32_t
+ sched_edge_clutch_bucket_group_preferred_cluster(sched_clutch_bucket_group_t clutch_bucket_group)
+ {
+ 	uint32_t cluster_id = os_atomic_load(&clutch_bucket_group->scbg_preferred_cluster, relaxed);
+ #if defined(ARM64_BOARD_CONFIG_PONG) || defined(ARM64_BOARD_CONFIG_BCM2837)
++	if (pong_prefer_cluster >= 0) {
++		cluster_id = (uint32_t)pong_prefer_cluster;
++	}
+ 	/* gts7xlwifi, as SM-T733 45e: early threads run before the secondary psets exist; until then the boot cluster. */
+ 	if (cluster_id >= MAX_PSETS || pset_array[cluster_id] == PROCESSOR_SET_NULL || !pset_is_recommended(pset_array[cluster_id])) {
+ 		return pset0.pset_cluster_id;
