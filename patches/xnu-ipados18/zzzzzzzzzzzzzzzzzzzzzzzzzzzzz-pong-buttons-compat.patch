@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/pong_buttons.c b/bsd/dev/pong_buttons.c
+index 67fb36c..8d579b4 100644
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -73,7 +73,14 @@ static bool configuration(void)
+         pmsg_log("[PONG_KEYS] fail: SecureDTLookupEntry(/arm-io/pong-buttons)\n");
+         return false;
+     }
+-    (void)property(e, "compatible", compat, sizeof(compat) - 1);
++    /* property() wants the exact size, and "compatible" is as long as its string (17 bytes for
++     * "qcom,pm8150-keys"): asking for 31 never matched, compat stayed empty and the T970 took the
++     * SM8475 addresses below, where every arbiter register reads 0. */
++    const void *compat_value = NULL;
++    unsigned compat_size = 0;
++    if (SecureDTGetProperty(e, "compatible", &compat_value, &compat_size) == kSuccess && compat_value) {
++        memcpy(compat, compat_value, compat_size < sizeof(compat) - 1 ? compat_size : sizeof(compat) - 1);
++    }
+     (void)property(e, "core-base", &c, 8);
+     (void)property(e, "cnfg-base", &n, 8);
+     (void)property(e, "observer-base", &o, 8);
+@@ -103,6 +110,8 @@ static bool configuration(void)
+ 
+     pon.ppid = (uint16_t)a;
+     pin.ppid = (uint16_t)b;
++    pmsg_log("[PONG_KEYS] config: compat=%s core=0x%llx cnfg=0x%llx obs=0x%llx pon=0x%x pin=0x%x\n", compat,
++             (unsigned long long)c, (unsigned long long)n, (unsigned long long)o, a, b);
+ 
+     core = ml_io_map(c, 0x4000);
+     cnfg = ml_io_map(n, 0x4000);
