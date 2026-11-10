@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 0e074c8..55ac8dc 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -48,6 +48,8 @@ extern uint64_t pong_cpu_idle_mach(unsigned int cpu);
+ extern int pong_prefer_cluster;
+ extern kern_return_t pong_task_prefer_cluster(task_t task, uint32_t cluster_id);
+ extern task_t kernel_task;
++/* ArmCpu (T970 patch): per-core IPIs asked for, IPIs taken, timer interrupts taken */
++extern volatile uint64_t armcpu_ipi_sent[8], armcpu_ipi_recv[8], armcpu_timer_recv[8];
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1020,6 +1022,38 @@ cmd_handle_top(void)
+ 	send_str(reply);
+ }
+ 
++/*
++ * ipis: for every core, IPIs asked for / IPIs taken / timer interrupts taken since the previous `ipis`.
++ * A core whose first number grows while the second stays is not being woken.
++ */
++static void
++cmd_handle_ipis(void)
++{
++	static uint64_t last[3][8];
++	const volatile uint64_t *now[3] = { armcpu_ipi_sent, armcpu_ipi_recv, armcpu_timer_recv };
++	char reply[400];
++	int n = snprintf(reply, sizeof(reply), "ipis sent/recv/timer:");
++
++	for (unsigned c = 0; c < 8; c++) {
++		uint64_t delta[3];
++
++		for (unsigned k = 0; k < 3; k++) {
++			uint64_t value = now[k][c];
++
++			delta[k] = value - last[k][c];
++			last[k][c] = value;
++		}
++		if (n > 0 && n < (int)sizeof(reply) - 48) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " c%u=%llu/%llu/%llu", c, delta[0], delta[1], delta[2]);
++		}
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1130,10 +1164,12 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_prefer(cmd + 7);
+ 	} else if (strcmp(cmd, "top") == 0) {
+ 		cmd_handle_top();
++	} else if (strcmp(cmd, "ipis") == 0) {
++		cmd_handle_ipis();
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis\n");
+ 	}
+ }
+ 

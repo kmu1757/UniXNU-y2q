@@ -38,6 +38,33 @@ def add_idle_latency_knob(txt: str) -> str:
     return txt.replace(LATENCY_AT, LATENCY)
 
 
+COUNTERS = (
+    ('volatile uint64_t armcpu_timer_interrupts, armcpu_ipi_interrupts;\n',
+     'volatile uint64_t armcpu_ipi_sent[8], armcpu_ipi_recv[8], armcpu_timer_recv[8];\n'),
+    ('      __atomic_fetch_add(&armcpu_timer_interrupts, 1, __ATOMIC_RELAXED);\n',
+     '      if (logicalId < 8) armcpu_timer_recv[logicalId]++;\n'),
+    ('      __atomic_fetch_add(&armcpu_ipi_interrupts, 1, __ATOMIC_RELAXED);\n',
+     '      if (logicalId < 8) armcpu_ipi_recv[logicalId]++;\n'),
+    ('  if (!cpu) panic("ArmCpu: invalid CPU signal target");\n',
+     '  armcpu_ipi_sent[cpu->logicalId & 7]++;\n'),
+)
+
+
+def add_ipi_counters(txt: str) -> str:
+    """Per-core counts of IPIs asked for, IPIs taken and timer interrupts taken (USB command `ipis`).
+
+    With backboardd and SpringBoard told to prefer the Gold cluster the display stopped for good
+    (11-10): a count that grows in `sent` and not in `recv` says the wake-up never reaches that core.
+    Runs after the SPI IPI step, whose needle contains the last anchor.
+    """
+    if 'armcpu_ipi_sent' in txt:
+        return txt
+    for anchor, addition in COUNTERS:
+        assert txt.count(anchor) == 1, 'expected exactly one: ' + anchor.strip()
+        txt = txt.replace(anchor, anchor + addition)
+    return txt
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
@@ -47,7 +74,7 @@ def patch_armcpu(armcpu_source: Path):
     txt = add_idle_latency_knob(disable_cpu_policy(target.read_text(encoding='utf-8')))
     if 'armcpu-spi-ipi' in txt:
         # already carries the SPI IPI patch; still make sure the policy is off
-        target.write_text(txt, encoding='utf-8')
+        target.write_text(add_ipi_counters(txt), encoding='utf-8')
         return
 
     # 1. Add SPI IPI state and helper functions after gBootAffinity
@@ -152,6 +179,7 @@ static void spiIpiSend(uintptr_t dist, uint32_t core)
       if (ipi_handler) ipi_handler();"""
     txt = txt.replace(needle_irq, replacement_irq)
 
+    txt = add_ipi_counters(txt)
     target.write_text(txt, encoding='utf-8')
     print(f'Applied SM-T970 ArmCpu patch to {target}', flush=True)
 
