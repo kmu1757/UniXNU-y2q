@@ -1,0 +1,816 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2fc6808..aca8be0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -408,6 +408,7 @@ bsd/dev/pong_usb_ctl.c			standard
+ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
++bsd/dev/pong_wifi_link.c		standard
+ bsd/pthread/pthread_kext.c			standard
+ bsd/kern/source_pthread_bootstrap.c			standard
+ bsd/kern/kern_event.c			standard
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 57db6a2..8f44f49 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -58,6 +58,9 @@ extern void armcpu_gic_poke(uint32_t off, uint32_t value);
+ extern uint32_t armcpu_redist_peek(uint32_t cpu, uint32_t off);
+ extern void armcpu_redist_poke(uint32_t cpu, uint32_t off, uint32_t value);
+ extern void armcpu_icc_state(uint64_t out[6]);
++/* pong_wifi_link.c: PCIe0 power-up and link training to the Wi-Fi chip; one result line each */
++extern int pong_wifi_link_up(char *reply, size_t reply_len);
++extern int pong_wifi_link_down(char *reply, size_t reply_len);
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1176,6 +1179,24 @@ cmd_handle_ipimode(const char *args)
+ 	send_str(reply);
+ }
+ 
++/*
++ * wifiup: power PCIe0 up, train the link to the Wi-Fi chip and read its ID (about 0.4 s, at most about 1.7 s).
++ * wifidown: put the chip back in reset. The reply is pong_wifi_link.c's result line.
++ */
++static void
++cmd_handle_wifi(bool up)
++{
++	char reply[400];
++
++	reply[0] = '\0';
++	if (up) {
++		(void)pong_wifi_link_up(reply, sizeof(reply));
++	} else {
++		(void)pong_wifi_link_down(reply, sizeof(reply));
++	}
++	send_str(reply[0] ? reply : "wifi: no reply\n");
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1300,10 +1321,14 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_gic_rw(cmd + 4, true, true);
+ 	} else if (strncmp(cmd, "ipimode ", 8) == 0) {
+ 		cmd_handle_ipimode(cmd + 8);
++	} else if (strcmp(cmd, "wifiup") == 0) {
++		cmd_handle_wifi(true);
++	} else if (strcmp(cmd, "wifidown") == 0) {
++		cmd_handle_wifi(false);
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+new file mode 100644
+index 0000000..885701c
+--- /dev/null
++++ b/bsd/dev/pong_wifi_link.c
+@@ -0,0 +1,743 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/*
++ * SM-T970 (SM8250) PCIe0 power-up and link training to the QCA6390, up to reading the
++ * endpoint's vendor/device ID from config space. Runs only when the USB command `wifiup` asks.
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/T970WifiProbe.cpp bringUp() steps 10..17 (rails, pins, GDSC, clocks, PARF, PHY,
++ *   LTSSM, iATU config read) and the PERST#/WLAN_EN power-down at the end of wifiThread();
++ *   package/T970Rpmh.inc (command DB lookup, one ACTIVE request on APPS RSC DRV2).
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ * Cross-checked against Linux gcc-sm8250.c / pinctrl-sm8250.c and the stock T970 DTS.
++ *
++ * Nothing here runs at boot. Entry points (to be called from a pong_usb_ctl.c command):
++ *   int pong_wifi_link_up(char *reply, size_t reply_len);    0 = endpoint ID read
++ *   int pong_wifi_link_down(char *reply, size_t reply_len);  PERST# low, then WLAN_EN low
++ * Step numbers follow rui's `st` field so a reply can be put next to their boot-log row:
++ *   1 mapped, 2 surveyed, 10 rails, 11 pins, 12 GDSC, 13 clocks, 14 PARF+PHY, 15 root port,
++ *   16 link, 17 endpoint ID. A negative step is the step that failed; `why` names the check.
++ * Before each step a short "[PONG_WIFI] L<step>" line goes to pmsg, so a silent SoC reset
++ * still shows which step it happened in.
++ *
++ * Not done here on purpose: the PARF BDF->SID table, root-port bus mastering,
++ * BAR assignment, MSI, SMMU. The endpoint cannot do DMA after this.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern uint64_t mach_absolute_time(void);
++
++int pong_wifi_link_up(char *reply, size_t reply_len);
++int pong_wifi_link_down(char *reply, size_t reply_len);
++
++/* ---- tuning knobs ------------------------------------------------------------------------- */
++#define WL_LINK_GEN        1u      /* LNKCTL2 target speed; stock DTS qcom,target-link-speed = 1 */
++#define WL_LINK_MS         1000u   /* LTSSM wait (rui: 1000 x 1 ms; their link came up in 13 ms) */
++#define WL_WLAN_OFF_MS     150u    /* WLAN_EN low before power-up (rui: cnss >= 100 ms) */
++#define WL_WLAN_ON_MS      60u     /* WLAN_EN high -> chip ready */
++#define WL_PERST_MS        100u    /* PERST# low after the PHY is ready */
++
++/* ---- addresses ---------------------------------------------------------------------------- */
++#define WL_PAGE            0x4000UL          /* one small window per register page, as the survey */
++
++#define GCC                0x00100000UL
++#define GCC_VOTE           (GCC + 0x52008)   /* APCS branch votes */
++#define GCC_VOTE_BITS      0x3fu             /* 0 slv_axi 1 mstr_axi 2 cfg_ahb 3 aux 4 pipe 5 slv_q2a */
++#define GCC_PCIE0_BCR      (GCC + 0x6b000)
++#define GCC_PCIE0_GDSCR    (GCC + 0x6b004)
++#define GCC_PCIE0_AUX_CMD  (GCC + 0x6b038)
++#define GCC_PCIE0_AUX_CFG  (GCC + 0x6b03c)
++#define GCC_PCIE0_PHY_BCR  (GCC + 0x6c01c)
++#define GCC_REFGEN_CMD     (GCC + 0x6f014)
++#define GCC_REFGEN_CFG     (GCC + 0x6f018)
++
++/* halt bit (31) of: slv_axi, mstr_axi, cfg_ahb, aux, slv_q2a, pipe, refgen, aggre_noc_tbu, ddrss_sf_tbu */
++static const uint32_t wl_branch[] = { 0x6b014, 0x6b01c, 0x6b024, 0x6b028, 0x6b010, 0x6b02c, 0x6f02c, 0x9000c, 0x8d058 };
++#define WL_NBRANCH         (sizeof(wl_branch) / sizeof(wl_branch[0]))
++#define WL_HALT_PARF       (0x0fu | 1u << 6) /* needed before PARF/PHY are touched (rui: 0xf; refgen added) */
++#define WL_HALT_DBI        (1u << 4 | 1u << 5) /* slv_q2a and pipe: needed before DBI/iATU/config */
++/* branches with their own enable bit 0: pcie0_phy_refgen, aggre_noc_pcie_tbu, ddrss_pcie_sf_tbu, pcie_wifi_clkref_en */
++static const uint32_t wl_direct[] = { 0x6f02c, 0x9000c, 0x8d058, 0x8c004 };
++
++/* TLMM: config at +0, in/out at +4 (in bit 0, out bit 1). GPIO 79/80 are on the north tile,
++ * 90 on the south tile (pinctrl-sm8250.c, measured by the survey). A wrong tile resets the SoC.
++ * Only these three pins are ever written. */
++#define TLMM_NORTH         0x0f900000UL
++#define TLMM_SOUTH         0x0f500000UL
++#define PIN_PERST          (TLMM_NORTH + 79 * 0x1000UL)
++#define PIN_CLKREQ         (TLMM_NORTH + 80 * 0x1000UL)
++#define PIN_WLAN_EN        (TLMM_SOUTH + 90 * 0x1000UL)
++/* config: pull bits 0-1 (1 down, 3 up), function 2-5, drive (mA / 2 - 1) 6-8, output enable bit 9 */
++#define CFG_PERST          (1u | 1u << 9)             /* gpio, pull-down, 2 mA, output */
++#define CFG_CLKREQ         (3u | 1u << 2)             /* function 1 = pci_e0, pull-up, 2 mA */
++#define CFG_WLAN_EN        (3u | 7u << 6 | 1u << 9)   /* gpio, pull-up, 16 mA, output */
++
++#define PARF               0x01c00000UL
++#define PHY                0x01c06000UL
++#define DBI                0x60000000UL
++#define ATU                0x60001000UL
++#define CFGSPACE           0x60100000UL
++#define PARF_SYS_CTRL      (PARF + 0x000)
++#define PARF_PM_CTRL       (PARF + 0x020)
++#define PARF_PHY_CTRL      (PARF + 0x040)
++#define PARF_MHI_CLK_RESET (PARF + 0x174)
++#define PARF_AXI_HALT      (PARF + 0x1a8)
++#define PARF_LTSSM         (PARF + 0x1b0)
++#define PARF_DBI_BASE      (PARF + 0x350)
++#define PARF_SLV_SPACE     (PARF + 0x358)
++#define PARF_ATU_BASE      (PARF + 0x634)
++#define PARF_DEVICE_TYPE   (PARF + 0x1000)
++#define PHY_PCS_STATUS1    (PHY + 0x814)     /* bit 6 clear = ready (DTS qcom,phy-status-offset/bit) */
++#define DBI_ID             (DBI + 0x000)
++#define DBI_BUS            (DBI + 0x018)
++#define DBI_LNKCTL         (DBI + 0x080)
++#define DBI_LNKCTL2        (DBI + 0x0a0)
++#define DBI_DEBUG0         (DBI + 0x728)     /* bits 5:0 LTSSM state, 0x11 = L0 */
++#define DBI_DEBUG1         (DBI + 0x72c)     /* bit 4 link up */
++
++/* RPMh: command DB the boot loader left, APPS RSC DRV2 (the one pong_fts.c already votes through) */
++#define CMDDB              0x80860000UL
++#define CMDDB_SIZE         0x20000UL
++#define RSC                0x18220000UL
++#define TCS_BASE           (RSC + 0xd00)
++#define TCS_IRQ_STATUS     (TCS_BASE + 0x04)
++#define TCS_IRQ_CLEAR      (TCS_BASE + 0x08)
++#define TCS(n, reg)        (TCS_BASE + 0x2a0UL * (n) + (reg))
++#define TCS_CMD_WAIT       0x10
++#define TCS_CONTROL        0x14
++#define TCS_STATUS         0x18              /* bit 0: idle */
++#define TCS_CMD_ENABLE     0x1c
++#define TCS_MSGID          0x30
++#define TCS_ADDR           0x34
++#define TCS_DATA           0x38
++#define TCS_CMD_STATUS     0x3c              /* bit 8 issued, bit 16 completed */
++#define AMC_ENABLE         (1u << 16)
++#define AMC_TRIGGER        (1u << 24)
++#define CMD_DONE           (1u << 8 | 1u << 16)
++
++/* cnss rails of the stock DTS: io first, then the PMU inputs, then the antenna switch (rui's order) */
++static const struct { const char *name; uint32_t mv; } wl_rail[] = {
++	{ "smpa4", 1800 }, { "smpa6", 950 }, { "smpa5", 2040 }, { "smpc8", 1350 }, { "ldoc5", 1800 },
++};
++#define WL_NRAIL           (sizeof(wl_rail) / sizeof(wl_rail[0]))
++#define WL_RAILS_NEEDED    0x0fu             /* ldoc5 (antenna switch) is voted but not required for a link */
++
++/* qcom,phy-sequence of qcom,pcie@1c00000 in the stock DTS (99 entries, every delay 0): offset, value.
++ * Starts with POWER_DOWN_CONTROL (0x840) = 3, ends with SW_RESET (0x800) = 0 and START (0x844) = 3. */
++static const struct { uint16_t off; uint8_t val; } wl_phy_seq[] = {
++	{0x840, 0x03}, {0x094, 0x08}, {0x154, 0x34}, {0x16c, 0x08}, {0x058, 0x0f}, {0x0a4, 0x42}, {0x110, 0x24}, {0x11c, 0x03}, {0x118, 0xb4},
++	{0x10c, 0x02}, {0x1bc, 0x11}, {0x0bc, 0x82}, {0x0d4, 0x03}, {0x0d0, 0x55}, {0x0cc, 0x55}, {0x0b0, 0x1a}, {0x0ac, 0x0a}, {0x0c4, 0x68},
++	{0x0e0, 0x02}, {0x0dc, 0xaa}, {0x0d8, 0xab}, {0x0b8, 0x34}, {0x0b4, 0x14}, {0x158, 0x01}, {0x074, 0x06}, {0x07c, 0x16}, {0x084, 0x36},
++	{0x078, 0x06}, {0x080, 0x16}, {0x088, 0x36}, {0x1b0, 0x1e}, {0x1ac, 0xca}, {0x1b8, 0x18}, {0x1b4, 0xa2}, {0x050, 0x07}, {0x010, 0x01},
++	{0x01c, 0x31}, {0x020, 0x01}, {0x024, 0xde}, {0x028, 0x07}, {0x030, 0x4c}, {0x034, 0x06}, {0x29c, 0x12}, {0x284, 0x35}, {0x23c, 0x11},
++	{0x51c, 0x03}, {0x518, 0x1c}, {0x524, 0x1e}, {0x4e8, 0x00}, {0x4ec, 0x0e}, {0x4f0, 0x4a}, {0x4f4, 0x0f}, {0x5b4, 0x04}, {0x434, 0x7f},
++	{0x444, 0x70}, {0x510, 0x17}, {0x4d4, 0x04}, {0x4d8, 0x07}, {0x598, 0xd4}, {0x59c, 0x54}, {0x5a0, 0xdb}, {0x5a4, 0x3b}, {0x5a8, 0x31},
++	{0x584, 0x24}, {0x588, 0xe4}, {0x58c, 0xec}, {0x590, 0x3b}, {0x594, 0x36}, {0x570, 0x3f}, {0x574, 0x3f}, {0x578, 0xff}, {0x57c, 0x7f},
++	{0x580, 0x14}, {0x4fc, 0x00}, {0x4f8, 0xc0}, {0x460, 0x30}, {0x464, 0x00}, {0x5bc, 0x0c}, {0x4dc, 0x1b}, {0x408, 0x0c}, {0x414, 0x03},
++	{0x5b8, 0x30}, {0x9a4, 0x01}, {0xc90, 0x00}, {0xc40, 0x01}, {0xc48, 0x01}, {0xc50, 0x00}, {0xcb4, 0x33}, {0xcbc, 0x00}, {0xce0, 0x58},
++	{0xca4, 0x0f}, {0x048, 0x90}, {0xc1c, 0xc1}, {0x988, 0x77}, {0x998, 0x0b}, {0x8dc, 0x0d}, {0x9ec, 0x12}, {0x800, 0x00}, {0x844, 0x03},
++};
++#define WL_NPHY            (sizeof(wl_phy_seq) / sizeof(wl_phy_seq[0]))
++
++/* ---- state -------------------------------------------------------------------------------- */
++struct wl {
++	int step;                 /* last step completed, or -(step that failed) */
++	const char *why;
++	uint32_t rails, rail_rc;  /* bit i: wl_rail[i] voted; first failure: rail << 8 | vote << 4 | code
++	                           * (vote 0 name not in the command DB, 1 voltage, 2 mode, 3 enable; code: wl_rpmh) */
++	uint32_t gdsc, vote, rcg; /* rcg: bit 0 aux, bit 1 refgen update did not finish (reported only) */
++	uint32_t halt0, halt1;    /* bit i: wl_branch[i] halted; before / latest */
++	uint32_t pins;            /* in|out<<1 of PERST | CLKREQ << 8 | WLAN_EN << 16 */
++	uint32_t pcs, polls;
++	uint32_t rp, ltssm, lnk, dbg0, dbg1, ms;
++	uint32_t ep, cls;
++};
++
++static struct { uint64_t pa; vm_offset_t va; } wl_page[16];
++static vm_offset_t wl_cmddb;
++static bool wl_is_up;             /* this file trained the link and has not taken it down since */
++static volatile uint32_t wl_busy;
++
++/* ---- small helpers ------------------------------------------------------------------------ */
++static volatile uint32_t *
++wl_ptr(uint64_t phys)
++{
++	uint64_t pa = phys & ~(uint64_t)(WL_PAGE - 1);
++	unsigned i;
++
++	for (i = 0; i < 16 && wl_page[i].va; i++) {
++		if (wl_page[i].pa == pa) {
++			return (volatile uint32_t *)(wl_page[i].va + (vm_offset_t)(phys - pa));
++		}
++	}
++	if (i == 16) {
++		return NULL;
++	}
++	vm_offset_t va = ml_io_map((vm_offset_t)pa, WL_PAGE);
++	if (!va) {
++		return NULL;
++	}
++	wl_page[i].pa = pa;
++	wl_page[i].va = va;
++	return (volatile uint32_t *)(va + (vm_offset_t)(phys - pa));
++}
++
++/* rd/wr are only used after wl_map() has mapped every page below. */
++static inline uint32_t
++rd(uint64_t phys)
++{
++	return *wl_ptr(phys);
++}
++
++static inline void
++wr(uint64_t phys, uint32_t value)
++{
++	*wl_ptr(phys) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Maps (does not touch) every register page this file uses. */
++static bool
++wl_map(void)
++{
++	static const uint64_t need[] = {
++		GCC_VOTE, GCC_PCIE0_BCR, GCC_PCIE0_PHY_BCR, GCC_REFGEN_CMD, GCC + 0x8c004, GCC + 0x8d058, GCC + 0x9000c,
++		PIN_PERST, PIN_CLKREQ, PIN_WLAN_EN, PARF, PARF_DEVICE_TYPE, PHY, DBI, ATU, CFGSPACE, RSC,
++	};
++
++	for (unsigned i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
++		if (!wl_ptr(need[i])) {
++			return false;
++		}
++	}
++	if (!wl_cmddb) {
++		wl_cmddb = ml_io_map(CMDDB, CMDDB_SIZE);
++	}
++	return wl_cmddb != 0;
++}
++
++static uint64_t
++wl_now_us(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++/* Spins: delay_for_interval() sleeps on a timer even for microseconds on this board (pong_fts.c). */
++static void
++wl_spin_us(uint32_t us)
++{
++	uint64_t end = wl_now_us() + us;
++
++	while (wl_now_us() < end) {
++	}
++}
++
++static void
++wl_sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* Polls until (reg & mask) == want; at most tries x us. */
++static bool
++wl_wait(uint64_t phys, uint32_t mask, uint32_t want, unsigned tries, uint32_t us, uint32_t *used)
++{
++	unsigned i = 0;
++
++	for (; i < tries && (rd(phys) & mask) != want; i++) {
++		wl_spin_us(us);
++	}
++	if (used) {
++		*used = i;
++	}
++	return (rd(phys) & mask) == want;
++}
++
++static void
++wl_mark(int step)
++{
++	char line[24];
++	int n = snprintf(line, sizeof(line), "[PONG_WIFI] L%d\n", step);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n);
++	}
++}
++
++static uint32_t
++wl_halt(void)
++{
++	uint32_t off = 0;
++
++	for (unsigned i = 0; i < WL_NBRANCH; i++) {
++		if (rd(GCC + wl_branch[i]) & (1u << 31)) {
++			off |= 1u << i;
++		}
++	}
++	return off;
++}
++
++/* Level first, then the config, then the level again (rui setPin). level < 0: config only. */
++static void
++wl_pin(uint64_t pin, uint32_t config, int level)
++{
++	if (level >= 0) {
++		wr(pin + 4, level ? 2u : 0u);
++	}
++	wr(pin, config);
++	if (level >= 0) {
++		wr(pin + 4, level ? 2u : 0u);
++	}
++}
++
++static uint32_t
++wl_pins(void)
++{
++	return (rd(PIN_PERST + 4) & 3u) | (rd(PIN_CLKREQ + 4) & 3u) << 8 | (rd(PIN_WLAN_EN + 4) & 3u) << 16;
++}
++
++/* ---- RPMh --------------------------------------------------------------------------------- */
++/*
++ * VRM address of a regulator by its command DB name; 0 = bad DB or no such name.
++ * Header: version 1, magic 0x0c0330db, 8 groups of 16 bytes from +8 (slave u16, entry offset u16
++ * at +2, count u16 at +6); entries of 24 bytes at 0x90 + offset (8-byte name, address at +16).
++ * The T970 DB lists smpa4/5/6 and smpc8 twice; the first match is used, as Linux does.
++ * Read word by word through volatile accesses: no memcpy/memcmp on this mapping.
++ */
++static uint32_t
++wl_cmddb_addr(const char *name)
++{
++	const volatile uint32_t *db = (const volatile uint32_t *)wl_cmddb;
++	uint32_t key[2] = { 0, 0 };
++
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	if (db[0] != 1 || db[1] != 0x0c0330dbu) {
++		return 0;
++	}
++	for (unsigned g = 0; g < 8; g++) {
++		uint32_t h0 = db[(8 + g * 16) / 4], h1 = db[(8 + g * 16 + 4) / 4];
++		uint32_t slave = h0 & 0xffff, offset = h0 >> 16, count = h1 >> 16;
++
++		if (!slave) {
++			break;
++		}
++		if ((offset & 3) || offset > CMDDB_SIZE - 0x90 || count > (CMDDB_SIZE - 0x90 - offset) / 24) {
++			return 0;
++		}
++		for (uint32_t e = 0; e < count; e++) {
++			uint32_t o = (0x90 + offset + e * 24) / 4;
++
++			if (db[o] == key[0] && db[o + 1] == key[1]) {
++				uint32_t address = db[o + 4];
++
++				/* VRM is slave 4; the address carries the slave in bits 18:16 */
++				if (slave != 4 || address > 0x7ffff || (address & 3) || ((address >> 16) & 7) != 4) {
++					return 0;
++				}
++				return address;
++			}
++		}
++	}
++	return 0;
++}
++
++/*
++ * One ACTIVE write on APPS RSC DRV2, TCS 0 or 1, waited for. 0 = done; 2 = no idle TCS;
++ * 3 = no completion in 50 ms (the TCS is then left alone, as rui); 5 = completed with an error.
++ * Completion is the TCS's IRQ status bit (cleared just before the trigger, so it cannot be a
++ * stale one) with the TCS idle again; pong_fts.c's votes show that bit set on this kernel.
++ */
++static int
++wl_rpmh(uint32_t address, uint32_t value)
++{
++	uint32_t ctl = 0, status;
++	unsigned t, i;
++
++	for (t = 0; t < 2; t++) {
++		ctl = rd(TCS(t, TCS_CONTROL));
++		if ((rd(TCS(t, TCS_STATUS)) & 1u) && !(ctl & AMC_TRIGGER) && rd(TCS(t, TCS_CMD_ENABLE)) == 0) {
++			break;
++		}
++	}
++	if (t == 2) {
++		return 2;
++	}
++	ctl &= ~(AMC_ENABLE | AMC_TRIGGER);
++	wr(TCS(t, TCS_CONTROL), ctl);
++	wr(TCS_IRQ_CLEAR, 1u << t);
++	wr(TCS(t, TCS_MSGID), 8u | 1u << 8 | 1u << 16);      /* 8-byte write, response wanted */
++	wr(TCS(t, TCS_ADDR), address);
++	wr(TCS(t, TCS_DATA), value);
++	wr(TCS(t, TCS_CMD_WAIT), 1);
++	wr(TCS(t, TCS_CMD_ENABLE), 1);
++	wr(TCS(t, TCS_CONTROL), ctl | AMC_ENABLE);
++	wr(TCS(t, TCS_CONTROL), ctl | AMC_ENABLE | AMC_TRIGGER);
++	for (i = 0; i < 1000; i++) {
++		if ((rd(TCS_IRQ_STATUS) & (1u << t)) && (rd(TCS(t, TCS_STATUS)) & 1u)) {
++			break;
++		}
++		wl_spin_us(50);
++	}
++	if (i == 1000) {
++		return 3;
++	}
++	status = rd(TCS(t, TCS_CMD_STATUS));
++	/* trigger off before mode off (rui ClearAmcControl), then the slot is empty again */
++	wr(TCS(t, TCS_CONTROL), ctl | AMC_ENABLE);
++	wr(TCS(t, TCS_CONTROL), ctl);
++	wr(TCS(t, TCS_CMD_ENABLE), 0);
++	wr(TCS_IRQ_CLEAR, 1u << t);
++	return (status & CMD_DONE) == CMD_DONE ? 0 : 5;
++}
++
++/* Voltage (word 0, mV), mode (word 8, 7 = HPM/PWM), enable (word 4) for every rail. */
++static void
++wl_rails(struct wl *w)
++{
++	static const struct { uint32_t word, value; } vote[3] = { { 0, 0 }, { 8, 7 }, { 4, 1 } };
++
++	for (unsigned i = 0; i < WL_NRAIL; i++) {
++		uint32_t address = wl_cmddb_addr(wl_rail[i].name);
++		int rc = address ? 0 : 1;
++		unsigned k = 0;
++
++		for (; !rc && k < 3; k++) {
++			rc = wl_rpmh(address + vote[k].word, k ? vote[k].value : wl_rail[i].mv);
++		}
++		if (rc) {
++			if (!w->rail_rc) {
++				w->rail_rc = i << 8 | k << 4 | (uint32_t)rc;
++			}
++			if (rc == 3) {
++				return;         /* a request is still in flight: no further votes */
++			}
++			continue;
++		}
++		w->rails |= 1u << i;
++		wl_sleep_ms(2);
++	}
++}
++
++/* ---- the sequence ------------------------------------------------------------------------- */
++#define WL_FAIL(n, reason) do { w->step = -(n); w->why = (reason); return false; } while (0)
++
++/* Steps 10..16: from everything off to L0. Safe to run again from any state: it power-cycles
++ * the chip (WLAN_EN low) and resets the controller and PHY (BCRs) on the way. */
++static bool
++wl_train(struct wl *w)
++{
++	uint32_t polls = 0;
++
++	wl_is_up = false;
++
++	/* 10: rails. Prerequisite: the command DB and the RSC are mapped (step 1). */
++	wl_mark(10);
++	wl_rails(w);
++	if ((w->rails & WL_RAILS_NEEDED) != WL_RAILS_NEEDED) {
++		WL_FAIL(10, "rail");
++	}
++	wl_sleep_ms(5);
++	w->step = 10;
++
++	/* 11: PERST# low, CLKREQ# to pci_e0, WLAN_EN low then high. Prerequisite: rails voted. */
++	wl_mark(11);
++	wl_pin(PIN_PERST, CFG_PERST, 0);
++	wl_pin(PIN_CLKREQ, CFG_CLKREQ, -1);
++	wl_pin(PIN_WLAN_EN, CFG_WLAN_EN, 0);
++	wl_sleep_ms(WL_WLAN_OFF_MS);
++	wl_pin(PIN_WLAN_EN, CFG_WLAN_EN, 1);
++	wl_sleep_ms(WL_WLAN_ON_MS);
++	w->pins = wl_pins();
++	if ((w->pins & 3u) != 0 || ((w->pins >> 16) & 3u) != 3u) {
++		WL_FAIL(11, "pin-readback");    /* PERST must read low, WLAN_EN high (rui's final row: pins 30003) */
++	}
++	w->step = 11;
++
++	/* 12: GDSC on: SW_COLLAPSE (bit 0) clear, wait for PWR_ON (bit 31). Survey: 0020f001 = off. */
++	wl_mark(12);
++	wr(GCC_PCIE0_GDSCR, rd(GCC_PCIE0_GDSCR) & ~1u);
++	(void)wl_wait(GCC_PCIE0_GDSCR, 1u << 31, 1u << 31, 1000, 10, NULL);
++	w->gdsc = rd(GCC_PCIE0_GDSCR);
++	if (!(w->gdsc & (1u << 31))) {
++		WL_FAIL(12, "gdsc");
++	}
++	w->step = 12;
++
++	/* 13: clock sources, branch votes, direct branches, then both block resets.
++	 * Prerequisite: GDSC on. The RCG update results are reported, the halt bits decide. */
++	wl_mark(13);
++	wr(GCC_PCIE0_AUX_CFG, 0);                       /* TCXO, divider bypass: 19.2 MHz */
++	wr(GCC_PCIE0_AUX_CMD, rd(GCC_PCIE0_AUX_CMD) | 1u);
++	wr(GCC_REFGEN_CFG, 1u << 8 | 11u);              /* GPLL0 main / 6: 100 MHz */
++	wr(GCC_REFGEN_CMD, rd(GCC_REFGEN_CMD) | 1u);
++	w->rcg = (wl_wait(GCC_PCIE0_AUX_CMD, 1u, 0, 100, 100, NULL) ? 0 : 1u) |
++	    (wl_wait(GCC_REFGEN_CMD, 1u, 0, 100, 100, NULL) ? 0 : 2u);
++	wr(GCC_VOTE, rd(GCC_VOTE) | GCC_VOTE_BITS);     /* shared register: only these six bits are set */
++	for (unsigned i = 0; i < sizeof(wl_direct) / sizeof(wl_direct[0]); i++) {
++		wr(GCC + wl_direct[i], rd(GCC + wl_direct[i]) | 1u);
++	}
++	for (unsigned i = 0; i < 50 && (wl_halt() & WL_HALT_PARF); i++) {
++		wl_spin_us(100);
++	}
++	w->halt1 = wl_halt();
++	w->vote = rd(GCC_VOTE);
++	if (w->halt1 & WL_HALT_PARF) {
++		WL_FAIL(13, "clk-halt");                    /* PARF/PHY would bus-error: stop before touching them */
++	}
++	wr(GCC_PCIE0_BCR, rd(GCC_PCIE0_BCR) | 1u);
++	wl_spin_us(1000);
++	wr(GCC_PCIE0_BCR, rd(GCC_PCIE0_BCR) & ~1u);
++	wl_spin_us(1000);
++	wr(GCC_PCIE0_PHY_BCR, rd(GCC_PCIE0_PHY_BCR) | 1u);
++	wl_spin_us(1000);
++	wr(GCC_PCIE0_PHY_BCR, rd(GCC_PCIE0_PHY_BCR) & ~1u);
++	wl_spin_us(1000);
++	w->step = 13;
++
++	/* 14: PARF as a root complex, PHY table, PHY ready. Prerequisite: GDSC on, cfg_ahb/axi/aux/refgen running.
++	 * First access to PARF and the PHY. */
++	wl_mark(14);
++	wr(PARF_DEVICE_TYPE, 4);                        /* root complex */
++	wr(PARF_PHY_CTRL, rd(PARF_PHY_CTRL) & ~1u);     /* PHY out of power-down */
++	wr(PARF_DBI_BASE, (uint32_t)DBI);
++	wr(PARF_DBI_BASE + 4, 0);
++	wr(PARF_ATU_BASE, (uint32_t)ATU);
++	wr(PARF_ATU_BASE + 4, 0);
++	wr(PARF_SLV_SPACE, 0);
++	wr(PARF_SLV_SPACE + 4, 0x80000000u);
++	wr(PARF_SYS_CTRL, rd(PARF_SYS_CTRL) & ~(1u << 29));
++	wr(PARF_MHI_CLK_RESET, rd(PARF_MHI_CLK_RESET) | 1u << 4);
++	wr(PARF_PM_CTRL, rd(PARF_PM_CTRL) & ~(1u << 5));
++	wr(PARF_AXI_HALT, rd(PARF_AXI_HALT) | 1u << 31);
++	for (unsigned i = 0; i < WL_NPHY; i++) {
++		wr(PHY + wl_phy_seq[i].off, wl_phy_seq[i].val);
++	}
++	wl_spin_us(1000);
++	bool ready = wl_wait(PHY_PCS_STATUS1, 1u << 6, 0, 500, 100, &polls);
++	w->pcs = rd(PHY_PCS_STATUS1) & 0xffffu;
++	w->polls = polls;
++	w->halt1 = wl_halt();
++	if (!ready) {
++		WL_FAIL(14, "phy-not-ready");
++	}
++	w->step = 14;
++
++	/* 15: root port. Prerequisite: PHY ready and the slave/pipe clocks running (first DBI access). */
++	wl_mark(15);
++	for (unsigned i = 0; i < 100 && (wl_halt() & WL_HALT_DBI); i++) {
++		wl_spin_us(100);
++	}
++	w->halt1 = wl_halt();
++	if (w->halt1 & WL_HALT_DBI) {
++		WL_FAIL(15, "pipe-clk-halt");
++	}
++	w->rp = rd(DBI_ID);
++	if ((w->rp & 0xffffu) != 0x17cbu) {
++		WL_FAIL(15, "rootport-id");                 /* rui read 010b17cb here */
++	}
++	wr(DBI_BUS, 0x00010100);                        /* primary 0, secondary 1, subordinate 1 */
++	wr(DBI_LNKCTL2, (rd(DBI_LNKCTL2) & ~0xfu) | WL_LINK_GEN);
++	w->step = 15;
++
++	/* 16: PERST# low >= 100 ms with the PHY up, release, LTSSM enable, wait for L0. */
++	wl_mark(16);
++	wl_sleep_ms(WL_PERST_MS);
++	wl_pin(PIN_PERST, CFG_PERST, 1);
++	wl_spin_us(1000);
++	wr(PARF_LTSSM, rd(PARF_LTSSM) | 1u << 8);
++	uint64_t start = wl_now_us();
++	bool up = false;
++	for (unsigned i = 0; i < WL_LINK_MS && wl_now_us() - start < WL_LINK_MS * 1000ull; i++) {
++		if ((rd(DBI_DEBUG1) & (1u << 4)) && (rd(DBI_DEBUG0) & 0x3fu) == 0x11u) {
++			up = true;
++			break;
++		}
++		wl_sleep_ms(1);
++	}
++	w->ms = (uint32_t)((wl_now_us() - start) / 1000);
++	w->dbg0 = rd(DBI_DEBUG0);
++	w->dbg1 = rd(DBI_DEBUG1);
++	w->ltssm = rd(PARF_LTSSM);
++	w->lnk = rd(DBI_LNKCTL);
++	w->pins = wl_pins();
++	if (!up) {
++		WL_FAIL(16, "no-link");                     /* dbg0 bits 5:0 = the LTSSM state it stopped in */
++	}
++	w->step = 16;
++	return true;
++}
++
++/* True when this file trained the link earlier and the hardware still shows it up.
++ * PARF/DBI are read only after GDSC and the clocks are seen running. */
++static bool
++wl_alive(struct wl *w)
++{
++	if (!wl_is_up || !(rd(GCC_PCIE0_GDSCR) & (1u << 31)) || (wl_halt() & (WL_HALT_PARF | WL_HALT_DBI))) {
++		return false;
++	}
++	w->ltssm = rd(PARF_LTSSM);
++	w->dbg0 = rd(DBI_DEBUG0);
++	w->dbg1 = rd(DBI_DEBUG1);
++	if (!(w->ltssm & (1u << 8)) || !(w->dbg1 & (1u << 4)) || (w->dbg0 & 0x3fu) != 0x11u) {
++		return false;
++	}
++	w->rp = rd(DBI_ID);
++	w->lnk = rd(DBI_LNKCTL);
++	w->halt1 = wl_halt();
++	return true;
++}
++
++/* 17: outbound iATU region 0 = type 0 config accesses to bus 1, then the endpoint's ID.
++ * Prerequisite: link up (a config read with no link does not come back cleanly). */
++static bool
++wl_endpoint(struct wl *w)
++{
++	wl_mark(17);
++	if (!(rd(DBI_DEBUG1) & (1u << 4))) {
++		WL_FAIL(17, "link-dropped");
++	}
++	wr(ATU + 0x08, (uint32_t)CFGSPACE);             /* base */
++	wr(ATU + 0x0c, 0);
++	wr(ATU + 0x10, (uint32_t)(CFGSPACE + 0xfffff)); /* limit */
++	wr(ATU + 0x20, 0);
++	wr(ATU + 0x14, 1u << 24);                       /* target: bus 1, device 0, function 0 */
++	wr(ATU + 0x18, 0);
++	wr(ATU + 0x00, 0x4);                            /* CFG0 */
++	wr(ATU + 0x04, 1u << 31);                       /* enable */
++	if (!wl_wait(ATU + 0x04, 1u << 31, 1u << 31, 5, 10, NULL)) {
++		WL_FAIL(17, "iatu");
++	}
++	/* The chip had WLAN_EN high for >= 160 ms by now; a few bounded retries cover a late answer
++	 * (all ones, or vendor 0001 = configuration retry status). */
++	for (unsigned i = 0; i < 5; i++) {
++		w->ep = rd(CFGSPACE);
++		if (w->ep != 0xffffffffu && (w->ep & 0xffffu) != 0x0001u) {
++			break;
++		}
++		wl_sleep_ms(10);
++	}
++	w->cls = rd(CFGSPACE + 8);
++	if ((w->ep & 0xffffu) != 0x17cbu) {
++		WL_FAIL(17, "ep-id");                       /* expected 110117cb (QCA6390) */
++	}
++	w->step = 17;
++	wl_is_up = true;
++	return true;
++}
++
++/* One line to pmsg and to the caller. Field order follows rui's "[t970 wifi] st .." row. */
++static int
++wl_report(const struct wl *w, const char *verb, char *reply, size_t reply_len)
++{
++	char line[400];
++	int n = snprintf(line, sizeof(line),
++	    "[PONG_WIFI] link %s st %d %s rails %x/%x gdsc %08x vote %x rcg %x halt %03x/%03x pins %x pcs %x/%u "
++	    "rp %08x ltssm %x lnk %08x dbg %x/%x %ums ep %08x cls %08x\n",
++	    verb, w->step, w->why ? w->why : "?", w->rails, w->rail_rc, w->gdsc, w->vote, w->rcg, w->halt0, w->halt1,
++	    w->pins, w->pcs, w->polls, w->rp, w->ltssm, w->lnk, w->dbg0, w->dbg1, w->ms, w->ep, w->cls);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++	}
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++/* ---- entry points ------------------------------------------------------------------------- */
++int
++pong_wifi_link_up(char *reply, size_t reply_len)
++{
++	struct wl w = { .step = 0, .why = "OK" };
++	int rc;
++
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] link busy\n", reply_len);
++		}
++		return -100;
++	}
++	/* 1: map everything (no register is touched). */
++	wl_mark(1);
++	if (!wl_map()) {
++		w.step = -1;
++		w.why = "map";
++	} else {
++		/* 2: the survey's read-only registers: GDSC, votes, halt bits, pins. */
++		w.step = 1;
++		w.vote = rd(GCC_VOTE);
++		w.gdsc = rd(GCC_PCIE0_GDSCR);
++		w.halt0 = w.halt1 = wl_halt();
++		w.pins = wl_pins();
++		w.step = 2;
++		if (wl_alive(&w)) {
++			w.why = "OK-already-up";    /* second call: only the ID is read again */
++			(void)wl_endpoint(&w);
++		} else if (wl_train(&w)) {
++			(void)wl_endpoint(&w);
++		}
++		w.gdsc = rd(GCC_PCIE0_GDSCR);
++	}
++	rc = wl_report(&w, "up", reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
++
++/*
++ * Holds the chip in reset: PERST# low, 10 ms, WLAN_EN low (the only power-down rui has).
++ * GDSC, clocks and the RPMh votes stay as they are; pong_wifi_link_up() starts over from there.
++ * Steps: 30 PERST# low, 31 WLAN_EN low.
++ */
++int
++pong_wifi_link_down(char *reply, size_t reply_len)
++{
++	struct wl w = { .step = 0, .why = "OK" };
++	int rc;
++
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] link busy\n", reply_len);
++		}
++		return -100;
++	}
++	wl_mark(30);
++	if (!wl_map()) {
++		w.step = -1;
++		w.why = "map";
++	} else {
++		wl_is_up = false;
++		wl_pin(PIN_PERST, CFG_PERST, 0);
++		w.step = 30;
++		wl_sleep_ms(10);
++		wl_pin(PIN_WLAN_EN, CFG_WLAN_EN, 0);
++		w.pins = wl_pins();
++		w.gdsc = rd(GCC_PCIE0_GDSCR);
++		w.vote = rd(GCC_VOTE);
++		w.halt0 = w.halt1 = wl_halt();
++		if ((w.pins & 2u) || ((w.pins >> 16) & 2u)) {
++			w.step = -31;
++			w.why = "pin-readback";
++		} else {
++			w.step = 31;
++		}
++	}
++	rc = wl_report(&w, "down", reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
++#endif
