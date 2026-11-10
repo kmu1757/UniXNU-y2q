@@ -1,0 +1,117 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 8f44f49..61e897f 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -58,6 +58,11 @@ extern void armcpu_gic_poke(uint32_t off, uint32_t value);
+ extern uint32_t armcpu_redist_peek(uint32_t cpu, uint32_t off);
+ extern void armcpu_redist_poke(uint32_t cpu, uint32_t off, uint32_t value);
+ extern void armcpu_icc_state(uint64_t out[6]);
++/* ArmCpu (T970 patch): the fallback for IPIs that never arrive, and where the IPIs went */
++extern volatile uint32_t armcpu_idle_tick_us, armcpu_timer_ipi, armcpu_idle_registered;
++extern volatile uint64_t armcpu_idle_wakes[8], armcpu_ipi_last_ms[8], armcpu_sgi_recv[8];
++extern volatile uint32_t armcpu_ipi_cfg[8][4];
++extern uint64_t armcpu_now_ms(void);
+ /* pong_wifi_link.c: PCIe0 power-up and link training to the Wi-Fi chip; one result line each */
+ extern int pong_wifi_link_up(char *reply, size_t reply_len);
+ extern int pong_wifi_link_down(char *reply, size_t reply_len);
+@@ -1179,6 +1184,76 @@ cmd_handle_ipimode(const char *args)
+ 	send_str(reply);
+ }
+ 
++/*
++ * tick: the fallback's settings and, per core, idle-timer wake-ups since the previous `tick`.
++ * idletick N: idle cores wake after N microseconds (0 off, at most 1000000). Works only when the boot argument
++ * armcpu-idle-tick-us registered the idle callbacks (registered=1).
++ * timeripi N: 1 = every timer interrupt also runs the IPI callback.
++ */
++static void
++cmd_handle_tick(const char *args, int which)
++{
++	static uint64_t last[8];
++	const char *p = args;
++	char reply[320];
++	int n;
++
++	if (which == 1) {
++		uint32_t us = parse_num(&p);
++
++		armcpu_idle_tick_us = us <= 1000000 ? us : 0;
++	} else if (which == 2) {
++		armcpu_timer_ipi = parse_num(&p) == 1 ? 1 : 0;
++	}
++	n = snprintf(reply, sizeof(reply), "tick: registered=%u idle_us=%u timer_ipi=%u wakes:",
++	    armcpu_idle_registered, armcpu_idle_tick_us, armcpu_timer_ipi);
++	for (unsigned c = 0; c < 8; c++) {
++		uint64_t value = armcpu_idle_wakes[c];
++
++		if (n > 0 && n < (int)sizeof(reply) - 28) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " c%u=%llu", c, value - last[c]);
++		}
++		last[c] = value;
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
++/*
++ * ipitrace: per core, when it last took an IPI (ms of uptime, 0 = never) and how many of its IPIs were SGIs; then
++ * the distributor words read back when the core's IPI SPI was set up: enable / trigger / route / pending.
++ */
++static void
++cmd_handle_ipitrace(void)
++{
++	char reply[700];
++	int n = snprintf(reply, sizeof(reply), "ipitrace: now=%llu last/sgi:", armcpu_now_ms());
++
++	for (unsigned c = 0; c < 8; c++) {
++		if (n > 0 && n < (int)sizeof(reply) - 48) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " c%u=%llu/%llu", c, armcpu_ipi_last_ms[c],
++			    armcpu_sgi_recv[c]);
++		}
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 32) {
++		n += snprintf(reply + n, sizeof(reply) - (size_t)n, " setup en/cfg/rt/pend:");
++	}
++	for (unsigned c = 0; c < 8; c++) {
++		if (n > 0 && n < (int)sizeof(reply) - 44) {
++			n += snprintf(reply + n, sizeof(reply) - (size_t)n, " %x/%x/%x/%x", armcpu_ipi_cfg[c][0],
++			    armcpu_ipi_cfg[c][1], armcpu_ipi_cfg[c][2], armcpu_ipi_cfg[c][3]);
++		}
++	}
++	if (n > 0 && n < (int)sizeof(reply) - 2) {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	send_str(reply);
++}
++
+ /*
+  * wifiup: power PCIe0 up, train the link to the Wi-Fi chip and read its ID (about 0.4 s, at most about 1.7 s).
+  * wifidown: put the chip back in reset. The reply is pong_wifi_link.c's result line.
+@@ -1321,6 +1396,14 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_gic_rw(cmd + 4, true, true);
+ 	} else if (strncmp(cmd, "ipimode ", 8) == 0) {
+ 		cmd_handle_ipimode(cmd + 8);
++	} else if (strcmp(cmd, "tick") == 0) {
++		cmd_handle_tick("", 0);
++	} else if (strncmp(cmd, "idletick ", 9) == 0) {
++		cmd_handle_tick(cmd + 9, 1);
++	} else if (strncmp(cmd, "timeripi ", 9) == 0) {
++		cmd_handle_tick(cmd + 9, 2);
++	} else if (strcmp(cmd, "ipitrace") == 0) {
++		cmd_handle_ipitrace();
+ 	} else if (strcmp(cmd, "wifiup") == 0) {
+ 		cmd_handle_wifi(true);
+ 	} else if (strcmp(cmd, "wifidown") == 0) {
+@@ -1328,7 +1411,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 

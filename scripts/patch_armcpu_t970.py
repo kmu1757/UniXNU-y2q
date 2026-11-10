@@ -152,6 +152,102 @@ def add_gic_bench(txt: str) -> str:
     return txt.replace(BENCH_SEND_OLD, BENCH_SEND_NEW) + BENCH_TAIL
 
 
+TICK_HELPERS = r"""
+// Fallback for IPIs that never arrive (11-10); see armcpu-idle-tick-us and armcpu-timer-ipi in ArmCpu::start.
+static uint64_t armcpuFrequency(void)
+{
+  uint64_t value;
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(value));
+  return value;
+}
+
+extern "C" uint64_t armcpu_now_ms(void)
+{
+  const uint64_t frequency = armcpuFrequency();
+  uint64_t ticks;
+  __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(ticks));
+  return frequency >= 1000 ? ticks / (frequency / 1000) : 0;
+}
+
+// processor_idle: entering idle, ask for a wake-up after the tick. Absolute time counts timebase ticks on arm64.
+static void armcpuIdleNotify(cpu_id_t, boolean_t enter, uint64_t *newTimeoutTicks)
+{
+  const uint64_t us = armcpu_idle_tick_us;
+  *newTimeoutTicks = (enter && us != 0) ? us * armcpuFrequency() / 1000000 : 0;
+}
+
+// idle_timer: the tick expired. One shot; the next idle entry arms it again.
+static void armcpuIdleTimer(void *refcon, uint64_t *newTimeoutTicks)
+{
+  const uintptr_t cpu = reinterpret_cast<uintptr_t>(refcon);
+  if (cpu < 8) armcpu_idle_wakes[cpu]++;
+  *newTimeoutTicks = 0;
+}
+"""
+TICK_REGISTER = """  // armcpu-idle-tick-us=N (0: registered but off; at most 1000000): an idle core wakes after N microseconds
+  // with nothing else due and looks at its run queue again, so a wake-up whose IPI never arrives costs at
+  // most N (USB command idletick). armcpu-timer-ipi=1: every timer interrupt also runs the IPI callback
+  // (USB command timeripi). Without the first argument the idle callbacks are not registered at all.
+  uint32_t idleTickUs = 0, timerIpi = 0;
+  if (PE_parse_boot_argn("armcpu-idle-tick-us", &idleTickUs, sizeof(idleTickUs))) {
+    armcpu_idle_tick_us = idleTickUs <= 1000000 ? idleTickUs : 0;
+    info.processor_idle = armcpuIdleNotify;
+    info.idle_timer = armcpuIdleTimer;
+    info.idle_timer_refcon = reinterpret_cast<void *>(static_cast<uintptr_t>(logicalId));
+    armcpu_idle_registered = 1;
+  }
+  if (PE_parse_boot_argn("armcpu-timer-ipi", &timerIpi, sizeof(timerIpi))) armcpu_timer_ipi = timerIpi == 1;
+"""
+TICK = (
+    ('volatile uint32_t armcpu_ipi_mode;\n',
+     'volatile uint32_t armcpu_idle_tick_us, armcpu_timer_ipi, armcpu_idle_registered;\n'
+     'volatile uint64_t armcpu_idle_wakes[8], armcpu_ipi_last_ms[8], armcpu_sgi_recv[8];\n'
+     'volatile uint32_t armcpu_ipi_cfg[8][4];\n'),
+    ('static ArmCpu *gCpus[8];\n', TICK_HELPERS),
+    ('  info.powergate_latency = idleLatencyUs <= 1000 ? idleLatencyUs * 1000 : 0;\n', TICK_REGISTER),
+    ('      rtclock_intr(0);\n',
+     '      if (armcpu_timer_ipi && ipi_handler) ipi_handler();\n'),
+    ('      if (logicalId < 8) armcpu_ipi_recv[logicalId]++;\n',
+     '      if (logicalId < 8) {\n'
+     '        armcpu_ipi_last_ms[logicalId] = armcpu_now_ms();\n'
+     '        if (intid == 0) armcpu_sgi_recv[logicalId]++;\n'
+     '      }\n'),
+)
+TICK_CFG_OLD = """  __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void spiIpiSend(uintptr_t dist, uint32_t core)
+"""
+TICK_CFG_NEW = """  __asm__ volatile("dsb sy" ::: "memory");
+  if (core < 8) { // what the distributor holds right after the set-up: enable, trigger, route, pending
+    armcpu_ipi_cfg[core][0] = *reinterpret_cast<volatile uint32_t *>(dist + 0x100 + (id / 32) * 4);
+    armcpu_ipi_cfg[core][1] = *reinterpret_cast<volatile uint32_t *>(dist + 0xc00 + (id / 16) * 4);
+    armcpu_ipi_cfg[core][2] = *reinterpret_cast<volatile uint32_t *>(dist + 0x6000 + 8ULL * id);
+    armcpu_ipi_cfg[core][3] = *reinterpret_cast<volatile uint32_t *>(dist + 0x200 + (id / 32) * 4);
+  }
+}
+
+static void spiIpiSend(uintptr_t dist, uint32_t core)
+"""
+
+
+def add_tick_fallback(txt: str) -> str:
+    """Bounded wake-up latency without IPIs, and two more IPI diagnostics (USB tick, idletick, timeripi, ipitrace).
+
+    half10 (11-10): no core takes an IPI after start-up, so a thread made runnable for an idle core waits for
+    that core's next timer interrupt, and an idle Gold core has none. With the idle callbacks registered an
+    idle core wakes on its own after the tick; with timer-ipi the timer interrupt also runs the IPI callback
+    (pending ASTs and cross-calls). Both are off unless asked for. Runs after add_gic_bench.
+    """
+    if 'armcpu_idle_tick_us' in txt:
+        return txt
+    for anchor, addition in TICK:
+        assert txt.count(anchor) == 1, 'expected exactly one: ' + anchor.strip()
+        txt = txt.replace(anchor, anchor + addition)
+    assert txt.count(TICK_CFG_OLD) == 1, 'expected exactly one end of spiIpiConfigure'
+    return txt.replace(TICK_CFG_OLD, TICK_CFG_NEW)
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
@@ -161,7 +257,7 @@ def patch_armcpu(armcpu_source: Path):
     txt = add_idle_latency_knob(disable_cpu_policy(target.read_text(encoding='utf-8')))
     if 'armcpu-spi-ipi' in txt:
         # already carries the SPI IPI patch; still make sure the policy is off
-        target.write_text(add_gic_bench(add_ipi_counters(txt)), encoding='utf-8')
+        target.write_text(add_tick_fallback(add_gic_bench(add_ipi_counters(txt))), encoding='utf-8')
         return
 
     # 1. Add SPI IPI state and helper functions after gBootAffinity
@@ -266,7 +362,7 @@ static void spiIpiSend(uintptr_t dist, uint32_t core)
       if (ipi_handler) ipi_handler();"""
     txt = txt.replace(needle_irq, replacement_irq)
 
-    txt = add_gic_bench(add_ipi_counters(txt))
+    txt = add_tick_fallback(add_gic_bench(add_ipi_counters(txt)))
     target.write_text(txt, encoding='utf-8')
     print(f'Applied SM-T970 ArmCpu patch to {target}', flush=True)
 
