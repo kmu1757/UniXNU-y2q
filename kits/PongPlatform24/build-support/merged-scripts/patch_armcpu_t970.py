@@ -21,13 +21,30 @@ def disable_cpu_policy(txt: str) -> str:
     return txt.replace(POLICY_ON, POLICY_OFF)
 
 
+LATENCY_AT = '  info.cluster_type = ml_get_topology_info()->cpus[logicalId].cluster_type;\n'
+LATENCY = LATENCY_AT + """  // armcpu-idle-latency-us=N (default 0, at most 1000): delays shorter than N microseconds spin
+  // instead of sleeping on a timer (ml_delay_should_spin). With 0 every IODelay(2) of the UFS
+  // poll is a block, a timer interrupt and a wake-up.
+  uint32_t idleLatencyUs = 0;
+  PE_parse_boot_argn("armcpu-idle-latency-us", &idleLatencyUs, sizeof(idleLatencyUs));
+  info.powergate_latency = idleLatencyUs <= 1000 ? idleLatencyUs * 1000 : 0;
+"""
+
+
+def add_idle_latency_knob(txt: str) -> str:
+    if 'armcpu-idle-latency-us' in txt:
+        return txt
+    assert txt.count(LATENCY_AT) == 1, 'expected exactly one info.cluster_type assignment'
+    return txt.replace(LATENCY_AT, LATENCY)
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
     if not target.is_file():
         return
 
-    txt = disable_cpu_policy(target.read_text(encoding='utf-8'))
+    txt = add_idle_latency_knob(disable_cpu_policy(target.read_text(encoding='utf-8')))
     if 'armcpu-spi-ipi' in txt:
         # already carries the SPI IPI patch; still make sure the policy is off
         target.write_text(txt, encoding='utf-8')

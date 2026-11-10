@@ -34,7 +34,7 @@ new file mode 100644
 index 0000000..1234567
 --- /dev/null
 +++ b/bsd/dev/pong_fts.c
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,884 @@
 +/* STM FTS Touchscreen Driver (Samsung TSP, fts1ba90a) for SM-T970 (SM8250).
 + * Implements I2C via TLMM North Tile GPIO bit-banging (GPIO 12 SDA, GPIO 13 SCL, GPIO 15 INT).
 + * Powers on AVDD (3.3V) via PM8150 ldoa13 and DVDD (1.8V) via PM8150 ldoa14 using RPMh VRM voting.
@@ -174,10 +174,23 @@ index 0000000..1234567
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
++/*
++ * Spin, do not sleep. cpu_idle_latency is 0 on this board, so delay_for_interval() blocks on a
++ * timer even for 4 us (ml_delay_should_spin() is false). A 16-byte event read is about 520
++ * half-bit delays; as timer sleeps that took some 40 ms and touch was sampled at 20 Hz, which
++ * is the 50 ms frame pace measured while a finger moves. Spun, the read takes about 2 ms.
++ */
++extern uint64_t mach_absolute_time(void);
++
 +static void
 +sleep_us(uint32_t us)
 +{
-+	delay_for_interval(us, NSEC_PER_USEC);
++	uint64_t interval, deadline;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &interval);
++	deadline = mach_absolute_time() + interval;
++	while (mach_absolute_time() < deadline) {
++	}
 +}
 +
 +static void
