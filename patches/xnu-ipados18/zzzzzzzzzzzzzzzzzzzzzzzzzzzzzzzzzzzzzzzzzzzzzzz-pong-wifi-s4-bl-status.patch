@@ -1,0 +1,822 @@
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+index 8763a55..170bff3 100644
+--- a/bsd/dev/pong_backlight_t970.c
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -47,6 +47,7 @@ extern uint64_t mach_absolute_time(void);
+ 
+ int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ int pong_backlight_set_dbv(uint32_t dbv);
++void pong_backlight_svc_state(uint32_t state, uint32_t ms);
+ 
+ /* ---- addresses ---------------------------------------------------------------------------- */
+ /* One 0x4000 window at ae94000 (one ml_io_map call). Every register this file touches is inside the
+@@ -90,6 +91,10 @@ int pong_backlight_set_dbv(uint32_t dbv);
+ static vm_offset_t g_bl_dsi;
+ static int g_bl_busy;   /* one in-flight transfer guard (USB `bl` and the iOS service share the FIFO) */
+ static int g_bl_quiet;  /* set while the iOS service sends: no per-write pmsg marker (a slider drag would fill pmsg) */
++/* The iOS service, for the USB `bl` reply. state: 0 not started (no pong_backlight=1), 1 waiting for the native
++ * class, 2 the class never appeared, 3 class found, 4 the service failed to start, 5 registered; ms: the wait.
++ * sets/fail/last: requests that reached pong_backlight_set_dbv, how many did not go out, the last value. */
++static uint32_t g_bl_svc_state, g_bl_svc_ms, g_bl_svc_sets, g_bl_svc_fail, g_bl_svc_last;
+ 
+ /* ---- small helpers ------------------------------------------------------------------------ */
+ /* Strict 32-bit volatile helpers with barriers; no memcpy/memmove on Device memory. */
+@@ -311,8 +316,8 @@ pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level)
+ 		const uint32_t tpg = bl_rd32(BL_REG_TPG_CTRL);
+ 
+ 		snprintf(reply, reply_cap,
+-		    "[PONG_BL] rd hw=%08x ctrl=%08x status=%08x dma=%08x int=%08x tpg=%08x\n",
+-		    hw, ctrl, status, dma, intr, tpg);
++		    "[PONG_BL] rd hw=%08x ctrl=%08x status=%08x dma=%08x int=%08x tpg=%08x svc=%u/%ums sets=%u fail=%u last=%u\n",
++		    hw, ctrl, status, dma, intr, tpg, g_bl_svc_state, g_bl_svc_ms, g_bl_svc_sets, g_bl_svc_fail, g_bl_svc_last);
+ 		bl_pmsg(reply);
+ 		return 0;
+ 	}
+@@ -417,13 +422,24 @@ done:
+  * is already in flight, -3 if a packet failed. On failure one pmsg line is left and the caller
+  * keeps accepting requests (no panic, no unbounded wait).
+  */
++void
++pong_backlight_svc_state(uint32_t state, uint32_t ms)
++{
++	g_bl_svc_state = state;
++	g_bl_svc_ms = ms;
++}
++
+ int
+ pong_backlight_set_dbv(uint32_t dbv)
+ {
++	g_bl_svc_sets++;
++	g_bl_svc_last = dbv;
+ 	if (dbv < BL_DBV_MIN || dbv > BL_DBV_MAX) {
++		g_bl_svc_fail++;
+ 		return -1;
+ 	}
+ 	if (__atomic_exchange_n(&g_bl_busy, 1, __ATOMIC_ACQUIRE)) {
++		g_bl_svc_fail++;
+ 		return -2;
+ 	}
+ 	g_bl_quiet = 1;
+@@ -470,6 +486,9 @@ pong_backlight_set_dbv(uint32_t dbv)
+ 			}
+ 		}
+ 	}
++	if (rc) {
++		g_bl_svc_fail++;
++	}
+ 	g_bl_quiet = 0;
+ 	__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 7fbed62..809bb91 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -74,6 +74,7 @@ extern int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ extern int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
+ extern int pong_wifi_stage3c(char *reply, size_t reply_len, int what);
+ extern int pong_wifi_stage3d(char *reply, size_t reply_len, int what);
++extern int pong_wifi_stage4(char *reply, size_t reply_len, int what);
+ /* pong_backlight_t970.c: DSI0 DCS backlight probe; one result line (mode 0 read, 1 write) */
+ extern int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ /* IOPMPowerSource.cpp: battery temperature in tenths of a degree, -32768 until the gauge was read */
+@@ -1745,8 +1746,10 @@ cmd_handle_wifis3cd(int stage, int what)
+ 	reply[0] = '\0';
+ 	if (stage == 3) {
+ 		(void)pong_wifi_stage3c(reply, sizeof(reply), what);
+-	} else {
++	} else if (stage == 4) {
+ 		(void)pong_wifi_stage3d(reply, sizeof(reply), what);
++	} else {
++		(void)pong_wifi_stage4(reply, sizeof(reply), what);    /* wifis4 [ctx|m0|copy|go|poll] */
+ 	}
+ 	send_str(reply[0] ? reply : "wifis3: no reply\n");
+ }
+@@ -1869,6 +1872,18 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifis3cd(4, 1);
+ 	} else if (strcmp(cmd, "wifis3d go") == 0) {
+ 		cmd_handle_wifis3cd(4, 2);
++	} else if (strcmp(cmd, "wifis4") == 0) {
++		cmd_handle_wifis3cd(5, 0);
++	} else if (strcmp(cmd, "wifis4 ctx") == 0) {
++		cmd_handle_wifis3cd(5, 2);
++	} else if (strcmp(cmd, "wifis4 m0") == 0) {
++		cmd_handle_wifis3cd(5, 3);
++	} else if (strcmp(cmd, "wifis4 copy") == 0) {
++		cmd_handle_wifis3cd(5, 4);
++	} else if (strcmp(cmd, "wifis4 go") == 0) {
++		cmd_handle_wifis3cd(5, 5);
++	} else if (strcmp(cmd, "wifis4 poll") == 0) {
++		cmd_handle_wifis3cd(5, 6);
+ 	} else if (strncmp(cmd, "fwput ", 6) == 0) {
+ 		cmd_handle_fwput(cmd + 6);
+ 	} else if (strcmp(cmd, "fwlist") == 0) {
+@@ -1894,7 +1909,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, fwput, fwlist, irqdbg, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, wifis4, fwput, fwlist, irqdbg, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index e40b03f..f324c50 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -45,6 +45,7 @@ int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
+ int pong_wifi_stage3c(char *reply, size_t reply_len, int what);
+ int pong_wifi_stage3d(char *reply, size_t reply_len, int what);
++int pong_wifi_stage4(char *reply, size_t reply_len, int what);
+ 
+ /* ---- tuning knobs ------------------------------------------------------------------------- */
+ #define WL_LINK_GEN        1u      /* LNKCTL2 target speed; stock DTS qcom,target-link-speed = 1 */
+@@ -1440,10 +1441,11 @@ pong_wifi_stage3a(char *reply, size_t reply_len, int banks)
+ #define S3B_HALT_TBU       (1u << 7 | 1u << 8)       /* wl_branch[7] aggre_noc_pcie_tbu, [8] ddrss_pcie_sf_tbu */
+ /* memory: rui wdom (rui:485-487): 4 MiB arena at IOVA 0xa0000000, 2 L3 tables, 4 table pages; sink = last page (rui:78) */
+ #define S3B_IOVA           0xa0000000u
+-#define S3B_ARENA          (4u << 20)
++#define S3B_ARENA          (8u << 20)                /* stage 4: the whole image (4.39 MB) and the MHI contexts */
+ #define S3B_SINK           (S3B_IOVA + S3B_ARENA - 4096u)
+ #define S3B_L3             (S3B_ARENA >> 21)
+-#define S3B_TABLE_BYTES    ((2u + S3B_L3) * 4096u)   /* 16 KiB = one kernel page = one wl_ptr() window */
++#define S3B_TABLE_BYTES    0x8000u                   /* L1, L2 and the L3 pages (24 KiB) in two 16 KiB kernel pages */
++_Static_assert((2u + S3B_L3) * 4096u <= S3B_TABLE_BYTES, "the page tables do not fit");
+ #define S3B_CHUNK          0x10000u                  /* the arena in physically contiguous 64 KiB pieces */
+ #define S3B_CHUNKS         (S3B_ARENA / S3B_CHUNK)
+ #define S3B_LEAF           0x0060000000000f43ull     /* rui:487, stack:83: AF, inner shareable, nG, AP, UXN/PXN, page, attr 0 */
+@@ -1459,7 +1461,7 @@ static struct {
+ 	uint32_t flags;
+ 	uint32_t cb;                                  /* the bank `wifis3b bank` programmed */
+ 	uint32_t smr, smr_val, s2cr_orig;             /* the SMR `wifis3b smr` wrote, its read back, S2CR before */
+-	uint64_t *tables;                             /* cached kernel VA of the 4 table pages */
++	uint64_t *tables;                             /* cached kernel VA of the table pages */
+ 	IOPhysicalAddress tpa;
+ 	void *chunk[S3B_CHUNKS];
+ 	IOPhysicalAddress chunk_pa[S3B_CHUNKS];
+@@ -1772,15 +1774,15 @@ s3b_memory(struct s3b_run *w)
+ 	}
+ 	/* DRAM, not the cache: an uncached (ml_io_map) window over the table page, read word by word (rui:657-679
+ 	 * does the same for the boot loader through IODeviceMemory). */
+-	dram = wl_ptr(s3b.tpa);
+-	if (!dram) {
+-		WL_FAIL(62, "tables-map");
+-	}
+ 	w->dram = 0;
+ 	for (unsigned k = 0; k < 5; k++) {
+ 		uint32_t e = check[k];
+ 
+-		if (dram[2 * e] != (uint32_t)t[e] || dram[2 * e + 1] != (uint32_t)(t[e] >> 32) || !t[e]) {
++		dram = wl_ptr(s3b.tpa + 8ull * e);          /* a 16 KiB window per kernel page of the tables */
++		if (!dram) {
++			WL_FAIL(62, "tables-map");
++		}
++		if (dram[0] != (uint32_t)t[e] || dram[1] != (uint32_t)(t[e] >> 32) || !t[e]) {
+ 			w->dram |= 1u << k;
+ 		}
+ 	}
+@@ -3287,4 +3289,601 @@ pong_wifi_stage3d(char *reply, size_t reply_len, int what)
+ 	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/*
++ * Stage 4 of the SM-T970 Wi-Fi bring-up: from the secondary boot loader (EE 1, where stage 3d stops) to mission
++ * mode (EE 2), the way the Linux MHI host does it for ath11k's QCA6390. USB commands, one class of writes each:
++ *   wifis4        reads only: prerequisites, MHI and BHIe registers, the layout below
++ *   wifis4 ctx    the MHI context arrays and rings in the arena, then the context base, window and MHICFG
++ *                 registers (mhi_init_dev_ctxt + mhi_init_mmio)
++ *   wifis4 copy   the whole amss20.bin and the BHIe vector table in the arena, cleaned and compared with DRAM
++ *                 (mhi_alloc_bhie_table + mhi_firmware_copy); no device write
++ *   wifis4 m0     the event ring doorbells, then MHICTRL state M0 (mhi_ready_state_transition); waits for
++ *                 MHISTATUS to show M0
++ *   wifis4 go     BHIe TXVECADDR/TXVECSIZE/TXVECDB (mhi_fw_load_bhie); polls TXVECSTATUS and the execution
++ *                 environment for at most 5 s
++ *   wifis4 poll   reads only: BHIe status, EE, MHISTATUS, the bank's fault registers, and what the chip wrote
++ *                 into event ring 0
++ * Values and layouts (no code) from Linux v6.6: drivers/bus/mhi/common.h (register offsets, 44-byte contexts,
++ * 16-byte ring elements), host/init.c, host/pm.c, host/boot.c, and drivers/net/wireless/ath/ath11k/mhi.c
++ * (ath11k_mhi_config_qca6390: 128 channels; 0/1 LOOPBACK on event ring 0, 20/21 IPCR on event ring 1; event
++ * rings of 32 and 256 elements on MSI vectors 1 and 2; iova 0..0xffffffff; 512 KiB segments). The same tablet's
++ * precedent runs that Linux code unchanged: UniXNU-gts7xlwifi c2aa790 package/T970WifiStack.cpp:753-777 reads
++ * the 44-byte contexts it produced, and package/MhiBoot.inc:67-133 is its boot state machine (BSD-2-Clause-Patent).
++ * Not done here: the RDDM (crash dump) vector table, and anything past mission mode.
++ * Steps: 91 survey, 93 contexts, 94 M0, 95 copy, 96 BHIe, 97 poll. pmsg "[PONG_WIFI] S<step> W<n>" before each write.
++ * A failed M0 or BHIe takes the chip off the bus (s3c_stop_dma); nothing is retried.
++ */
++
++/* Arena layout (IOVA): 3d's boot loader copy at S3B_IOVA, the whole image after it, then one 64 KiB chunk for
++ * everything else. Each ring's base is a multiple of its length, as mhi_alloc_aligned_ring() makes it. */
++#define S4_IMG_CHUNK       (S3D_SBL_BYTES / S3B_CHUNK)               /* 8 */
++#define S4_CTL_CHUNK       80u
++#define S4_IMG_CHUNKS      (S4_CTL_CHUNK - S4_IMG_CHUNK)             /* 72: room for 4.5 MiB */
++#define S4_IMG_IOVA        (S3B_IOVA + S4_IMG_CHUNK * S3B_CHUNK)     /* 0xa0080000 */
++#define S4_CTL_IOVA        (S3B_IOVA + S4_CTL_CHUNK * S3B_CHUNK)     /* 0xa0500000 */
++#define S4_VEC_OFF         0x0000u    /* BHIe vector table: {u64 address, u64 size} per segment */
++#define S4_CHAN_OFF        0x1000u    /* 128 channel contexts of 44 bytes */
++#define S4_EV_OFF          0x3000u    /* 2 event ring contexts */
++#define S4_CMD_OFF         0x4000u    /* 1 command ring context */
++#define S4_ER0_OFF         0x5000u
++#define S4_ER1_OFF         0x6000u
++#define S4_CR0_OFF         0x7000u
++#define S4_CTL_END         0x8000u
++#define S4_CTX_BYTES       44u        /* u32 x3, then u64 rbase @12, rlen @20, rp @28, wp @36 */
++#define S4_EL_BYTES        16u        /* u64 ptr, u32 dword[2] */
++#define S4_ER0_LEN         (32u * S4_EL_BYTES)
++#define S4_ER1_LEN         (256u * S4_EL_BYTES)
++#define S4_CR0_LEN         (128u * S4_EL_BYTES)      /* CMD_EL_PER_RING */
++#define S4_SEG_BYTES       0x80000u
++#define S4_MAX_SEGS        (S4_IMG_CHUNKS * S3B_CHUNK / S4_SEG_BYTES)    /* 9 */
++#define S4_GO_TIMEOUT_MS   5000u
++#define S4_M0_TIMEOUT_MS   1000u
++
++_Static_assert(S4_CTL_CHUNK + 1u < S3B_CHUNKS, "the control chunk must lie below the arena's last chunk (the MSI sink page)");
++
++#define S4_F_CTX           1u    /* contexts and context registers written */
++#define S4_F_COPIED        2u    /* image and vector table in the arena and DRAM-matched */
++#define S4_F_M0REQ         4u    /* MHICTRL M0 written (once per boot) */
++#define S4_F_M0            8u    /* MHISTATUS showed M0 */
++#define S4_F_GO            16u   /* BHIe doorbell written (once per boot) */
++
++static struct {
++	uint32_t flags, segs, seq;
++	vm_offset_t ctl;                              /* uncached (ml_io_map) view of the control chunk */
++	vm_offset_t dram[S4_IMG_CHUNKS];              /* and of each image chunk */
++} s4;
++
++struct s4_run {
++	int step;
++	const char *why;
++	int what;
++	uint32_t fl3b, fl3c, fl3d, cb, shift, pages;
++	uint32_t sctlr, fsr, far, gfsr;                 /* the bank, and sGFSR */
++	uint32_t bar, bhi, bhie;
++	uint32_t ee, cfg, chdb, erdb, ctrl, status, tx; /* BHI EXECENV, MHICFG, CHDBOFF, ERDBOFF, MHICTRL, MHISTATUS, TXVECSTATUS */
++	uint32_t fw_len;
++	uint32_t a[8];                                  /* the step's own results */
++	uint32_t ms;
++	uint32_t er0_rp, er1_rp, ev[8];                 /* event ring read pointers; ring 0's first four elements' dwords */
++};
++
++static uint64_t
++s4_cb(const struct s4_run *w)
++{
++	return SMMU + ((uint64_t)(w->pages + w->cb) << w->shift);
++}
++
++/* What the chip wrote: read from DRAM through the uncached view. */
++static void
++s4_events(struct s4_run *w)
++{
++	const volatile uint32_t *u = (const volatile uint32_t *)s4.ctl;
++
++	if (!u) {
++		return;
++	}
++	w->er0_rp = u[(S4_EV_OFF + 28u) / 4];
++	w->er1_rp = u[(S4_EV_OFF + S4_CTX_BYTES + 28u) / 4];
++	for (uint32_t i = 0; i < 4; i++) {
++		w->ev[2 * i] = u[(S4_ER0_OFF + S4_EL_BYTES * i + 8u) / 4];
++		w->ev[2 * i + 1] = u[(S4_ER0_OFF + S4_EL_BYTES * i + 12u) / 4];
++	}
++}
++
++static void
++s4_faults(struct s4_run *w)
++{
++	w->fsr = rd(s4_cb(w) + SMMU_CB_FSR);
++	w->far = rd(s4_cb(w) + 0x60);                    /* FAR, low half */
++	w->gfsr = rd(SMMU + SMMU_SGFSR);
++}
++
++/* ---- 91: the survey, reads only, before every step ------------------------------------------ */
++static bool
++s4_survey(struct s4_run *w)
++{
++	struct wl l = { .step = 0 };
++	const uint8_t *data = NULL;
++	uint32_t id1, len = 0;
++	bool writes = w->what == 2 || w->what == 3 || w->what == 5;
++
++	s3b_wmark(91, 0);
++	w->fl3b = s3b.flags;
++	w->fl3c = s3c.flags;
++	w->fl3d = s3d.flags;
++	w->cb = s3b.cb;
++	if ((w->fl3b & (S3B_F_SMR | S3B_F_BANK | S3B_F_MEM)) != (S3B_F_SMR | S3B_F_BANK | S3B_F_MEM) || w->cb >= 128 ||
++	    s3b.chunks != S3B_CHUNKS) {
++		WL_FAIL(91, "no-3b");
++	}
++	if (!(w->fl3d & S3D_F_SENT)) {
++		WL_FAIL(91, "no-3d");                       /* run `wifis3d go` first */
++	}
++	if (writes && (w->fl3c & (S3C_F_MSI | S3C_F_BM | S3C_F_OBSERVED)) != (S3C_F_MSI | S3C_F_BM | S3C_F_OBSERVED)) {
++		WL_FAIL(91, "no-3c");                       /* also after s3c_stop_dma() */
++	}
++	if (!wl_alive(&l)) {
++		WL_FAIL(91, "link-not-up");
++	}
++	if (!wm_link()) {
++		WL_FAIL(91, "dll-down");
++	}
++	w->bar = rd(EP_BAR0) & ~0xfu;
++	if (w->bar < WM_MEM_BASE || w->bar > WM_MEM_LAST) {
++		WL_FAIL(91, "no-bar");
++	}
++	if (!wl_ptr(w->bar)) {
++		WL_FAIL(91, "bar-map");
++	}
++	id1 = rd(SMMU + SMMU_IDR1);
++	w->shift = (id1 >> 31) ? 16 : 12;
++	w->pages = 2u << ((id1 >> 28) & 7u);
++	if (!wl_ptr(s4_cb(w))) {
++		WL_FAIL(91, "bank-map");
++	}
++	w->sctlr = rd(s4_cb(w) + SMMU_CB_SCTLR);
++	s4_faults(w);
++	w->bhi = rd(w->bar + 0x28u);                     /* BHIOFF */
++	w->bhie = rd(w->bar + 0x2cu);                    /* BHIEOFF */
++	if (!w->bhi || (w->bhi & 3u) || w->bhi >= WL_PAGE - 0x40) {
++		WL_FAIL(91, "bhi-off");
++	}
++	if (!w->bhie || (w->bhie & 3u) || w->bhie >= WL_PAGE - 0x80) {
++		WL_FAIL(91, "bhie-off");
++	}
++	w->ee = rd(w->bar + w->bhi + 0x28u);
++	w->cfg = rd(w->bar + 0x10u);
++	w->chdb = rd(w->bar + 0x18u);
++	w->erdb = rd(w->bar + 0x20u);
++	w->ctrl = rd(w->bar + 0x38u);
++	w->status = rd(w->bar + 0x48u);
++	w->tx = rd(w->bar + w->bhie + 0x44u);
++	if (pong_fw_lookup("amss20.bin", &data, &len) == 0 && data) {
++		w->fw_len = len;
++	}
++	if (writes) {
++		if (w->sctlr != S3B_SCTLR || (w->fsr & SMMU_FSR_FAULT)) {
++			WL_FAIL(91, "bank-gone");
++		}
++		if (w->ee != 1) {
++			WL_FAIL(91, "ee-not-sbl");
++		}
++	}
++	w->step = 91;
++	return true;
++}
++
++/* ---- 93: contexts and context registers ----------------------------------------------------- */
++static bool
++s4_ctx(struct s4_run *w)
++{
++	/* ath11k_mhi_channels_qca6390: number, type (1 to the device, 2 from it), event ring */
++	static const uint8_t chan[4][3] = { { 0, 1, 0 }, { 1, 2, 0 }, { 20, 1, 1 }, { 21, 2, 1 } };
++	/* ath11k_mhi_events_qca6390: ring offset, length, interrupt moderation (ms), MSI vector */
++	static const uint32_t er[2][4] = { { S4_ER0_OFF, S4_ER0_LEN, 0, 1 }, { S4_ER1_OFF, S4_ER1_LEN, 1, 2 } };
++	/* mhi_init_mmio's writes, in its order: upper half first; iova_start 0, iova_stop 0xffffffff */
++	static const struct { uint32_t off, val; } reg[14] = {
++		{ 0x5c, 0 }, { 0x58, S4_CTL_IOVA + S4_CHAN_OFF },    /* CCABAP */
++		{ 0x64, 0 }, { 0x60, S4_CTL_IOVA + S4_EV_OFF },      /* ECABAP */
++		{ 0x6c, 0 }, { 0x68, S4_CTL_IOVA + S4_CMD_OFF },     /* CRCBAP */
++		{ 0x84, 0 }, { 0x80, 0 },                            /* MHICTRLBASE */
++		{ 0x9c, 0 }, { 0x98, 0 },                            /* MHIDATABASE */
++		{ 0x8c, 0 }, { 0x88, 0xffffffffu },                  /* MHICTRLLIMIT */
++		{ 0xa4, 0 }, { 0xa0, 0xffffffffu },                  /* MHIDATALIMIT */
++	};
++	uint32_t *ctl = (uint32_t *)s3b.chunk[S4_CTL_CHUNK];
++	uint32_t bar = w->bar, *p;
++
++	s3b_wmark(93, 0);
++	if (s4.flags & S4_F_M0REQ) {
++		WL_FAIL(93, "after-m0");                    /* the chip is using them */
++	}
++	if ((w->ctrl & 2u) || !(w->status & 1u)) {
++		WL_FAIL(93, "not-ready");                   /* MHICTRL.RESET clear and MHISTATUS.READY set, as Linux waits for */
++	}
++	if (!ctl) {
++		WL_FAIL(93, "arena-hole");
++	}
++	for (uint32_t i = S4_CHAN_OFF / 4; i < S4_CTL_END / 4; i++) {
++		ctl[i] = 0;                                 /* every other channel: disabled, type 0 */
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		p = ctl + (S4_CHAN_OFF + S4_CTX_BYTES * chan[i][0]) / 4;
++		p[0] = 2u << 8;                             /* chcfg: state disabled, MHI_DB_BRST_DISABLE, pollcfg 0 */
++		p[1] = chan[i][1];
++		p[2] = chan[i][2];                          /* the ring fields stay 0 until a channel is started */
++	}
++	for (uint32_t i = 0; i < 2; i++) {
++		p = ctl + (S4_EV_OFF + S4_CTX_BYTES * i) / 4;
++		p[0] = er[i][2] << 16;                      /* intmod: INTMODT */
++		p[1] = 1;                                   /* MHI_ER_TYPE_VALID */
++		p[2] = er[i][3];
++		p[3] = S4_CTL_IOVA + er[i][0];              /* rbase */
++		p[5] = er[i][1];                            /* rlen */
++		p[7] = p[3];                                /* rp */
++		p[9] = p[3] + er[i][1] - S4_EL_BYTES;       /* wp: every element but one is the chip's to fill */
++	}
++	p = ctl + S4_CMD_OFF / 4;
++	p[3] = p[7] = p[9] = S4_CTL_IOVA + S4_CR0_OFF;
++	p[5] = S4_CR0_LEN;
++	s3b_clean(ctl, S3B_CHUNK);
++	for (unsigned n = 0; n < 14; n++) {
++		s3b_wmark(93, n + 1);
++		wr(bar + reg[n].off, reg[n].val);
++	}
++	s3b_wmark(93, 15);
++	wr(bar + 0x10u, (rd(bar + 0x10u) & ~0x00ff0000u) | 2u << 16);    /* MHICFG.NER = 2 event rings */
++	s3b_wmark(93, 16);
++	wr(bar + 0x10u, rd(bar + 0x10u) & ~0xff000000u);                 /* MHICFG.NHWER = 0 */
++	w->a[0] = rd(bar + 0x58u);
++	w->a[1] = rd(bar + 0x60u);
++	w->a[2] = rd(bar + 0x68u);
++	w->a[3] = rd(bar + 0x80u);
++	w->a[4] = rd(bar + 0x88u);
++	w->a[5] = rd(bar + 0xa0u);
++	w->a[6] = rd(bar + 0x10u);
++	if (w->a[0] != reg[1].val || w->a[1] != reg[3].val || w->a[2] != reg[5].val) {
++		WL_FAIL(93, "ctx-rb");
++	}
++	s4.flags |= S4_F_CTX;
++	w->step = 93;
++	return true;
++}
++
++/* ---- 95: the whole image and the vector table (no device write) ----------------------------- */
++static bool
++s4_copy(struct s4_run *w)
++{
++	const uint8_t *fw = NULL;
++	uint32_t len = 0, segs, want[4 * S4_MAX_SEGS];
++	uint32_t *vec = (uint32_t *)s3b.chunk[S4_CTL_CHUNK];
++	const volatile uint32_t *u;
++
++	s3b_wmark(95, 0);
++	if (s4.flags & S4_F_GO) {
++		WL_FAIL(95, "already-go");                  /* the chip may be reading it */
++	}
++	if (pong_fw_lookup("amss20.bin", &fw, &len) != 0 || !fw) {
++		WL_FAIL(95, "no-fw");
++	}
++	if (len < S3D_SBL_BYTES) {
++		WL_FAIL(95, "fw-too-small");
++	}
++	if (len > S4_IMG_CHUNKS * S3B_CHUNK) {
++		WL_FAIL(95, "image-too-big");
++	}
++	if (!vec) {
++		WL_FAIL(95, "arena-hole");
++	}
++	if (!s4.ctl) {
++		s4.ctl = ml_io_map((vm_offset_t)s3b.chunk_pa[S4_CTL_CHUNK], S3B_CHUNK);
++	}
++	if (!s4.ctl) {
++		WL_FAIL(95, "dram-map");
++	}
++	for (uint32_t off = 0, c = S4_IMG_CHUNK; off < len; off += S3B_CHUNK, c++) {
++		uint32_t n = len - off < S3B_CHUNK ? len - off : S3B_CHUNK;
++
++		if (!s3b.chunk[c]) {
++			WL_FAIL(95, "arena-hole");
++		}
++		memcpy(s3b.chunk[c], fw + off, n);          /* both ordinary kernel RAM */
++		s3b_clean(s3b.chunk[c], n);
++	}
++	segs = (len + S4_SEG_BYTES - 1u) / S4_SEG_BYTES;
++	for (uint32_t i = 0; i < segs; i++) {
++		uint32_t left = len - i * S4_SEG_BYTES;
++
++		want[4 * i] = S4_IMG_IOVA + i * S4_SEG_BYTES;
++		want[4 * i + 1] = 0;
++		want[4 * i + 2] = left < S4_SEG_BYTES ? left : S4_SEG_BYTES;
++		want[4 * i + 3] = 0;
++		for (unsigned k = 0; k < 4; k++) {
++			vec[S4_VEC_OFF / 4 + 4 * i + k] = want[4 * i + k];
++		}
++	}
++	s3b_clean(vec, segs * 16u);
++	/* DRAM, not the cache: every word through an uncached mapping, against the file (the precedent's ef128100
++	 * was cache and DRAM disagreeing). a[0] differing words, a[1] the first one's byte offset + 1, a[2] table. */
++	for (uint32_t off = 0, c = 0; off < len; off += S3B_CHUNK, c++) {
++		uint32_t n = len - off < S3B_CHUNK ? len - off : S3B_CHUNK;
++		const uint32_t *src = (const uint32_t *)(const void *)(fw + off);
++
++		if (!s4.dram[c]) {
++			s4.dram[c] = ml_io_map((vm_offset_t)s3b.chunk_pa[S4_IMG_CHUNK + c], S3B_CHUNK);
++		}
++		if (!s4.dram[c]) {
++			WL_FAIL(95, "dram-map");
++		}
++		u = (const volatile uint32_t *)s4.dram[c];
++		for (uint32_t k = 0; k < n / 4; k++) {
++			if (u[k] != src[k]) {
++				if (!w->a[0]++) {
++					w->a[1] = off + 4 * k + 1;
++				}
++			}
++		}
++		for (uint32_t k = n & ~3u; k < n; k++) {
++			if (((const volatile uint8_t *)u)[k] != fw[off + k]) {
++				if (!w->a[0]++) {
++					w->a[1] = off + k + 1;
++				}
++			}
++		}
++	}
++	u = (const volatile uint32_t *)s4.ctl;
++	for (uint32_t i = 0; i < 4 * segs; i++) {
++		if (u[S4_VEC_OFF / 4 + i] != want[i]) {
++			w->a[2]++;
++		}
++	}
++	w->a[3] = segs;
++	w->a[4] = len;
++	if (w->a[0] || w->a[2]) {
++		WL_FAIL(95, "dram-mismatch");
++	}
++	s4.segs = segs;
++	s4.flags |= S4_F_COPIED;
++	w->step = 95;
++	return true;
++}
++
++/* ---- 94: event ring doorbells, then M0 ------------------------------------------------------- */
++static bool
++s4_m0(struct s4_run *w)
++{
++	uint32_t bar = w->bar, db = w->erdb, st = 0;
++	uint64_t t0;
++
++	s3b_wmark(94, 0);
++	if (!(s4.flags & S4_F_CTX)) {
++		WL_FAIL(94, "no-ctx");
++	}
++	if (s4.flags & S4_F_M0REQ) {
++		WL_FAIL(94, "already-m0");
++	}
++	/* ath11k reads and writes the MHI registers and doorbells straight through the BAR (no window register) */
++	if (db < 0x100 || (db & 3u) || db + 16u > S3D_WIN_PAGE || !wl_ptr(bar + db) || !wl_ptr(bar + db + 12u)) {
++		WL_FAIL(94, "erdb-off");
++	}
++	if (!s4.ctl) {
++		s4.ctl = ml_io_map((vm_offset_t)s3b.chunk_pa[S4_CTL_CHUNK], S3B_CHUNK);
++	}
++	if (!s4.ctl) {
++		WL_FAIL(94, "dram-map");
++	}
++	/* mhi_ready_state_transition: each event ring's doorbell = its write pointer (mhi_write_db: upper half first) */
++	s3b_wmark(94, 1);
++	wr(bar + db + 4u, 0);
++	s3b_wmark(94, 2);
++	wr(bar + db, S4_CTL_IOVA + S4_ER0_OFF + S4_ER0_LEN - S4_EL_BYTES);
++	s3b_wmark(94, 3);
++	wr(bar + db + 12u, 0);
++	s3b_wmark(94, 4);
++	wr(bar + db + 8u, S4_CTL_IOVA + S4_ER1_OFF + S4_ER1_LEN - S4_EL_BYTES);
++	s3b_wmark(94, 5);
++	wr(bar + 0x38u, (rd(bar + 0x38u) & ~0xff00u) | 2u << 8);        /* MHICTRL.MHISTATE = M0 */
++	s4.flags |= S4_F_M0REQ;
++	t0 = wl_now_us();
++	for (;;) {
++		st = rd(bar + 0x48u);
++		if (st != 0xffffffffu && ((st & 4u) || ((st >> 8) & 0xffu) == 2u)) {
++			break;                                  /* SYSERR, or state M0 */
++		}
++		if (wl_now_us() - t0 >= S4_M0_TIMEOUT_MS * 1000ull) {
++			break;
++		}
++		wl_sleep_ms(1);
++	}
++	w->ms = (uint32_t)((wl_now_us() - t0) / 1000u);
++	/* the chip reports its state and execution environment in event ring 0: up to 200 ms for the first one */
++	for (unsigned t = 0; t < 40; t++) {
++		s4_events(w);
++		if (w->er0_rp != S4_CTL_IOVA + S4_ER0_OFF) {
++			break;
++		}
++		wl_sleep_ms(5);
++	}
++	w->a[0] = rd(bar + 0x38u);
++	w->a[1] = st;
++	w->ee = rd(bar + w->bhi + 0x28u);
++	s4_faults(w);
++	if (st == 0xffffffffu || (st & 4u) || ((st >> 8) & 0xffu) != 2u) {
++		s3c_stop_dma();
++		w->step = -94;
++		w->why = (st != 0xffffffffu && (st & 4u)) ? "syserr" : "m0-timeout";
++		return false;
++	}
++	s4.flags |= S4_F_M0;
++	w->step = 94;
++	return true;
++}
++
++/* ---- 96/97: BHIe status and the execution environment, for at most limit_ms ------------------ */
++static bool
++s4_wait(struct s4_run *w, int step, uint32_t limit_ms)
++{
++	uint32_t bar = w->bar, tx, ee;
++	uint64_t t0 = wl_now_us();
++	bool mine, failed;
++
++	for (;;) {
++		tx = rd(bar + w->bhie + 0x44u);              /* TXVECSTATUS: sequence 29:0, status 31:30 */
++		ee = rd(bar + w->bhi + 0x28u);
++		mine = tx != 0xffffffffu && (tx & 0x3fffffffu) == s4.seq;
++		failed = mine && (tx >> 30) == 3u;
++		if (failed || ee == 2u || ee == 4u || wl_now_us() - t0 >= limit_ms * 1000ull) {
++			break;
++		}
++		wl_sleep_ms(1);
++	}
++	w->ms = (uint32_t)((wl_now_us() - t0) / 1000u);
++	w->tx = tx;
++	w->ee = ee;
++	w->status = rd(bar + 0x48u);
++	s4_faults(w);
++	s4_events(w);
++	for (unsigned i = 0; i < 4; i++) {
++		w->a[i] = rd(bar + w->bhi + 0x30u + 4u * i);   /* BHI ERRCODE, ERRDBG1..3 */
++	}
++	if (failed) {
++		s3c_stop_dma();
++		w->step = -step;
++		w->why = "bhie-error";
++		return false;
++	}
++	w->why = (ee == 2u || ee == 4u) ? "mission" : (mine && (tx >> 30) == 2u) ? "waiting-ee" : "in-progress";
++	w->step = step;
++	return true;
++}
++
++static bool
++s4_go(struct s4_run *w)
++{
++	uint32_t bar = w->bar, seq = (uint32_t)(wl_now_us() & 0x3fffffffu);
++
++	s3b_wmark(96, 0);
++	if (!(s4.flags & S4_F_COPIED)) {
++		WL_FAIL(96, "not-copied");
++	}
++	if (!(s4.flags & S4_F_M0)) {
++		WL_FAIL(96, "no-m0");
++	}
++	if (s4.flags & S4_F_GO) {
++		WL_FAIL(96, "already-go");
++	}
++	s4.seq = seq ? seq : 1;
++	/* mhi_fw_load_bhie: the vector table's address (upper half first), its size in bytes, the doorbell */
++	s3b_wmark(96, 1);
++	wr(bar + w->bhie + 0x30u, 0);
++	s3b_wmark(96, 2);
++	wr(bar + w->bhie + 0x2cu, S4_CTL_IOVA + S4_VEC_OFF);
++	s3b_wmark(96, 3);
++	wr(bar + w->bhie + 0x34u, s4.segs * 16u);
++	s3b_wmark(96, 4);
++	wr(bar + w->bhie + 0x3cu, s4.seq);
++	s4.flags |= S4_F_GO;
++	return s4_wait(w, 96, S4_GO_TIMEOUT_MS);
++}
++
++static bool
++s4_poll(struct s4_run *w)
++{
++	s3b_wmark(97, 0);
++	if (!s4.ctl) {
++		WL_FAIL(97, "not-started");                 /* nothing to read before `wifis4 copy` or `wifis4 m0` */
++	}
++	return s4_wait(w, 97, 0);
++}
++
++/* ---- the reply ------------------------------------------------------------------------------ */
++static int
++s4_report(const struct s4_run *w, char *reply, size_t reply_len)
++{
++	char line[640];
++	int k = 0;
++
++	S3_ADD("[PONG_WIFI] s4 w%d st %d %s fl %x/%x/%x/%x sctlr %x fsr %x far %x gfsr %x ee %x ctrl %x status %x ",
++	    w->what, w->step, w->why ? w->why : "?", w->fl3b, w->fl3c, w->fl3d, s4.flags, w->sctlr, w->fsr, w->far,
++	    w->gfsr, w->ee, w->ctrl, w->status);
++	switch (w->what) {
++	case 0:
++		S3_ADD("cfg %x chdb %x erdb %x bhi %x bhie %x tx %x fw %u img %x ctl %x sink %x\n", w->cfg, w->chdb,
++		    w->erdb, w->bhi, w->bhie, w->tx, w->fw_len, S4_IMG_IOVA, S4_CTL_IOVA, S3B_SINK);
++		break;
++	case 2:
++		S3_ADD("cca %x eca %x crc %x ctlbase %x ctllimit %x datalimit %x cfg %x>%x\n", w->a[0], w->a[1], w->a[2],
++		    w->a[3], w->a[4], w->a[5], w->cfg, w->a[6]);
++		break;
++	case 4:
++		S3_ADD("segs %u len %u diff %u first %x vec %u\n", w->a[3], w->a[4], w->a[0], w->a[1], w->a[2]);
++		break;
++	case 3:
++		S3_ADD("erdb %x m0 %ums ctrl %x status %x er0 rp %x ev %x/%x %x/%x %x/%x %x/%x er1 rp %x\n", w->erdb,
++		    w->ms, w->a[0], w->a[1], w->er0_rp, w->ev[0], w->ev[1], w->ev[2], w->ev[3], w->ev[4], w->ev[5],
++		    w->ev[6], w->ev[7], w->er1_rp);
++		break;
++	default:
++		S3_ADD("seq %x tx %x %ums er0 rp %x ev %x/%x %x/%x %x/%x %x/%x er1 rp %x err %x dbg %x/%x/%x\n", s4.seq,
++		    w->tx, w->ms, w->er0_rp, w->ev[0], w->ev[1], w->ev[2], w->ev[3], w->ev[4], w->ev[5], w->ev[6],
++		    w->ev[7], w->er1_rp, w->a[0], w->a[1], w->a[2], w->a[3]);
++		break;
++	}
++	if (k > 0) {
++		pong_ramoops_diagnostic_write(line, k);
++	}
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++int
++pong_wifi_stage4(char *reply, size_t reply_len, int what)
++{
++	struct s4_run s = { .step = 0, .why = "OK", .what = what };
++	int rc;
++
++	if (what != 0 && (what < 2 || what > 6)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s4 bad what\n", reply_len);
++		}
++		return -101;
++	}
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s4 busy\n", reply_len);
++		}
++		return -100;
++	}
++	s3b_wmark(1, 0);
++	if (!wl_map() || !wl_ptr(SMMU)) {
++		s.step = -1;
++		s.why = "map";
++	} else if (s4_survey(&s)) {
++		switch (what) {
++		case 2:
++			(void)s4_ctx(&s);
++			break;
++		case 3:
++			(void)s4_m0(&s);
++			break;
++		case 4:
++			(void)s4_copy(&s);
++			break;
++		case 5:
++			(void)s4_go(&s);
++			break;
++		case 6:
++			(void)s4_poll(&s);
++			break;
++		default:
++			break;
++		}
++	}
++	rc = s4_report(&s, reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif
+diff --git a/iokit/Kernel/PongBacklightT970.cpp b/iokit/Kernel/PongBacklightT970.cpp
+index cf81c93..a251df6 100644
+--- a/iokit/Kernel/PongBacklightT970.cpp
++++ b/iokit/Kernel/PongBacklightT970.cpp
+@@ -39,6 +39,7 @@
+ #include <kern/thread.h>
+ 
+ extern "C" int pong_backlight_set_dbv(uint32_t dbv);
++extern "C" void pong_backlight_svc_state(uint32_t state, uint32_t ms);   /* shown by the USB `bl` command */
+ 
+ class T970Backlight;
+ 
+@@ -191,10 +192,12 @@ t970_backlight_bringup(void *arg, wait_result_t)
+ 	}
+ 	if (!native) {
+ 		IOLog("T970Backlight: native AppleARMBacklight class still unavailable after %u ms; keep current brightness\n", waited * 100);
++		pong_backlight_svc_state(2, waited * 100);
+ 		display->release();
+ 		return;
+ 	}
+ 	IOLog("T970Backlight: native AppleARMBacklight class ready after %u ms\n", waited * 100);
++	pong_backlight_svc_state(3, waited * 100);
+ 	T970Backlight *service = OSTypeAlloc(T970Backlight);
+ 	if (service) {
+ 		if (!service->init() || !service->attach(display) || !service->start(display)) {
+@@ -202,6 +205,9 @@ t970_backlight_bringup(void *arg, wait_result_t)
+ 				service->detach(display);
+ 			}
+ 			service->release();
++			pong_backlight_svc_state(4, waited * 100);
++		} else {
++			pong_backlight_svc_state(5, waited * 100);
+ 		}
+ 		/* on success the service and the DSI0 handoff persist until reboot */
+ 	}
+@@ -220,6 +226,7 @@ pong_backlight_t970_start(IOService *display)
+ 		return;
+ 	}
+ 	started = true;
++	pong_backlight_svc_state(1, 0);
+ 	display->retain();
+ 	if (kernel_thread_start(t970_backlight_bringup, display, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
