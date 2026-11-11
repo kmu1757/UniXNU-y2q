@@ -1,0 +1,330 @@
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+index 8fb1e11..32c9947 100644
+--- a/bsd/dev/pong_backlight_t970.c
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -46,6 +46,7 @@ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern uint64_t mach_absolute_time(void);
+ 
+ int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
++int pong_backlight_set_dbv(uint32_t dbv);
+ 
+ /* ---- addresses ---------------------------------------------------------------------------- */
+ /* One 0x4000 window at ae94000 (one ml_io_map call). Every register this file touches is inside the
+@@ -87,6 +88,7 @@ int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ 
+ /* ---- state -------------------------------------------------------------------------------- */
+ static vm_offset_t g_bl_dsi;
++static int g_bl_busy;   /* one in-flight transfer guard (USB `bl` and the iOS service share the FIFO) */
+ 
+ /* ---- small helpers ------------------------------------------------------------------------ */
+ /* Strict 32-bit volatile helpers with barriers; no memcpy/memmove on Device memory. */
+@@ -393,4 +395,71 @@ done:
+ 	bl_pmsg(reply);
+ 	return -1;
+ }
++
++/*
++ * The iOS-facing entry point: set the panel DBV once, reusing the same bl_send/bl_pack transport
++ * as the USB `bl` command (no second transmitter). The service calls this from its work loop; the
++ * USB command calls pong_backlight_usb from the CDC-ACM thread. The TPG FIFO is not reentrant, so
++ * a single atomic in-flight guard serializes the two callers: a second caller returns -2 instead
++ * of corrupting a transfer in progress.
++ *
++ * Returns 0 on success, -1 if the DBV is out of range or the link is not ready, -2 if a transfer
++ * is already in flight, -3 if a packet failed. On failure one pmsg line is left and the caller
++ * keeps accepting requests (no panic, no unbounded wait).
++ */
++int
++pong_backlight_set_dbv(uint32_t dbv)
++{
++	if (dbv < BL_DBV_MIN || dbv > BL_DBV_MAX) {
++		return -1;
++	}
++	if (__atomic_exchange_n(&g_bl_busy, 1, __ATOMIC_ACQUIRE)) {
++		return -2;
++	}
++	if (!g_bl_dsi) {
++		g_bl_dsi = ml_io_map(BL_DSI0_PHYS, BL_DSI0_WINDOW);
++	}
++	int rc = -1;
++	if (!g_bl_dsi) {
++		bl_pmsg("[PONG_BL] svc map ae94000 failed\n");
++	} else {
++		const uint32_t hw = bl_rd32(BL_REG_HW_VERSION);
++		const uint32_t ctrl = bl_rd32(BL_REG_CTRL);
++		const uint32_t tpg_before = bl_rd32(BL_REG_TPG_CTRL);
++
++		if (!hw || hw == ~0u || (ctrl & 1u) == 0 || (tpg_before & 1u) != 0) {
++			rc = -1;
++		} else {
++			static const uint8_t gamma[] = { 0x68, 0x19, 0x20, 0x00, 0x14 };
++			const uint8_t dbv_bytes[3] = {
++				BL_DCS_BRIGHTNESS,
++				(uint8_t)(dbv & 0xffu),
++				(uint8_t)((dbv >> 8) & 0x7u),
++			};
++			const uint8_t control[2] = { BL_DCS_CONTROL, 0x20 };
++			uint32_t words[4];
++			unsigned int step = 1;
++
++			rc = 0;
++			if (bl_send(words, bl_pack(gamma, (unsigned)sizeof gamma, words, 4), &step)) {
++				rc = -3;
++			} else if (bl_send(words, bl_pack(dbv_bytes, 3u, words, 4), &step)) {
++				rc = -3;
++			} else if (bl_send(words, bl_pack(control, 2u, words, 4), &step)) {
++				rc = -3;
++			}
++			if (rc) {
++				char line[64];
++				int n = snprintf(line, sizeof(line), "[PONG_BL] svc set dbv=%u rc=%d step=%u\n",
++				    dbv, rc, step);
++
++				if (n > 0) {
++					pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++				}
++			}
++		}
++	}
++	__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif /* PONG */
+\ No newline at end of file
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 1339b89..33169cd 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -57,6 +57,7 @@ extern "C" void pong_scanout_idle(void);
+ #if XNU_PONG_BACKLIGHT
+ extern "C" void pong_backlight_start(IOService *display);
+ #endif
++extern "C" void pong_backlight_t970_start(IOService *display);
+ extern "C" int pong_mmio_quiet;
+ 
+ 
+@@ -1648,13 +1649,11 @@ MiniIOMobileFramebufferStart(IOService * provider)
+ 	if (!fb->start(provider)) {
+ 		fb->detach(provider);
+ 	}
+-#if XNU_PONG_BACKLIGHT
+ 	else {
+ 		if (!pong_mmio_quiet) {
+-			pong_backlight_start(fb);
++			pong_backlight_t970_start(fb);
+ 		}
+ 	}
+-#endif
+ 	fb->release();
+ }
+ 
+diff --git a/iokit/Kernel/PongBacklightT970.cpp b/iokit/Kernel/PongBacklightT970.cpp
+new file mode 100644
+index 0000000..688baa6
+--- /dev/null
++++ b/iokit/Kernel/PongBacklightT970.cpp
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SM-T970 (SM8250 / kona, Galaxy Tab S7+) panel backlight presented to iPadOS as
++ * AppleARMBacklight, so the Settings / Control Center brightness slider drives the real panel.
++ *
++ * The transport is the DSI0 DCS three-packet write already in bsd/dev/pong_backlight_t970.c
++ * (the same one the USB `bl` command uses): 68 19 20 00 14 -> 51 DBV[7:0] DBV[10:8] -> 53 20.
++ * This file only adds the IOKit service on top of that entry point (pong_backlight_set_dbv);
++ * it does not re-implement the transfer, does not do the DCS 0x52 read-back (a bus turnaround
++ * halted this SoC in rui's v84-v86), and never touches DSI1, the PLL, the PHY or a DMA buffer.
++ *
++ * Gated by the boot argument pong_backlight=1 (off by default): without it the kernel behaves
++ * exactly as before. The service publishes IODisplayParameters.brightness = {min=10, max=2047,
++ * value=...} and accepts brightness / FadePeriod in setProperties. The value CoreBrightness
++ * sends is the panel DBV directly (linear for now; a curve can replace brightness_to_dbv later).
++ * The service never writes a level at boot: it publishes a placeholder and waits for the first
++ * request, so the panel keeps whatever brightness the boot loader left until the user moves the
++ * slider. A failed transfer leaves one pmsg line and the next request is still served.
++ *
++ * The AppleARMBacklight conformance is the source-level getMetaClass override (the same shape as
++ * ref/UniXNU-pong/drivers/PongPower/PongBacklight.cpp:393-403): the class is registered under its
++ * own name at static-init, and getMetaClass answers the real Apple metaclass only for the one
++ * published instance. No vtable slot is guessed and no duplicate class name is registered.
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790)
++ * package/BacklightProbe.cpp (the T970Backlight service :194-321) and from UniXNU-pong
++ * PongBacklight.cpp (the getMetaClass override and the 22H374 property set). Both are
++ * BSD-2-Clause-Patent. Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG) && (DEVELOPMENT || DEBUG) && !SECURE_KERNEL
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/OSKextLib.h>
++#include <pexpert/pexpert.h>
++
++extern "C" int pong_backlight_set_dbv(uint32_t dbv);
++
++namespace {
++const OSMetaClass *gAppleClass;
++class T970Backlight;
++T970Backlight *gPublished;
++
++/* The one place the service's brightness unit maps to a panel DBV. Linear for now: the unit IS
++ * the DBV, clamped to the panel's 10..2047 range (0..9 are not a valid DBV; the panel is off via
++ * a different command, not via DBV 0). A later curve replaces only this function. */
++static uint32_t
++brightness_to_dbv(uint32_t value)
++{
++	if (value < 10) {
++		return 10;
++	}
++	if (value > 2047) {
++		return 2047;
++	}
++	return value;
++}
++} // namespace
++
++class T970Backlight : public IOService {
++	OSDeclareDefaultStructors(T970Backlight)
++	uint32_t level = 1029;   /* the last value CoreBrightness asked for; never written at boot */
++
++	void publishLevel();
++public:
++	bool start(IOService *provider) override;
++	IOReturn setProperties(OSObject *properties) override;
++	void free() override;
++};
++
++void
++T970Backlight::publishLevel()
++{
++	OSDictionary *item = OSDictionary::withCapacity(3);
++	OSDictionary *parameters = OSDictionary::withCapacity(1);
++	OSNumber *minimum = OSNumber::withNumber(10ULL, 32);
++	OSNumber *maximum = OSNumber::withNumber(2047ULL, 32);
++	OSNumber *value = OSNumber::withNumber((uint64_t)level, 32);
++
++	if (item && parameters && minimum && maximum && value) {
++		item->setObject("min", minimum);
++		item->setObject("max", maximum);
++		item->setObject("value", value);
++		parameters->setObject("brightness", item);
++		setProperty("IODisplayParameters", parameters);
++	}
++	OSSafeReleaseNULL(item);
++	OSSafeReleaseNULL(parameters);
++	OSSafeReleaseNULL(minimum);
++	OSSafeReleaseNULL(maximum);
++	OSSafeReleaseNULL(value);
++}
++
++bool
++T970Backlight::start(IOService *provider)
++{
++	(void)provider;
++	const OSSymbol *name = OSSymbol::withCString("AppleARMBacklight");
++
++	gAppleClass = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
++	OSSafeReleaseNULL(name);
++	if (!gAppleClass) {
++		IOLog("T970Backlight: native AppleARMBacklight class unavailable; keep current brightness\n");
++		return false;
++	}
++	gPublished = this;
++	setName("AppleARMBacklight");
++	setProperty("NativeSandboxGrantProcess", "backboardd");
++	setProperty("backlight-control", true);
++	setProperty("built-in", true);
++	/* Matching key for the 22H374 CoreBrightness adapter in userland/ui_compat18.c; not a panel
++	 * description. The adapter only installs when this exact string is present. */
++	setProperty("PongPanel", "NT37705 Visionox / SM8475 DSI0");
++	publishLevel();
++	registerService();
++	IOLog("T970Backlight: DCS service ready (pong_backlight=1), level=%u\n", level);
++	return true;
++}
++
++IOReturn
++T970Backlight::setProperties(OSObject *properties)
++{
++	OSDictionary *dictionary = OSDynamicCast(OSDictionary, properties);
++
++	if (!dictionary) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *brightness = OSDynamicCast(OSNumber, dictionary->getObject("brightness"));
++	if (!brightness) {
++		return kIOReturnSuccess;
++	}
++	const uint32_t dbv = brightness_to_dbv(brightness->unsigned32BitValue());
++
++	level = dbv;
++	/* A failed transfer already left a pmsg line inside pong_backlight_set_dbv; keep serving. */
++	(void)pong_backlight_set_dbv(dbv);
++	publishLevel();
++	return kIOReturnSuccess;
++}
++
++void
++T970Backlight::free()
++{
++	if (gPublished == this) {
++		gPublished = nullptr;
++	}
++	IOService::free();
++}
++
++/* Manual metaclass definition with a source-level getMetaClass override (PongBacklight.cpp:395-404).
++ * gMetaClass is a global object, so its constructor registers "T970Backlight" at static-init; no
++ * preModLoad/postModLoad and no late-init object rewrite are needed. */
++T970Backlight::MetaClass T970Backlight::gMetaClass;
++const OSMetaClass *const T970Backlight::metaClass = &T970Backlight::gMetaClass;
++const OSMetaClass *const T970Backlight::superClass = &IOService::gMetaClass;
++T970Backlight::T970Backlight(const OSMetaClass *meta) : IOService(meta) {}
++T970Backlight::~T970Backlight() {}
++const OSMetaClass *
++T970Backlight::getMetaClass() const
++{
++	return __atomic_load_n(&gPublished, __ATOMIC_ACQUIRE) == this ? gAppleClass : &gMetaClass;
++}
++OSMetaClassConstructorInit(T970Backlight, IOService, )
++OSDefineDefaultStructors(T970Backlight, IOService)
++
++extern "C" void
++pong_backlight_t970_start(IOService *display)
++{
++	static T970Backlight *backlight;
++	unsigned enabled = 0;
++
++	PE_parse_boot_argn("pong_backlight", &enabled, sizeof(enabled));
++	if (!enabled || backlight || !display) {
++		return;
++	}
++	T970Backlight *service = OSTypeAlloc(T970Backlight);
++	if (!service) {
++		return;
++	}
++	if (!service->init() || !service->attach(display) || !service->start(display)) {
++		if (service->getProvider()) {
++			service->detach(display);
++		}
++		service->release();
++		return;
++	}
++	backlight = service;   /* the service and the DSI0 handoff persist until reboot */
++}
++#endif /* PONG && (DEVELOPMENT || DEBUG) && !SECURE_KERNEL */
+diff --git a/iokit/conf/files b/iokit/conf/files
+index 679caad..8e0c497 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -82,6 +82,7 @@ iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
+ iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
++iokit/Kernel/PongBacklightT970.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+ iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
+ 
