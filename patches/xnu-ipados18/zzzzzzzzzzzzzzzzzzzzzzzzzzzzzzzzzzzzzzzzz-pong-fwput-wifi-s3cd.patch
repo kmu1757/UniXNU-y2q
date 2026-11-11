@@ -1,0 +1,1572 @@
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+index 32c9947..8763a55 100644
+--- a/bsd/dev/pong_backlight_t970.c
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -89,6 +89,7 @@ int pong_backlight_set_dbv(uint32_t dbv);
+ /* ---- state -------------------------------------------------------------------------------- */
+ static vm_offset_t g_bl_dsi;
+ static int g_bl_busy;   /* one in-flight transfer guard (USB `bl` and the iOS service share the FIFO) */
++static int g_bl_quiet;  /* set while the iOS service sends: no per-write pmsg marker (a slider drag would fill pmsg) */
+ 
+ /* ---- small helpers ------------------------------------------------------------------------ */
+ /* Strict 32-bit volatile helpers with barriers; no memcpy/memmove on Device memory. */
+@@ -138,6 +139,10 @@ static void
+ bl_wmark(unsigned int step)
+ {
+ 	char line[24];
++
++	if (g_bl_quiet) {
++		return;
++	}
+ 	int n = snprintf(line, sizeof(line), "[PONG_BL] W%u\n", step);
+ 
+ 	if (n > 0) {
+@@ -356,6 +361,10 @@ pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level)
+ 		unsigned int sent = 0;
+ 		int rc;
+ 
++		if (__atomic_exchange_n(&g_bl_busy, 1, __ATOMIC_ACQUIRE)) {
++			snprintf(reply, reply_cap, "[PONG_BL] set dbv=%u busy (the iOS service is sending)\n", level);
++			return -5;
++		}
+ 		bl_pmsg("[PONG_BL] set\n");
+ 		rc = bl_send(words, bl_pack(gamma, (unsigned)sizeof gamma, words, 4), &step);
+ 		if (rc) {
+@@ -387,6 +396,7 @@ done:
+ 		    level, sent, step, rc,
+ 		    hw, ctrl, dma_before, dma_after, intr, tpg_before, tpg_after);
+ 		bl_pmsg(reply);
++		__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
+ 		return rc ? -4 : 0;
+ 	}
+ 	}
+@@ -416,6 +426,7 @@ pong_backlight_set_dbv(uint32_t dbv)
+ 	if (__atomic_exchange_n(&g_bl_busy, 1, __ATOMIC_ACQUIRE)) {
+ 		return -2;
+ 	}
++	g_bl_quiet = 1;
+ 	if (!g_bl_dsi) {
+ 		g_bl_dsi = ml_io_map(BL_DSI0_PHYS, BL_DSI0_WINDOW);
+ 	}
+@@ -459,6 +470,7 @@ pong_backlight_set_dbv(uint32_t dbv)
+ 			}
+ 		}
+ 	}
++	g_bl_quiet = 0;
+ 	__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 8eb82cc..130637e 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -32,6 +32,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
++extern void IOFreeContiguous(void *address, vm_size_t size);
++int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern unsigned int vm_page_free_count;
+ 
+@@ -69,6 +71,8 @@ extern int pong_wifi_link_down(char *reply, size_t reply_len);
+ extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ extern int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ extern int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
++extern int pong_wifi_stage3c(char *reply, size_t reply_len, int what);
++extern int pong_wifi_stage3d(char *reply, size_t reply_len, int what);
+ /* pong_backlight_t970.c: DSI0 DCS backlight probe; one result line (mode 0 read, 1 write) */
+ extern int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ /* IOPMPowerSource.cpp: battery temperature in tenths of a degree, -32768 until the gauge was read */
+@@ -1509,6 +1513,243 @@ cmd_handle_threads(void)
+ 	send_str("threads: snapshot written to pmsg; use 'log' to read\n");
+ }
+ 
++/* ---- fwput: firmware upload over the USB control channel ---- */
++
++#define FWPUT_MAX_NAME   31
++#define FWPUT_MAX_SLOTS  4
++#define FWPUT_MAX_SIZE   (8u * 1024u * 1024u)
++#define FWPUT_TIMEOUT_MS 10000u
++
++struct fwput_slot {
++    char     name[FWPUT_MAX_NAME + 1];
++    uint8_t *data;
++    uint32_t cap;      /* bytes allocated at data */
++    uint32_t len;
++    uint32_t crc;
++    bool     used;
++};
++
++static struct fwput_slot fwput_slots[FWPUT_MAX_SLOTS];
++
++/* Binary receive mode: while set, incoming bulk-OUT bytes are firmware, not a command line. */
++static bool fwput_rx_active;
++static struct fwput_slot *fwput_rx_slot;
++static uint32_t fwput_rx_len;
++static uint32_t fwput_rx_got;
++static uint32_t fwput_rx_crc;
++static uint64_t fwput_rx_deadline;
++
++static uint32_t
++fwput_crc32(const uint8_t *data, uint32_t len)
++{
++    uint32_t crc = 0xffffffffu;
++    for (uint32_t i = 0; i < len; i++) {
++        crc ^= data[i];
++        for (int b = 0; b < 8; b++) {
++            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++        }
++    }
++    return crc ^ 0xffffffffu;
++}
++
++static void
++fwput_reset_deadline(void)
++{
++    uint64_t interval = 0;
++    nanoseconds_to_absolutetime((uint64_t)FWPUT_TIMEOUT_MS * NSEC_PER_MSEC, &interval);
++    fwput_rx_deadline = mach_absolute_time() + interval;
++}
++
++/* Consume one bulk-OUT chunk while in binary receive mode. */
++static void
++fwput_feed(const uint8_t *data, unsigned len)
++{
++    struct fwput_slot *slot = fwput_rx_slot;
++    uint32_t remaining = fwput_rx_len - fwput_rx_got;
++
++    if (len > remaining) {
++        len = remaining;
++    }
++    copy_from_device(slot->data + fwput_rx_got, (const volatile uint8_t *)data, len);
++    fwput_rx_got += len;
++    fwput_reset_deadline();
++
++    if (fwput_rx_got == fwput_rx_len) {
++        fwput_rx_active = false;
++        uint32_t crc = fwput_crc32(slot->data, slot->len);
++        char reply[96];
++        if (crc == fwput_rx_crc) {
++            snprintf(reply, sizeof(reply), "fwput: ok %s %u %08x\n", slot->name, slot->len, crc);
++        } else {
++            snprintf(reply, sizeof(reply), "fwput: crc-mismatch %s got %08x want %08x\n",
++                slot->name, crc, fwput_rx_crc);
++            slot->used = false;
++        }
++        send_str(reply);
++    }
++}
++
++/* Called from the control thread's main loop: abandon a stalled upload. */
++static void
++fwput_check_timeout(void)
++{
++    if (!fwput_rx_active) {
++        return;
++    }
++    if (mach_absolute_time() < fwput_rx_deadline) {
++        return;
++    }
++    fwput_rx_active = false;
++    fwput_rx_slot->used = false;
++    char reply[64];
++    snprintf(reply, sizeof(reply), "fwput: timeout got %u\n", fwput_rx_got);
++    send_str(reply);
++}
++
++static void
++cmd_handle_fwput(const char *args)
++{
++    const char *p = args;
++    char name[FWPUT_MAX_NAME + 1];
++    unsigned name_len = 0;
++
++    while (*p == ' ') {
++        p++;
++    }
++    while (*p && *p != ' ' && name_len < FWPUT_MAX_NAME) {
++        char c = *p;
++        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) {
++            send_str("fwput: bad-name\n");
++            return;
++        }
++        name[name_len++] = c;
++        p++;
++    }
++    if (name_len == 0) {
++        send_str("fwput: bad-name\n");
++        return;
++    }
++    name[name_len] = '\0';
++
++    uint32_t size = parse_num(&p);
++    uint32_t crc = parse_num(&p);
++
++    if (size < 1 || size > FWPUT_MAX_SIZE) {
++        send_str("fwput: bad-size\n");
++        return;
++    }
++
++    struct fwput_slot *slot = NULL;
++    struct fwput_slot *free_slot = NULL;
++    for (unsigned i = 0; i < FWPUT_MAX_SLOTS; i++) {
++        if (fwput_slots[i].used && strcmp(fwput_slots[i].name, name) == 0) {
++            slot = &fwput_slots[i];
++            break;
++        }
++        if (!fwput_slots[i].used && !free_slot) {
++            free_slot = &fwput_slots[i];
++        }
++    }
++    if (!slot) {
++        slot = free_slot;
++    }
++    if (!slot) {
++        send_str("fwput: no-slot\n");
++        return;
++    }
++
++    if (!slot->data || slot->cap < size) {
++        IOPhysicalAddress phys = 0;
++        void *buf = IOMallocContiguous(size, 4096, &phys);
++        if (!buf) {
++            send_str("fwput: no-mem\n");
++            return;
++        }
++        if (slot->data) {
++            IOFreeContiguous(slot->data, slot->cap);
++        }
++        slot->data = buf;
++        slot->cap = size;
++    }
++
++    slot->len = size;
++    slot->crc = crc;
++    strlcpy(slot->name, name, sizeof(slot->name));
++    slot->used = true;
++
++    fwput_rx_active = true;
++    fwput_rx_slot = slot;
++    fwput_rx_len = size;
++    fwput_rx_got = 0;
++    fwput_rx_crc = crc;
++    fwput_reset_deadline();
++
++    char reply[64];
++    snprintf(reply, sizeof(reply), "fwput: ready %u\n", size);
++    send_str(reply);
++}
++
++static void
++cmd_handle_fwlist(void)
++{
++    char reply[256];
++    int n = 0;
++
++    for (unsigned i = 0; i < FWPUT_MAX_SLOTS; i++) {
++        if (fwput_slots[i].used) {
++            n += snprintf(reply + n, sizeof(reply) - (size_t)n, "%s %u %08x\n",
++                fwput_slots[i].name, fwput_slots[i].len, fwput_slots[i].crc);
++        }
++    }
++    if (n == 0) {
++        send_str("fwlist: (empty)\n");
++    } else {
++        send_str(reply);
++    }
++}
++
++/*
++ * Look up an uploaded firmware blob by name. Returns 0 and sets *data and *len on
++ * success, -1 if not found. The returned pointer stays valid until the next
++ * `fwput` that replaces the same name (or a timeout discards it).
++ */
++int
++pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len)
++{
++    for (unsigned i = 0; i < FWPUT_MAX_SLOTS; i++) {
++        if (fwput_slots[i].used && strcmp(fwput_slots[i].name, name) == 0) {
++            if (data) {
++                *data = fwput_slots[i].data;
++            }
++            if (len) {
++                *len = fwput_slots[i].len;
++            }
++            return 0;
++        }
++    }
++    return -1;
++}
++
++/*
++ * wifis3c [msi|bm|undo] and wifis3d [copy|go]: Wi-Fi stages 3c (MSI into the sink page, endpoint bus mastering) and
++ * 3d (boot loader image through BHI; needs `fwput amss20.bin` first). One class of writes per call; the reply is
++ * pong_wifi_link.c's result line.
++ */
++static void
++cmd_handle_wifis3cd(int stage, int what)
++{
++	char reply[640];
++
++	reply[0] = '\0';
++	if (stage == 3) {
++		(void)pong_wifi_stage3c(reply, sizeof(reply), what);
++	} else {
++		(void)pong_wifi_stage3d(reply, sizeof(reply), what);
++	}
++	send_str(reply[0] ? reply : "wifis3: no reply\n");
++}
++
+ /* Dispatch Received Command String */
+ static void
+ dispatch_command(const char *cmd)
+@@ -1581,6 +1822,24 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifis3b(3);
+ 	} else if (strcmp(cmd, "wifis3b undo") == 0) {
+ 		cmd_handle_wifis3b(9);
++	} else if (strcmp(cmd, "wifis3c") == 0) {
++		cmd_handle_wifis3cd(3, 0);
++	} else if (strcmp(cmd, "wifis3c msi") == 0) {
++		cmd_handle_wifis3cd(3, 1);
++	} else if (strcmp(cmd, "wifis3c bm") == 0) {
++		cmd_handle_wifis3cd(3, 2);
++	} else if (strcmp(cmd, "wifis3c undo") == 0) {
++		cmd_handle_wifis3cd(3, 9);
++	} else if (strcmp(cmd, "wifis3d") == 0) {
++		cmd_handle_wifis3cd(4, 0);
++	} else if (strcmp(cmd, "wifis3d copy") == 0) {
++		cmd_handle_wifis3cd(4, 1);
++	} else if (strcmp(cmd, "wifis3d go") == 0) {
++		cmd_handle_wifis3cd(4, 2);
++	} else if (strncmp(cmd, "fwput ", 6) == 0) {
++		cmd_handle_fwput(cmd + 6);
++	} else if (strcmp(cmd, "fwlist") == 0) {
++		cmd_handle_fwlist();
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
+@@ -1598,7 +1857,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, fwput, fwlist, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+@@ -1606,6 +1865,10 @@ dispatch_command(const char *cmd)
+ static void
+ feed_input(const uint8_t *data, unsigned len)
+ {
++	if (fwput_rx_active) {
++		fwput_feed(data, len);     /* firmware bytes, not a command line */
++		return;
++	}
+ 	for (unsigned i = 0; i < len; i++) {
+ 		char c = (char)data[i];
+ 		if (c == '\r' || c == '\n') {
+@@ -2104,6 +2367,7 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 
+ 	while (1) {
+ 		process_events();
++		fwput_check_timeout();
+ 		if (ctl_configured && !ctl_rx_active) {
+ 			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
+ 		}
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index 38ee80a..e40b03f 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -43,6 +43,8 @@ int pong_wifi_link_down(char *reply, size_t reply_len);
+ int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
++int pong_wifi_stage3c(char *reply, size_t reply_len, int what);
++int pong_wifi_stage3d(char *reply, size_t reply_len, int what);
+ 
+ /* ---- tuning knobs ------------------------------------------------------------------------- */
+ #define WL_LINK_GEN        1u      /* LNKCTL2 target speed; stock DTS qcom,target-link-speed = 1 */
+@@ -2108,4 +2110,1181 @@ pong_wifi_stage3b(char *reply, size_t reply_len, int what)
+ 	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/*
++ * Stage 3c of the SM-T970 Wi-Fi bring-up: ASPM off, MSI capability on (address = sink IOVA,
++ * data = 0, 4 vectors), endpoint bus mastering on. The sink page is the arena's last 4 KiB
++ * (IOVA 0xa03ff000), zeroed and cleaned in stage 3b. MSI writes are DMA writes the chip does
++ * through the SMMU into RAM; nobody needs to receive them — polling works down to mission mode
++ * (wifi-sources.md:145). This stage observes the bank for 2 s after bus mastering is enabled
++ * and immediately disables both if a fault appears.
++ *
++ * It uses these pieces of the code above unchanged:
++ *   rd(), wr(), wl_ptr(), wl_map(), wl_alive(), wm_link(), wl_spin_us(), WL_FAIL(), struct wl,
++ *   wl_busy, WL_PAGE, PARF, DBI, CFGSPACE, DBI_COMMAND, EP_ID, EP_COMMAND, EP_BAR0,
++ *   WM_MEM_BASE, WM_MEM_LAST,
++ *   s3b (the global state: flags, cb, smr, smr_val, s2cr_orig, tables, tpa, chunk[], chunk_pa[],
++ *   chunks),
++ *   s3b_cb(), s3b_wmark(), s3b_clean(), S3B_F_SMR, S3B_F_BANK, S3B_SINK, S3B_IOVA, S3B_ARENA,
++ *   S3B_CHUNK, S3B_SCTLR, S3B_LEAF, S3B_LINE,
++ *   SMMU, SMMU_SGFSR, SMMU_SGFSYNR0, SMMU_CB_SCTLR, SMMU_CB_FSR, SMMU_FSR_FAULT,
++ *   pong_ramoops_diagnostic_write().
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/T970WifiProbe.cpp endpointLinkSetup() lines 262-286 (ASPM off and MSI on, periph27),
++ *   and endpointProbe() lines 261 (bus master, already in `wm_run` step 20 comment).
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ * Cross-checked against the stock T970 DTS (pcie0 qcom,target-link-speed = 1) and the 11-11
++ * half20 log (MSI cap at 0x50, 64-bit, 32 vectors, currently off).
++ *
++ * Entry points (USB commands after `wifiup`, `wifimhi`, `wifis3a`, `wifis3b`):
++ *   int pong_wifi_stage3c(char *reply, size_t reply_len, int what);
++ *     what 0 `wifis3c`       read only: 3b state, link, endpoint Command/MSI cap/DEVCTL/LNKCTL,
++ *                             and every value that would be written
++ *     what 1 `wifis3c msi`    ASPM off (only if on) + MSI capability → sink IOVA, read back
++ *     what 2 `wifis3c bm`     bus master on, poll bank FSR/FAR/sGFSR/link/BHI 20x@100ms, disable on fault
++ *     what 9 `wifis3c undo`   bus master off → MSI off (enable bit cleared)
++ * Steps (a negative step is the one that failed, `why` names the check):
++ *   1 mapped, 71 survey (3b + link + endpoint), 72 ASPM off, 73 MSI write + read back,
++ *   74 bus master on, 75 observation (20 polls), 79 undo.
++ * pmsg: "[PONG_WIFI] S<step>" before each step, and for writes "[PONG_WIFI] S<step> W<n>".
++ */
++
++/* ---- tuning knobs ------------------------------------------------------------------------- */
++#define S3C_POLL_MS         100u   /* observation interval after bus master, ms */
++#define S3C_POLL_N          20u    /* polls (2 s) — rui saw the PBL reject in ~300 ms (periph17) */
++
++/* ---- values from the precedent ------------------------------------------------------------ */
++/* rui:272 LNKCTL bits 1:0 clear = ASPM off (ASPM is already off on this tablet: 11-11 lnk 10110000) */
++#define S3C_LNK_ASPM_MASK   3u
++/* rui:276 MSI address = sink IOVA; rui:78 kMsiSink = arena last page */
++#define S3C_MSI_ADDR        S3B_SINK
++/* rui:278 MSI control: clear Multiple Message Enable (bits 22:20), set 4 vectors (bit 21 = 0x20), enable (bit 16 = 1) */
++#define S3C_MSI_CTL_CLR     0x70u
++#define S3C_MSI_CTL_SET     (0x20u | 1u)
++/* rui:261 endpoint Command bit 2 = bus master */
++#define S3C_CMD_BM          0x4u
++
++/* ---- endpoint config-space helpers -------------------------------------------------------- */
++/* The iATU CFG0 window (at CFGSPACE) was left enabled by `wifimhi` / stage 3a. Endpoint
++ * config registers are at CFGSPACE + offset, word-aligned. */
++#define S3_CFG(o)           (CFGSPACE + (o))
++
++/* ---- state -------------------------------------------------------------------------------- */
++#define S3C_F_ASPM_OFF      1u    /* LNKCTL bits 1:0 cleared in this boot */
++#define S3C_F_MSI           2u    /* MSI capability written and read back */
++#define S3C_F_BM            4u    /* bus master enabled in this boot */
++#define S3C_F_OBSERVED      8u    /* the 2 s observation poll has run */
++
++static struct {
++	uint32_t flags;
++	uint32_t lnk_orig, msi_orig, msia_orig, msia2_orig, msid_orig;   /* values before the write */
++	uint32_t cmd_orig;
++	uint32_t mcap;                                 /* MSI capability offset, once `wifis3c msi` wrote it */
++} s3c;
++
++struct s3c_run {
++	int step;
++	const char *why;
++	int what;
++	uint32_t fl;                                   /* s3b.flags */
++	uint32_t cb, smr, smr_val, sctlr, fsr;          /* s3b's bank and SMR */
++	uint32_t cmd, bar, rpcmd;                       /* endpoint Command, BAR0, root port Command */
++	uint32_t lnk, dev;                              /* endpoint LNKCTL, DEVCTL */
++	uint32_t pcap, mcap, msi;                       /* PCIe/MSI capability offsets, MSI control word */
++	uint32_t msia, msia2, msid;                     /* MSI addr low/high, data (taken from mcap+4,+8,+c or +8) */
++	uint32_t gfsr, gsyn1;                           /* sGFSR and sGFSYNR1 */
++	uint32_t polls;                                 /* observation polls completed */
++	uint32_t obs[20];                               /* observation poll results: bit 0=fsr-clean, bit1=gfsr-clean,
++	                                                 *   bit2=link-up, bit3=bhi-not-all-ones, bit4=bm-still-on */
++	uint32_t ek;                                    /* error kind when observation stopped: 1 fsr, 2 gfsr, 3 link, 4 bhi, 5 bm-off */
++	uint32_t obs_fsr, obs_far_lo, obs_far_hi;       /* latched at the first fault */
++	uint32_t obs_bhi;
++};
++
++/* ---- the survey: reads only, run before every write step -------------------------------- */
++static bool
++s3c_survey(struct s3c_run *w)
++{
++	struct wl l = { .step = 0 };
++	uint32_t cap;
++
++	/* 71. Prerequisites: 3b has its SMR live and the bank programmed (3b flags SMR|BANK);
++	 * link up; the CFG0 window enabled. Read every register this stage would touch. */
++	s3b_wmark(71, 0);
++	w->fl = s3b.flags;
++	w->cb = s3b.cb;
++	w->smr = s3b.smr;
++	w->smr_val = s3b.smr_val;
++	if ((w->fl & (S3B_F_SMR | S3B_F_BANK)) != (S3B_F_SMR | S3B_F_BANK) || w->cb >= 128) {
++		WL_FAIL(71, "no-3b");                       /* run `wifis3b smr` first */
++	}
++	if (!wl_alive(&l)) {
++		WL_FAIL(71, "link-not-up");
++	}
++	if (!wm_link()) {
++		WL_FAIL(71, "dll-down");
++	}
++	if (!(rd(ATU + 0x04) & (1u << 31))) {
++		WL_FAIL(71, "cfg-window");
++	}
++	if ((rd(EP_ID) & 0xffffu) != 0x17cbu) {
++		WL_FAIL(71, "ep-id");
++	}
++	/* compute bank base from the SMMU geometry (read locally, same as 3b step 51) */
++	{
++		uint32_t id1 = rd(SMMU + SMMU_IDR1);
++		uint32_t shift = (id1 >> 31) ? 16 : 12;
++		uint32_t pages = 2u << ((id1 >> 28) & 7u);
++		uint64_t cb = SMMU + ((uint64_t)(pages + w->cb) << shift);
++
++		if (!wl_ptr(cb)) {
++			WL_FAIL(71, "bank-map");
++		}
++		w->sctlr = rd(cb + SMMU_CB_SCTLR);
++		w->fsr = rd(cb + SMMU_CB_FSR);
++	}
++	if (w->sctlr != S3B_SCTLR || (w->fsr & SMMU_FSR_FAULT)) {
++		WL_FAIL(71, "bank-gone");                   /* our bank changed or faulted */
++	}
++	w->gfsr = rd(SMMU + SMMU_SGFSR);
++	w->gsyn1 = rd(SMMU + SMMU_SGFSYNR0 + 4);
++	w->cmd = rd(EP_COMMAND);
++	w->bar = rd(EP_BAR0) & ~0xfu;
++	w->rpcmd = rd(DBI_COMMAND);
++	if (!(w->cmd & 0x2u) || w->bar < WM_MEM_BASE || w->bar > WM_MEM_LAST || !wl_ptr(w->bar)) {
++		WL_FAIL(71, "no-bar");                      /* run `wifimhi` first */
++	}
++	if (!(w->cmd & (1u << 20))) {
++		WL_FAIL(71, "no-cap-list");
++	}
++	cap = rd(S3_CFG(0x34)) & 0xfcu;
++	w->pcap = 0;
++	w->mcap = 0;
++	for (unsigned guard = 0; cap >= 0x40 && guard < 48; guard++) {
++		uint32_t v = rd(S3_CFG(cap));
++
++		if ((v & 0xffu) == 0x10u) {
++			w->pcap = cap;
++		} else if ((v & 0xffu) == 0x05u) {
++			w->mcap = cap;
++		}
++		cap = (v >> 8) & 0xfcu;
++	}
++	if (!w->pcap || !w->mcap) {
++		WL_FAIL(71, "no-msi-cap");
++	}
++	w->msi = rd(S3_CFG(w->mcap));                    /* upper half: bit16 enable, 19:17 capable, 22:20 enabled, 23 64-bit */
++	w->msia = rd(S3_CFG(w->mcap + 4));
++	w->msia2 = rd(S3_CFG(w->mcap + 8));
++	w->msid = w->msi & (1u << 23) ? rd(S3_CFG(w->mcap + 0xc)) : w->msia2;
++	w->dev = rd(S3_CFG(w->pcap + 0x08));             /* DEVCTL */
++	w->lnk = rd(S3_CFG(w->pcap + 0x10));             /* LNKCTL: bits 1:0 ASPM */
++	w->step = 71;
++	return true;
++}
++
++/* ---- what 1: ASPM off + MSI on ---------------------------------------------------------- */
++static bool
++s3c_msi(struct s3c_run *w)
++{
++	uint32_t v;
++
++	/* 72: ASPM off in the endpoint's LNKCTL. rui:270-272. Only needed when it is on
++	 * (11-11: lnk 10110000 = already off, bit 1:0 = 0). */
++	s3b_wmark(72, 0);
++	if (w->lnk & S3C_LNK_ASPM_MASK) {
++		s3b_wmark(72, 1);
++		s3c.lnk_orig = w->lnk;
++		wr(S3_CFG(w->pcap + 0x10), w->lnk & ~S3C_LNK_ASPM_MASK);
++		w->lnk = rd(S3_CFG(w->pcap + 0x10));
++		if (w->lnk & S3C_LNK_ASPM_MASK) {
++			WL_FAIL(72, "aspm-stuck");
++		}
++		s3c.flags |= S3C_F_ASPM_OFF;
++	}
++	w->step = 72;
++
++	/* 73: MSI capability: address = sink IOVA, data = 0, control = 4 vectors + enable.
++	 * Order: address first, then control, as rui:275-278. */
++	s3b_wmark(73, 0);
++	if (!wm_link()) {
++		WL_FAIL(73, "link-dropped");
++	}
++	s3c.msi_orig = w->msi;
++	s3c.msia_orig = w->msia;
++	s3c.msia2_orig = w->msia2;
++	s3c.msid_orig = w->msid;
++	if (w->msi & (1u << 16)) {
++		WL_FAIL(73, "msi-already-on");              /* does not undo: it was already on (likely a second call) */
++	}
++	s3b_wmark(73, 1);
++	wr(S3_CFG(w->mcap + 4), (uint32_t)S3C_MSI_ADDR);
++	if (w->msi & (1u << 23)) {                       /* 64-bit capable (11-11: msi 10a7005 → bit 23 = 1) */
++		s3b_wmark(73, 2);
++		wr(S3_CFG(w->mcap + 8), 0);               /* addr high = 0 (S3C_MSI_ADDR is below 4 GiB) */
++		s3b_wmark(73, 3);
++		wr(S3_CFG(w->mcap + 0xc), 0);               /* data = 0 (rui:277) */
++	} else {
++		s3b_wmark(73, 2);
++		wr(S3_CFG(w->mcap + 8), 0);                 /* data = 0 (rui:278) */
++	}
++	v = (w->msi & 0xffffu) | (((w->msi >> 16) & ~S3C_MSI_CTL_CLR) | S3C_MSI_CTL_SET) << 16;
++	s3b_wmark(73, 4);
++	wr(S3_CFG(w->mcap), v);
++	w->msi = rd(S3_CFG(w->mcap));
++	w->msia = rd(S3_CFG(w->mcap + 4));
++	if (w->msi & (1u << 23)) {
++		w->msia2 = rd(S3_CFG(w->mcap + 8));
++		w->msid = rd(S3_CFG(w->mcap + 0xc));
++	} else {
++		w->msia2 = 0;
++		w->msid = rd(S3_CFG(w->mcap + 8));
++	}
++	if (!(w->msi & (1u << 16))) {
++		WL_FAIL(73, "msi-not-on");
++	}
++	if (w->msia != (uint32_t)S3C_MSI_ADDR) {
++		WL_FAIL(73, "msi-addr-rb");
++	}
++	s3c.mcap = w->mcap;
++	s3c.flags |= S3C_F_MSI;
++	w->step = 73;
++	return true;
++}
++
++/* ---- what 2: bus master on, then observe ------------------------------------------------ */
++static bool
++s3c_bm(struct s3c_run *w)
++{
++	uint32_t n;
++	uint64_t cb;
++
++	/* 74. Prerequisite: survey + MSI on (S3C_F_MSI). Bus master on the endpoint: bit 2
++	 * of Command. rui:261. The root port's bus master is already set (wm_step 18). */
++	s3b_wmark(74, 0);
++	if (!(s3c.flags & S3C_F_MSI)) {
++		WL_FAIL(74, "msi-not-done");                 /* run `wifis3c msi` first */
++	}
++	if (!wm_link()) {
++		WL_FAIL(74, "link-dropped");
++	}
++	s3c.cmd_orig = w->cmd;
++	s3b_wmark(74, 1);
++	wr(S3_CFG(0x04), (w->cmd & 0xffffu) | S3C_CMD_BM);
++	w->cmd = rd(S3_CFG(0x04));
++	if (!(w->cmd & S3C_CMD_BM)) {
++		WL_FAIL(74, "bm-not-on");
++	}
++	if (!wm_link()) {
++		/* link dropped on the first config write: leave BM on and stop */
++		WL_FAIL(74, "link-dropped-after");
++	}
++	s3c.flags |= S3C_F_BM;
++	w->step = 74;
++
++	/* 75: observe the bank for 2 s (20 polls at 100 ms). The chip can now send DMA requests
++	 * (MSI writes to the sink, BHI reads from the arena). rui's PBL rejects in ~300 ms
++	 * (periph17), so 2 s covers the first reaction. For each poll: read bank FSR/FAR,
++	 * sGFSR, link state, BHI STATUS; if a fault appears, stop immediately and turn off BM.
++	 * rui:14: after a failed start, MSI + BM on → ~55 s reset; this avoids that. */
++	s3b_wmark(75, 0);
++	{
++		uint32_t id1 = rd(SMMU + SMMU_IDR1);
++		uint32_t shift = (id1 >> 31) ? 16 : 12;
++		uint32_t pages = 2u << ((id1 >> 28) & 7u);
++
++		cb = SMMU + ((uint64_t)(pages + w->cb) << shift);
++	}
++	for (n = 0; n < S3C_POLL_N; n++) {
++		uint32_t fl = 0, fsr, gfsr;
++
++		wl_sleep_ms(S3C_POLL_MS);
++		fsr = rd(cb + SMMU_CB_FSR);
++		gfsr = rd(SMMU + SMMU_SGFSR);
++		if (!(fsr & SMMU_FSR_FAULT)) {
++			fl |= 1u;                                /* bit 0: bank FSR clean */
++		} else {
++			w->obs_fsr = fsr;
++			w->obs_far_lo = rd(cb + 0x60);
++			w->obs_far_hi = rd(cb + 0x64);
++			w->ek = 1;
++		}
++		if (!gfsr) {
++			fl |= 2u;                                /* bit 1: global fault register clean */
++		} else if (!w->ek) {
++			w->ek = 2;
++		}
++		if (wm_link()) {
++			fl |= 4u;                                /* bit 2: link up */
++		} else if (!w->ek) {
++			w->ek = 3;
++		}
++		{
++			uint32_t bi = rd(w->bar + 0x28u);        /* BHIOFF */
++			uint32_t bs = 0;
++
++			if (bi && !(bi & 3u) && bi < WL_PAGE - 0x40) {
++				bs = rd(w->bar + bi + 0x2cu);        /* BHI STATUS */
++			}
++			if (bs != 0xffffffffu) {
++				fl |= 8u;                            /* bit 3: BHI answers (not dead link) */
++			}
++			if (bs == 0xffffffffu && !w->ek) {
++				w->ek = 4;
++			}
++			if (n == 0) {
++				w->obs_bhi = bs;
++			}
++		}
++		if (rd(S3_CFG(0x04)) & S3C_CMD_BM) {
++			fl |= 16u;                               /* bit 4: BM still on */
++		} else if (!w->ek) {
++			w->ek = 5;
++		}
++		w->obs[n] = fl;
++		if (w->ek) {
++			break;                                   /* fault detected: stop the poll and turn BM off */
++		}
++	}
++	w->polls = n + 1;
++	if (w->ek) {
++		/* fault seen: turn bus master off immediately */
++		s3b_wmark(75, 1);
++		wr(S3_CFG(0x04), rd(S3_CFG(0x04)) & ~S3C_CMD_BM);
++		WL_FAIL(75, "fault");
++	}
++	s3c.flags |= S3C_F_OBSERVED;
++	w->step = 75;
++	return true;
++}
++
++/* Take the chip off the bus: bus master off, then MSI off. Stage 3d calls this when the boot loader load fails
++ * (the precedent reset ~55 s after a failed start with MSI and bus mastering left on). Caller holds wl_busy and
++ * has checked the link. */
++static void
++s3c_stop_dma(void)
++{
++	if (s3c.flags & S3C_F_BM) {
++		s3b_wmark(79, 11);
++		wr(S3_CFG(0x04), (rd(S3_CFG(0x04)) & 0xffffu) & ~S3C_CMD_BM);
++		s3c.flags &= ~(S3C_F_BM | S3C_F_OBSERVED);
++	}
++	if ((s3c.flags & S3C_F_MSI) && s3c.mcap) {
++		s3b_wmark(79, 12);
++		wr(S3_CFG(s3c.mcap), s3c.msi_orig);          /* the control word as it was: MSI disabled */
++		s3c.flags &= ~S3C_F_MSI;
++	}
++}
++
++/* ---- what 9: undo ----------------------------------------------------------------------- */
++/* Bus master off first (stops DMA), then MSI off (rui:1095-1099 stack shutdown order). */
++static bool
++s3c_undo(struct s3c_run *w)
++{
++	s3b_wmark(79, 0);
++	if (!(s3c.flags & (S3C_F_BM | S3C_F_MSI))) {
++		WL_FAIL(79, "nothing");
++	}
++	if (s3c.flags & S3C_F_BM) {
++		s3b_wmark(79, 1);
++		wr(S3_CFG(0x04), (rd(S3_CFG(0x04)) & 0xffffu) & ~S3C_CMD_BM);
++		s3c.flags &= ~S3C_F_BM;
++	}
++	if (s3c.flags & S3C_F_MSI) {
++		if (s3c.flags & S3C_F_ASPM_OFF) {
++			s3b_wmark(79, 2);
++			wr(S3_CFG(w->pcap + 0x10), s3c.lnk_orig);
++			s3c.flags &= ~S3C_F_ASPM_OFF;
++		}
++		s3b_wmark(79, 3);
++		wr(S3_CFG(w->mcap), s3c.msi_orig);
++		s3b_wmark(79, 4);
++		wr(S3_CFG(w->mcap + 4), s3c.msia_orig);
++		if (s3c.msi_orig & (1u << 23)) {
++			s3b_wmark(79, 5);
++			wr(S3_CFG(w->mcap + 8), s3c.msia2_orig);
++			s3b_wmark(79, 6);
++			wr(S3_CFG(w->mcap + 0xc), s3c.msid_orig);
++		} else {
++			s3b_wmark(79, 5);
++			wr(S3_CFG(w->mcap + 8), s3c.msid_orig);
++		}
++		s3c.flags &= ~S3C_F_MSI;
++	}
++	s3c.flags &= ~S3C_F_OBSERVED;
++	w->step = 79;
++	return true;
++}
++
++/* Append to line[] (the report functions): never writes outside it, k stays below sizeof(line). */
++#ifndef S3_ADD
++#define S3_ADD(...) do { \
++	if (k < 0) { k = 0; } \
++	if (k < (int)sizeof(line) - 1) { \
++		int a_ = snprintf(line + k, sizeof(line) - (size_t)k, __VA_ARGS__); \
++		if (a_ > 0) { k += a_; } \
++	} \
++	if (k > (int)sizeof(line) - 1) { k = (int)sizeof(line) - 1; } \
++} while (0)
++#endif
++
++/* ---- the reply -------------------------------------------------------------------------- */
++static int
++s3c_report(const struct s3c_run *w, char *reply, size_t reply_len)
++{
++	char line[640];
++	int k = 0;
++	unsigned i;
++
++	k = snprintf(line, sizeof(line),
++	    "[PONG_WIFI] s3c w%d st %d %s fl %x/%x cb %u smr %u:%x sctlr %x fsr %x "
++	    "gfsr %x/%x cmd %x bar %x rp %x cap %x/%x ",
++	    w->what, w->step, w->why ? w->why : "?", w->fl, s3c.flags, w->cb, w->smr, w->smr_val, w->sctlr, w->fsr,
++	    w->gfsr, w->gsyn1, w->cmd, w->bar, w->rpcmd, w->pcap, w->mcap);
++	if (k < 0) {
++		k = 0;
++	}
++	if (k > (int)sizeof(line) - 1) {
++		k = (int)sizeof(line) - 1;
++	}
++	switch (w->what) {
++	case 0:
++		S3_ADD(
++		    "msi %x a %x/%x d %x lnk %x dev %x\n",
++		    w->msi, w->msia, w->msia2, w->msid, w->lnk, w->dev);
++		break;
++	case 1:
++		S3_ADD(
++		    "msi %x>%x a %x>%x d %x>%x\n",
++		    s3c.msi_orig, w->msi, s3c.msia_orig, w->msia, s3c.msid_orig, w->msid);
++		break;
++	case 2:
++		S3_ADD(
++		    "cmd %x>%x polls %u ek %u fsr %x far %x:%x bhi %x obs",
++		    s3c.cmd_orig, w->cmd, w->polls, w->ek, w->obs_fsr, w->obs_far_lo, w->obs_far_hi, w->obs_bhi);
++		if (k < 0) {
++			k = 0;
++		}
++		for (i = 0; i < w->polls && i < S3C_POLL_N; i++) {
++			S3_ADD(
++			    " %x", w->obs[i]);
++		}
++		S3_ADD(
++		    "\n");
++		break;
++	default:
++		S3_ADD(
++		    "cmd %x msi %x lnk %x\n", w->cmd, w->msi, w->lnk);
++		break;
++	}
++	if (k > 0) {
++		pong_ramoops_diagnostic_write(line, k < (int)sizeof(line) ? k : (int)sizeof(line) - 1);
++	}
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++int
++pong_wifi_stage3c(char *reply, size_t reply_len, int what)
++{
++	struct s3c_run s = { .step = 0, .why = "OK", .what = what };
++	int rc;
++
++	if (what != 0 && what != 1 && what != 2 && what != 9) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3c bad what\n", reply_len);
++		}
++		return -101;
++	}
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3c busy\n", reply_len);
++		}
++		return -100;
++	}
++	/* 1: pages from `wifiup` + SMMU (no register is touched). */
++	s3b_wmark(1, 0);
++	if (!wl_map() || !wl_ptr(SMMU)) {
++		s.step = -1;
++		s.why = "map";
++	} else {
++		s.step = 1;
++		if (s3c_survey(&s)) {
++			switch (what) {
++			case 1:
++				(void)s3c_msi(&s);
++				break;
++			case 2:
++				(void)s3c_bm(&s);
++				break;
++			case 9:
++				(void)s3c_undo(&s);
++				break;
++			default:
++				break;
++			}
++		}
++	}
++	rc = s3c_report(&s, reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
++
++/*
++ * Stage 3d of the SM-T970 Wi-Fi bring-up: copy the QCA6390 boot loader (first 512 KiB of
++ * amss20.bin) into the 4 MiB arena at IOVA 0xa0000000, clean it to DRAM, verify each chunk
++ * against the uncached view, then run a sw_reset sequence from ath11k and program the BHI
++ * registers to start the transfer. Poll the BHI STATUS register at 1 ms intervals until the
++ * device accepts the image (bits 31:30 = 2 = success) or rejects it (bits 31:30 = 3, ERRCODE
++ * gives the reason) or times out (rui's default 20 s; the PBL reports in ~300 ms: periph17).
++ *
++ * It uses these pieces of the code above unchanged:
++ *   rd(), wr(), wl_ptr(), wl_map(), wl_alive(), wm_link(), wl_spin_us(), wl_sleep_ms(),
++ *   wl_now_us(), WL_FAIL(), struct wl, wl_busy, WL_PAGE,
++ *   SMMU, SMMU_SGFSR, SMMU_SGFSYNR0, SMMU_SGFSYNR1, SMMU_CB_SCTLR, SMMU_CB_FSR, SMMU_FSR_FAULT,
++ *   s3b (global: flags, cb, smr, smr_val, chunk[], chunk_pa[], chunks),
++ *   s3b_clean(), s3b_wmark(), S3B_F_SMR, S3B_F_BANK, S3B_SCTLR, S3B_IOVA, S3B_ARENA,
++ *   S3B_CHUNK, S3B_CHUNKS, S3B_SINK, S3B_LINE, S3B_LEAF,
++ *   s3c (global: flags S3C_F_MSI|S3C_F_BM|S3C_F_OBSERVED),
++ *   pong_ramoops_diagnostic_write().
++ *
++ * pong_fw_lookup() is declared extern (supplied by another module; 0 = found).
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/T970WifiProbe.cpp wifiStage5() lines 636-679 (firmware open, copy, clean, DRAM
++ *   check), lines 688-738 (ath11k sw_reset), lines 744-786 (BHI begin, step until READY,
++ *   PBL diagnostics);
++ *   package/MhiBoot.inc lines 33-43 (start_sbl: INTVEC/STATUS/IMGADDR/IMGSIZE/IMGTXDB),
++ *   lines 92-101 (step: BHI STATUS poll → success/error).
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ * Cross-checked against the stock T970 DTS and the 11-11 half20 log (ee 0, BHI status 0/0).
++ *
++ * Entry points (USB commands after `wifiup`, `wifimhi`, `wifis3a`, `wifis3b`, `wifis3c`):
++ *   int pong_wifi_stage3d(char *reply, size_t reply_len, int what);
++ *     what 0 `wifis3d`       read only: 3c flags, fw_lookup result & size, BHI registers,
++ *                             args that would be sent (image addr/size, seq)
++ *     what 1 `wifis3d copy`  copy 0x80000 B from amss20.bin into arena, dc civac, DRAM compare
++ *     what 2 `wifis3d go`    sw_reset → BHI program → poll BHI STATUS at 1 ms intervals
++ * Steps (a negative step is the one that failed, `why` names the check):
++ *   1 mapped, 81 survey, 83 firmware, 85 copy + DRAM check, 87 sw_reset, 88 BHI + poll, 89 timeout/result.
++ * pmsg: "[PONG_WIFI] S<step>" before each step, "[PONG_WIFI] S<step> W<n>" before each write.
++ * No `undo`: BHI can't be undone; use `wifis3c undo` + `wifis3b undo` + `wifidown`.
++ */
++
++extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
++
++/* ---- tuning knobs ------------------------------------------------------------------------- */
++#define S3D_SBL_BYTES       0x80000u               /* rui:474 kSblBytes */
++#define S3D_BHI_POLL_MS     1u                     /* poll interval (rui polls every 1 ms in the loop:751-772) */
++#define S3D_BHI_TIMEOUT_MS  5000u                  /* rui:751 allows 20 s; its boot loader answered within ~0.3 s either way,
++                                                    * and this runs in the USB command thread */
++#define S3D_EE_WAIT_MS      2000u                  /* after BHI success: wait for the execution environment to leave PBL */
++#define S3D_SW_RESET_DELAY   100u                  /* rui:712 IODelay(100000) = 100 ms before LTSSM check */
++
++/* ---- windowed BAR access above 512 KiB (rui:696-702) ------------------------------------ */
++/* The window register at BAR offset 0x310c selects which 512 KiB region of the chip's address
++ * space appears at BAR offset 0x80000. After writing it, read/write BAR + 0x80000 + (off & 0x7ffff).
++ * The caller must have mapped bar_addr + 0x80000 through wl_ptr(). */
++#define S3D_WIN_REG         0x310cu
++#define S3D_WIN_PAGE        0x80000u
++#define S3D_WIN_SEL(v)      (0x40000000u | (((v) >> 19) & 0x3fu))
++#define S3D_WIN_OFF(v)      (S3D_WIN_PAGE + ((v) & 0x7ffffu))
++
++/* ---- state -------------------------------------------------------------------------------- */
++static struct {
++	uint32_t flags;
++	const uint8_t *fw;                            /* amss20.bin pointer, once */
++	uint32_t fw_len;                              /* 0x42fa20 = 4,389,024 B (rui:638) */
++	uint32_t sbl_seq;                             /* IMGTXDB value */
++	vm_offset_t dram[8];                          /* uncached (ml_io_map) view of the first eight arena chunks */
++} s3d;
++
++#define S3D_F_FW           1u    /* pong_fw_lookup("amss20.bin") succeeded */
++#define S3D_F_COPIED       2u    /* the first 0x80000 bytes are in the arena, cleaned, and DRAM-matched */
++#define S3D_F_SENT         4u    /* BHI registers were written and the transfer started */
++
++struct s3d_run {
++	int step;
++	const char *why;
++	int what;
++	uint32_t fl3b, fl3c;                          /* s3b.flags, s3c.flags */
++	uint32_t cb, smr, smr_val, sctlr, fsr;          /* s3b's bank state */
++	uint32_t bar;                                   /* BAR0 address */
++	uint32_t shift, pages;                          /* SMMU geometry (from IDR1 read locally) */
++	uint32_t ee, bhi_status, bhi_err, bhi_off;      /* before */
++	uint32_t fw_found, fw_len;                      /* pong_fw_lookup result, fw length */
++	uint32_t arena_written;                         /* bytes copied to arena so far */
++	uint32_t dram_diff[8];                          /* DRAM-check: 0 = chunk matched; non-zero = first mismatching word offset+1 */
++	uint32_t dram_pages;                            /* pages checked */
++	uint32_t reset_done;                            /* sw_reset completed (bit per substep) */
++	uint32_t mhictrl, mhistatus;                    /* after sw_reset */
++	uint32_t seq;                                   /* IMGTXDB value sent */
++	uint32_t bhi_written[5];                        /* INTVEC, STATUS, IMGADDR_HIGH, IMGADDR_LOW, IMGSIZE after write */
++	uint32_t poll_ms, poll_n;                       /* time spent polling, polls done */
++	uint32_t poll_ee, poll_st, poll_err;            /* after polling: EE, BHI STATUS, ERRCODE */
++	uint32_t poll_err_dbg[3];                       /* ERRDBG1..3 at the first error */
++	uint32_t poll_fsr, poll_far_lo, poll_far_hi;    /* bank FSR/FAR at failure */
++	uint32_t poll_gfsr;                             /* sGFSR at failure */
++	uint32_t pbl[25];                               /* PBL diagnostic registers (rui:781-785) */
++};
++
++/* ---- the survey: reads only, run before every write step -------------------------------- */
++static bool
++s3d_survey(struct s3d_run *w)
++{
++	struct wl l = { .step = 0 };
++	uint32_t id1, bhi;
++
++	/* 81. Prerequisites: 3b SMR live, 3c done (MSI + BM + observation), link up, BAR0 mapped
++	 * and with BHIOFF pointing inside the mapped page. Also reads the SMMU geometry for
++	 * the bank base address (same as 3b's s3b_survey reads). */
++	s3b_wmark(81, 0);
++	w->fl3b = s3b.flags;
++	w->fl3c = s3c.flags;
++	w->cb = s3b.cb;
++	w->smr = s3b.smr;
++	w->smr_val = s3b.smr_val;
++	if ((w->fl3b & (S3B_F_SMR | S3B_F_BANK)) != (S3B_F_SMR | S3B_F_BANK) || w->cb >= 128) {
++		WL_FAIL(81, "no-3b");
++	}
++	if (w->what != 0 && (w->fl3c & (S3C_F_MSI | S3C_F_BM | S3C_F_OBSERVED)) != (S3C_F_MSI | S3C_F_BM | S3C_F_OBSERVED)) {
++		WL_FAIL(81, "no-3c");                       /* run `wifis3c msi` + `wifis3c bm` first */
++	}
++	if (!wl_alive(&l)) {
++		WL_FAIL(81, "link-not-up");
++	}
++	if (!wm_link()) {
++		WL_FAIL(81, "dll-down");
++	}
++	w->bar = rd(EP_BAR0) & ~0xfu;
++	if (w->bar < WM_MEM_BASE || w->bar > WM_MEM_LAST) {
++		WL_FAIL(81, "no-bar");                      /* run `wifimhi` first */
++	}
++	if (!wl_ptr(w->bar)) {
++		WL_FAIL(81, "bar-map");
++	}
++	/* SMMU geometry for the bank base address (read locally, same as 3b step 51). */
++	id1 = rd(SMMU + SMMU_IDR1);
++	w->shift = (id1 >> 31) ? 16 : 12;
++	w->pages = 2u << ((id1 >> 28) & 7u);
++	{
++		uint64_t cb = SMMU + ((uint64_t)(w->pages + w->cb) << w->shift);
++
++		if (!wl_ptr(cb)) {
++			WL_FAIL(81, "bank-map");
++		}
++		w->sctlr = rd(cb + SMMU_CB_SCTLR);
++		w->fsr = rd(cb + SMMU_CB_FSR);
++		/* sGFSR snapshot for the `go` step's pre-transfer baseline (rui:745) */
++		w->poll_gfsr = rd(SMMU + SMMU_SGFSR);
++	}
++	if (w->sctlr != S3B_SCTLR || (w->fsr & SMMU_FSR_FAULT)) {
++		WL_FAIL(81, "bank-gone");
++	}
++	bhi = rd(w->bar + 0x28u);                        /* BHIOFF */
++	if (!bhi || (bhi & 3u) || bhi >= WL_PAGE - 0x40) {
++		WL_FAIL(81, "bhi-off");                     /* expected 0x100 */
++	}
++	w->bhi_off = bhi;
++	w->ee = rd(w->bar + bhi + 0x28u);                /* BHI EXECENV */
++	w->bhi_status = rd(w->bar + bhi + 0x2cu);        /* BHI STATUS */
++	w->bhi_err = rd(w->bar + bhi + 0x30u);           /* BHI ERRCODE */
++	if (w->ee != 0 && w->what != 0) {
++		WL_FAIL(81, "ee-not-pbl");                  /* expected 0 (PBL), rui:55 mhi_boot_begin */
++	}
++
++	/* firmware lookup via pong_fw_lookup (assumes USB command has loaded it). */
++	{
++		const uint8_t *data = NULL;
++		uint32_t len = 0;
++
++		/* looked up on every call: a later `fwput` of the same name replaces the buffer */
++		if (pong_fw_lookup("amss20.bin", &data, &len) == 0 && data && len) {
++			s3d.fw = data;
++			s3d.fw_len = len;
++			s3d.flags |= S3D_F_FW;
++		} else {
++			s3d.fw = NULL;
++			s3d.fw_len = 0;
++			s3d.flags &= ~S3D_F_FW;
++		}
++	}
++	w->fw_found = (s3d.flags & S3D_F_FW) ? 1 : 0;
++	w->fw_len = s3d.fw_len;
++	w->step = 81;
++	return true;
++}
++
++/* ---- windowed BAR access helpers -------------------------------------------------------- */
++static uint32_t
++s3d_win_rd(uint32_t bar_addr, uint32_t off)
++{
++	const volatile uint32_t *p;
++
++	if (off < S3D_WIN_PAGE) {
++		return rd(bar_addr + off);
++	}
++	wr(bar_addr + S3D_WIN_REG, S3D_WIN_SEL(off));
++	/* rd() does dsb sy after each read; the window register write must be visible first */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	p = wl_ptr(bar_addr + S3D_WIN_OFF(off));
++	return p ? *p : 0xffffffffu;
++}
++
++static void
++s3d_win_wr(uint32_t bar_addr, uint32_t off, uint32_t val)
++{
++	if (off < S3D_WIN_PAGE) {
++		wr(bar_addr + off, val);
++		return;
++	}
++	wr(bar_addr + S3D_WIN_REG, S3D_WIN_SEL(off));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	{
++		volatile uint32_t *p = wl_ptr(bar_addr + S3D_WIN_OFF(off));
++
++		if (p) {
++			*p = val;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---- what 1: copy firmware into arena, clean, DRAM verify ------------------------------- */
++static bool
++s3d_copy(struct s3d_run *w)
++{
++	uint32_t left, off = 0;
++
++	/* 85. Prerequisite: S3D_F_FW, the arena allocated (S3B_F_MEM), and no transfer in flight. */
++	s3b_wmark(85, 0);
++	if (!(s3d.flags & S3D_F_FW)) {
++		WL_FAIL(85, "no-fw");
++	}
++	if (!(s3b.flags & S3B_F_MEM) || !s3b.chunks) {
++		WL_FAIL(85, "no-arena");                    /* run `wifis3b bank` first */
++	}
++	if (s3d.flags & S3D_F_SENT) {
++		WL_FAIL(85, "already-sent");                /* BHI was already sent; the arena may have been read */
++	}
++	if (s3d.fw_len < S3D_SBL_BYTES) {
++		WL_FAIL(85, "fw-too-small");
++	}
++
++	/* Copy the first 512 KiB of amss20.bin into the arena at offset 0 (IOVA 0xa0000000).
++	 * The arena is 64 KiB chunks; S3D_SBL_BYTES = 0x80000 = 8 chunks. */
++	left = S3D_SBL_BYTES;
++	for (uint32_t c = 0; c < 8 && c < S3B_CHUNKS && left; c++) {
++		uint32_t n = left < S3B_CHUNK ? left : S3B_CHUNK;
++
++		if (!s3b.chunk[c]) {
++			WL_FAIL(85, "arena-hole");              /* chunk not allocated */
++		}
++		memcpy(s3b.chunk[c], s3d.fw + off, n);    /* both ordinary kernel RAM (the arena is not a device mapping) */
++		s3b_clean(s3b.chunk[c], n);               /* dc civac, as stage 5 does (rui:657) */
++		off += n;
++		left -= n;
++	}
++	w->arena_written = S3D_SBL_BYTES - left;
++
++	/* DRAM, not the cache: every word of every chunk through an uncached mapping of the chunk (the precedent
++	 * failed with ef128100 while cache and DRAM disagreed, rui:661-679). wl_ptr() maps 16 KiB only, so each
++	 * 64 KiB chunk gets a mapping of its own, once. */
++	w->dram_pages = 0;
++	for (uint32_t c = 0; c < 8 && c * S3B_CHUNK < w->arena_written; c++) {
++		const volatile uint32_t *u;
++		const uint32_t *cached = (const uint32_t *)s3b.chunk[c];
++
++		if (!s3d.dram[c]) {
++			s3d.dram[c] = ml_io_map((vm_offset_t)s3b.chunk_pa[c], S3B_CHUNK);
++		}
++		if (!s3d.dram[c]) {
++			WL_FAIL(85, "dram-map");
++		}
++		u = (const volatile uint32_t *)s3d.dram[c];
++		for (uint32_t k = 0; k < S3B_CHUNK / 4; k++) {
++			if (u[k] != cached[k]) {
++				if (!w->dram_diff[c]) {
++					w->dram_diff[c] = k * 4 + 1;      /* byte offset + 1 of the first difference */
++				}
++				w->dram_pages++;                  /* differing words in all */
++			}
++		}
++	}
++	if (w->dram_pages) {
++		WL_FAIL(85, "dram-mismatch");
++	}
++	if (w->arena_written < S3D_SBL_BYTES) {
++		WL_FAIL(85, "copy-short");
++	}
++	s3d.flags |= S3D_F_COPIED;
++	w->step = 85;
++	return true;
++}
++
++/* ---- what 2: sw_reset + BHI + poll ------------------------------------------------------ */
++/* sw_reset: rui:688-738 (ath11k_pci_sw_reset power-on sequence, Linux v6.6 pci.c qca6390_regs).
++ * BHI: MhiBoot.inc:33-41 (start_sbl). Poll: rui:751-772 (step every ms, up to 20 s). */
++static bool
++s3d_sw_reset(struct s3d_run *w)
++{
++	uint32_t bar_addr = w->bar, v;
++
++	s3b_wmark(87, 0);
++
++	/* map the window page (bar + 0x80000) for accesses above 512 KiB */
++	if (!wl_ptr(bar_addr + S3D_WIN_PAGE)) {
++		WL_FAIL(87, "win-map");
++	}
++
++	/* 100 ms delay (rui:712) */
++	wl_sleep_ms(S3D_SW_RESET_DELAY);
++
++	/* PARF LTSSM = 0x111 (rui:713-714, periph19) */
++	v = s3d_win_rd(bar_addr, 0x1e081b0u);
++	for (unsigned i = 0; v != 0x111u && i < 5; i++) {
++		s3d_win_wr(bar_addr, 0x1e081b0u, 0x111u);
++		v = s3d_win_rd(bar_addr, 0x1e081b0u);
++		if (v == 0xffffffffu) {
++			wl_sleep_ms(5);
++		}
++	}
++	s3b_wmark(87, 1);
++
++	/* HOT_RST (rui:716) */
++	v = s3d_win_rd(bar_addr, 0x1e402bcu);
++	s3d_win_wr(bar_addr, 0x1e402bcu, v | 0x10u);
++	wl_sleep_ms(5);
++	s3b_wmark(87, 2);
++
++	/* INT_ALL_CLEAR (rui:719) */
++	s3d_win_wr(bar_addr, 0x1e08228u, 0xffffffffu);
++	s3b_wmark(87, 3);
++
++	/* WLAON_QFPROM_PWR_CTRL: VDD4BLOW and SHUTDOWN_EN off (rui:721) */
++	v = s3d_win_rd(bar_addr, 0x1f8031cu);
++	s3d_win_wr(bar_addr, 0x1f8031cu, v & ~5u);
++	s3b_wmark(87, 4);
++
++	/* fix_l1ss (rui:723-724): four register writes */
++	s3d_win_wr(bar_addr, 0x1e0c0acu, 0x10u);
++	s3d_win_wr(bar_addr, 0x1e0c628u, 0x02u);
++	s3d_win_wr(bar_addr, 0x1e0c62cu, 0x52u);
++	s3d_win_wr(bar_addr, 0x1e0c634u, 0xffu);
++	s3b_wmark(87, 5);
++
++	/* clear MHI vectors (rui:725) */
++	wr(bar_addr + 0x360u, 0);
++	wr(bar_addr + 0x368u, 0);
++	wr(bar_addr + 0x394u, 0);
++	wr(bar_addr + 0x39cu, 0);
++	s3b_wmark(87, 6);
++
++	/* read Q6 cookie and WARM_SW_ENTRY (rui:727-728) */
++	(void)s3d_win_rd(bar_addr, 0x1f80500u);
++	(void)s3d_win_rd(bar_addr, 0x1f80504u);
++	wl_sleep_ms(10);
++	s3d_win_wr(bar_addr, 0x1f80504u, 0);           /* clear WARM_SW_ENTRY (rui:729) */
++	wl_sleep_ms(10);
++	s3b_wmark(87, 7);
++
++	/* SOC_GLOBAL_RESET toggle (rui:732-733) */
++	(void)s3d_win_rd(bar_addr, 0x1f8060cu);         /* SOC_RESET_CAUSE (read-clear) */
++	v = s3d_win_rd(bar_addr, 0x3008u);
++	s3d_win_wr(bar_addr, 0x3008u, v | 1u);
++	wl_sleep_ms(10);
++	s3d_win_wr(bar_addr, 0x3008u, v & ~1u);
++	wl_sleep_ms(10);
++	s3b_wmark(87, 8);
++
++	/* MHICTRL_RESET (rui:736), clears SYSERR that the reset leaves */
++	w->mhictrl = rd(bar_addr + 0x38u);
++	wr(bar_addr + 0x38u, 2u);                        /* MHICTRL_RESET = bit 1 */
++	wl_sleep_ms(10);
++	w->mhistatus = rd(bar_addr + 0x48u);
++	w->reset_done = 1;
++	w->step = 87;
++	s3b_wmark(87, 9);
++	return true;
++}
++
++static bool
++s3d_go(struct s3d_run *w)
++{
++	uint32_t bar_addr = w->bar, bhi = w->bhi_off;
++	uint32_t seq;
++
++	if (!(s3d.flags & S3D_F_COPIED)) {
++		WL_FAIL(87, "not-copied");                  /* run `wifis3d copy` first */
++	}
++	if (s3d.flags & S3D_F_SENT) {
++		WL_FAIL(87, "already-sent");                /* one attempt per boot: never retried by itself */
++	}
++	/* 87: sw_reset. Must run first (periph18: BHI succeeded, EE stayed PBL; periph19 added this). */
++	if (!s3d_sw_reset(w)) {
++		return false;
++	}
++
++	/* 88: BHI register writes, then poll. */
++	s3b_wmark(88, 0);
++
++	/* re-read BHIOFF after reset (the reset may have changed the MHI layout) */
++	bhi = rd(bar_addr + 0x28u);
++	if (!bhi || (bhi & 3u) || bhi >= WL_PAGE - 0x40) {
++		bhi = w->bhi_off;                            /* fall back to pre-reset value */
++	}
++
++	/* EE must be PBL (0) before we start (rui:55 mhi_boot_begin) */
++	if (rd(bar_addr + bhi + 0x28u) != 0) {           /* BHI EXECENV */
++		/* not PBL: the chip came up in a different state */
++		WL_FAIL(88, "not-pbl");
++	}
++
++	/* SYSERR check: if MHISTATUS shows SYSERR (bit 2), clear via MHICTRL RESET (rui:60) */
++	if (rd(bar_addr + 0x48u) & (1u << 2)) {
++		wr(bar_addr + 0x38u, 2u);                    /* MHICTRL_RESET */
++		wl_sleep_ms(10);
++	}
++
++	/* sequence number: any non-zero value ≤ 0x3fffffff (rui:747, MhiBoot.inc:52-53) */
++	seq = (uint32_t)(wl_now_us() & 0x3fffffffu);
++	if (!seq) {
++		seq = 1;
++	}
++	w->seq = seq;
++	s3d.sbl_seq = seq;
++
++	/* BHI registers: INTVEC = 0, STATUS = 0, IMGADDR = 0xa0000000, IMGSIZE = 0x80000,
++	 * IMGTXDB = seq. Order follows MhiBoot.inc:35-41 (start_sbl). */
++	s3b_wmark(88, 1);
++	w->bhi_written[0] = 0;
++	wr(bar_addr + bhi + 0x20u, 0);                   /* INTVEC = 0 (rui: no MSI vector) */
++
++	s3b_wmark(88, 2);
++	w->bhi_written[1] = 0;
++	wr(bar_addr + bhi + 0x2cu, 0);                   /* STATUS = 0 */
++
++	s3b_wmark(88, 3);
++	w->bhi_written[2] = 0;
++	wr(bar_addr + bhi + 0x0cu, 0);                   /* IMGADDR_HIGH = 0 */
++
++	s3b_wmark(88, 4);
++	w->bhi_written[3] = S3B_IOVA;
++	wr(bar_addr + bhi + 0x08u, S3B_IOVA);            /* IMGADDR_LOW = 0xa0000000 */
++
++	s3b_wmark(88, 5);
++	w->bhi_written[4] = S3D_SBL_BYTES;
++	wr(bar_addr + bhi + 0x10u, S3D_SBL_BYTES);       /* IMGSIZE = 0x80000 */
++
++	s3b_wmark(88, 6);
++	wr(bar_addr + bhi + 0x18u, seq);                 /* IMGTXDB (rui:40) */
++
++	s3d.flags |= S3D_F_SENT;
++	w->step = 88;
++
++	/* Poll BHI STATUS at 1 ms intervals (rui:751-772). Bits 31:30:
++	 *   2 = MHI_XFER_SUCCESS → go to READY wait
++	 *   3 = MHI_XFER_ERROR  → read ERRCODE, ERRDBG1..3, PBL diagnostics, stop
++	 *   0 = pending, not started yet → keep waiting
++	 *   1 = reserved
++	 * all-ones = dead link → keep waiting (rui:83: "not a status")
++	 */
++	s3b_wmark(88, 7);
++	{
++		uint32_t ms, bs, err, n_polls = 0;
++		uint64_t cb = SMMU + ((uint64_t)(w->pages + w->cb) << w->shift);
++
++		for (ms = 0; ms < S3D_BHI_TIMEOUT_MS; ms++) {
++			bs = rd(bar_addr + bhi + 0x2cu);         /* BHI STATUS */
++			if (bs == 0xffffffffu) {
++				goto next;
++			}
++			n_polls++;
++			if ((bs >> 30) == 2u) {                   /* success */
++				break;
++			}
++			if ((bs >> 30) == 3u) {                   /* error */
++				err = rd(bar_addr + bhi + 0x30u);     /* ERRCODE */
++				w->poll_err = err;
++				w->poll_err_dbg[0] = rd(bar_addr + bhi + 0x34u);  /* ERRDBG1: address the PBL read */
++				w->poll_err_dbg[1] = rd(bar_addr + bhi + 0x38u);
++				w->poll_err_dbg[2] = rd(bar_addr + bhi + 0x3cu);
++				/* read the bank FSR/FAR now (rui:759) */
++				w->poll_fsr = rd(cb + SMMU_CB_FSR);
++				w->poll_far_lo = rd(cb + 0x60);
++				w->poll_far_hi = rd(cb + 0x64);
++				w->poll_gfsr = rd(SMMU + SMMU_SGFSR);
++				/* PBL diagnostics (rui:781-785) — through the window for addresses > 512 KiB */
++				if (w->reset_done) {
++					w->pbl[0] = s3d_win_rd(bar_addr, 0x1b000f8u);
++					w->pbl[1] = s3d_win_rd(bar_addr, 0x1e22b34u);
++					w->pbl[2] = s3d_win_rd(bar_addr, 0x1910008u);
++					w->pbl[3] = s3d_win_rd(bar_addr, 0x1e0e238u);
++					w->pbl[4] = s3d_win_rd(bar_addr, 0x1f8031cu);
++					for (unsigned k = 0; k < 20; k++) {
++						w->pbl[5 + k] = s3d_win_rd(bar_addr, 0x1403d58u + 4 * k);
++					}
++				}
++				w->poll_ms = ms;
++				w->poll_n = n_polls;
++				s3c_stop_dma();
++				WL_FAIL(88, "bhi-error");
++			}
++		next:
++			wl_sleep_ms(S3D_BHI_POLL_MS);
++		}
++		w->poll_ms = ms;
++		w->poll_n = n_polls;
++		if (ms >= S3D_BHI_TIMEOUT_MS) {
++			w->poll_err = rd(bar_addr + bhi + 0x30u);
++			w->poll_fsr = rd(cb + SMMU_CB_FSR);
++			w->poll_far_lo = rd(cb + 0x60);
++			w->poll_far_hi = rd(cb + 0x64);
++			w->poll_gfsr = rd(SMMU + SMMU_SGFSR);
++			s3c_stop_dma();
++			WL_FAIL(88, "bhi-timeout");
++		}
++		/* success: read EE (should be 1 = SBL) and final status */
++		w->poll_st = bs;                             /* BHI STATUS */
++		for (uint32_t t = 0; t < S3D_EE_WAIT_MS; t += 10) {
++			w->poll_ee = rd(bar_addr + bhi + 0x28u); /* EE: 0 PBL, 1 SBL */
++			if (w->poll_ee != 0 && w->poll_ee != 0xffffffffu) {
++				break;
++			}
++			wl_sleep_ms(10);
++			w->poll_ms += 10;
++		}
++		w->poll_fsr = rd(cb + SMMU_CB_FSR);
++		w->poll_gfsr = rd(SMMU + SMMU_SGFSR);
++	}
++	w->step = 88;
++	return true;
++}
++
++/* Append to line[] (the report functions): never writes outside it, k stays below sizeof(line). */
++#ifndef S3_ADD
++#define S3_ADD(...) do { \
++	if (k < 0) { k = 0; } \
++	if (k < (int)sizeof(line) - 1) { \
++		int a_ = snprintf(line + k, sizeof(line) - (size_t)k, __VA_ARGS__); \
++		if (a_ > 0) { k += a_; } \
++	} \
++	if (k > (int)sizeof(line) - 1) { k = (int)sizeof(line) - 1; } \
++} while (0)
++#endif
++
++/* ---- the reply -------------------------------------------------------------------------- */
++static int
++s3d_report(const struct s3d_run *w, char *reply, size_t reply_len)
++{
++	char line[640];
++	int k = 0;
++
++	k = snprintf(line, sizeof(line),
++	    "[PONG_WIFI] s3d w%d st %d %s fl3b %x fl3c %x cb %u smr %u:%x sctlr %x fsr %x "
++	    "bar %x bhi %x ee %x ",
++	    w->what, w->step, w->why ? w->why : "?", w->fl3b, w->fl3c, w->cb, w->smr, w->smr_val, w->sctlr, w->fsr,
++	    w->bar, w->bhi_off, w->ee);
++	if (k < 0) {
++		k = 0;
++	}
++	if (k > (int)sizeof(line) - 1) {
++		k = (int)sizeof(line) - 1;
++	}
++	switch (w->what) {
++	case 0:
++		S3_ADD(
++		    "fw %u/%u status %x/%x\n",
++		    w->fw_found, w->fw_len, w->bhi_status, w->bhi_err);
++		break;
++	case 1:
++		S3_ADD(
++		    "copied %u fw %u/%u dram %u/%u diff %x/%x/%x/%x/%x/%x/%x/%x\n",
++		    w->arena_written, w->fw_found, w->fw_len, w->dram_pages, w->arena_written / 4096,
++		    w->dram_diff[0], w->dram_diff[1], w->dram_diff[2], w->dram_diff[3],
++		    w->dram_diff[4], w->dram_diff[5], w->dram_diff[6], w->dram_diff[7]);
++		break;
++	case 2:
++		S3_ADD(
++		    "rst %x mhi %x/%x seq %x bhi-wr intv %x st %x hi %x lo %x sz %x "
++		    "poll %ums/%u ee %x st %x fsr %x gfsr %x fl3c>%x",
++		    w->reset_done, w->mhictrl, w->mhistatus, w->seq,
++		    w->bhi_written[0], w->bhi_written[1], w->bhi_written[2], w->bhi_written[3], w->bhi_written[4],
++		    w->poll_ms, w->poll_n, w->poll_ee, w->poll_st, w->poll_fsr, w->poll_gfsr, s3c.flags);
++		if (k < 0) {
++			k = 0;
++		}
++		if (w->poll_err) {
++			S3_ADD(
++			    " err %x dbg %x/%x/%x fsr %x far %x:%x gfsr %x "
++			    "pbl %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
++			    w->poll_err, w->poll_err_dbg[0], w->poll_err_dbg[1], w->poll_err_dbg[2],
++			    w->poll_fsr, w->poll_far_lo, w->poll_far_hi, w->poll_gfsr,
++			    w->pbl[0], w->pbl[1], w->pbl[2], w->pbl[3],
++			    w->pbl[4],
++			    w->pbl[5], w->pbl[6], w->pbl[7], w->pbl[8], w->pbl[9],
++			    w->pbl[10], w->pbl[11], w->pbl[12], w->pbl[13], w->pbl[14],
++			    w->pbl[15], w->pbl[16], w->pbl[17], w->pbl[18], w->pbl[19],
++			    w->pbl[20], w->pbl[21], w->pbl[22], w->pbl[23], w->pbl[24]);
++		}
++		S3_ADD( "\n");
++		break;
++	default:
++		S3_ADD( "\n");
++		break;
++	}
++	if (k > 0) {
++		pong_ramoops_diagnostic_write(line, k < (int)sizeof(line) ? k : (int)sizeof(line) - 1);
++	}
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++int
++pong_wifi_stage3d(char *reply, size_t reply_len, int what)
++{
++	struct s3d_run s = { .step = 0, .why = "OK", .what = what };
++	int rc;
++
++	if (what != 0 && what != 1 && what != 2) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3d bad what\n", reply_len);
++		}
++		return -101;
++	}
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3d busy\n", reply_len);
++		}
++		return -100;
++	}
++	/* 1: pages from `wifiup` + SMMU + BAR (no register is touched). */
++	s3b_wmark(1, 0);
++	if (!wl_map() || !wl_ptr(SMMU)) {
++		s.step = -1;
++		s.why = "map";
++	} else {
++		s.step = 1;
++		if (s3d_survey(&s)) {
++			switch (what) {
++			case 1:
++				(void)s3d_copy(&s);
++				break;
++			case 2:
++				(void)s3d_go(&s);
++				break;
++			default:
++				break;
++			}
++		}
++	}
++	rc = s3d_report(&s, reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif
