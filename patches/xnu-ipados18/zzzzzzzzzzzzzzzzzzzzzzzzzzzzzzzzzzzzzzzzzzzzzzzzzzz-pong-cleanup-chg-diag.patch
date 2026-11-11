@@ -1,0 +1,157 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 23dbaad..deedf62 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -34,7 +34,6 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
+ extern void IOFreeContiguous(void *address, vm_size_t size);
+ int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
+-int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern unsigned int vm_page_free_count;
+ 
+@@ -79,6 +78,7 @@ extern int pong_wifi_stage4(char *reply, size_t reply_len, int what);
+ extern int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ /* IOPMPowerSource.cpp: battery temperature in tenths of a degree, -32768 until the gauge was read */
+ extern int pong_battery_last_decic;
++extern uint8_t pong_charger_cnfg[14];      /* CHG_CNFG_00..12 as the battery thread last read them, [13] = valid */
+ /* pong_gpu_probe.c: staged Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ extern struct vc_info vinfo;
+@@ -1433,6 +1433,15 @@ cmd_handle_temp(void)
+ 		    pong_battery_last_decic < 0 ? -pong_battery_last_decic % 10 : pong_battery_last_decic % 10);
+ 		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
+ 	}
++	if (pong_charger_cnfg[13]) {
++		/* MAX77705 charger CHG_CNFG_00 (0xb7) .. CHG_CNFG_12 (0xc3), raw: nothing here changes them */
++		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " | chg b7");
++		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++		for (unsigned i = 0; i < 13; i++) {
++			k = snprintf(reply + n, sizeof(reply) - (size_t)n, " %02x", pong_charger_cnfg[i]);
++			n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++		}
++	}
+ 	(void)snprintf(reply + n, sizeof(reply) - (size_t)n, "\n");
+ 	send_str(reply);
+ }
+@@ -1756,38 +1765,6 @@ cmd_handle_wifis3cd(int stage, int what)
+ 	send_str(reply[0] ? reply : "wifis3: no reply\n");
+ }
+ 
+-/*
+- * irqdbg [N]: read, and with N set, the development kernel's "interrupts were held disabled too long" check
+- * (kern.interrupt_masked_debug_mode: 0 off, 1 trace, 2 panic). On 11-11 this check panicked the tablet twice, in
+- * bzero_phys / bcopy_phys of ordinary user tasks, 0.66 ms and about 2.5 ms against a 0.625 ms limit; the cause of
+- * the long section is not known yet. Setting it from here, after boot, leaves early boot exactly as it was.
+- */
+-static void
+-cmd_handle_irqdbg(const char *arg)
+-{
+-	char reply[120];
+-	const char *p = arg;
+-	unsigned was = 0xffffffffu, now = 0xffffffffu, mode = 0;
+-	size_t len = sizeof(was);
+-	int rc, rc_set = 0, rc_now;
+-	bool set = false;
+-
+-	while (*p == ' ') {
+-		p++;
+-	}
+-	rc = kernel_sysctlbyname("kern.interrupt_masked_debug_mode", &was, &len, NULL, 0);
+-	if (*p >= '0' && *p <= '2') {
+-		set = true;
+-		mode = parse_num(&p);
+-		rc_set = kernel_sysctlbyname("kern.interrupt_masked_debug_mode", NULL, NULL, &mode, sizeof(mode));
+-	}
+-	len = sizeof(now);
+-	rc_now = kernel_sysctlbyname("kern.interrupt_masked_debug_mode", &now, &len, NULL, 0);
+-	snprintf(reply, sizeof(reply), "irqdbg: was %u (rc %d) set %u (%s rc %d) now %u (rc %d)\n",
+-	    was, rc, mode, set ? "yes" : "no", rc_set, now, rc_now);
+-	send_str(reply);
+-}
+-
+ /* Dispatch Received Command String */
+ static void
+ dispatch_command(const char *cmd)
+@@ -1890,10 +1867,6 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_fwput(cmd + 6);
+ 	} else if (strcmp(cmd, "fwlist") == 0) {
+ 		cmd_handle_fwlist();
+-	} else if (strcmp(cmd, "irqdbg") == 0) {
+-		cmd_handle_irqdbg("");
+-	} else if (strncmp(cmd, "irqdbg ", 7) == 0) {
+-		cmd_handle_irqdbg(cmd + 7);
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
+@@ -1913,7 +1886,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, wifis4, fwput, fwlist, irqdbg, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, wifis4, fwput, fwlist, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+@@ -2443,7 +2416,7 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+  */
+ extern void armcpu_ipi_enable(void);
+ static uint32_t pong_ipi_late_seconds = 1;
+-static int pong_prefer_late = -1;
++static int pong_prefer_late = 1;          /* Gold; every image since half22 passed 1 (another value turns it off) */
+ 
+ static void
+ pong_ipi_late_thread(__unused void *param, __unused wait_result_t wr)
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index cb95b40..b42e552 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -600,6 +600,7 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+ void pong_battery_publish(IOPMPowerSource *, unsigned int, unsigned int, bool, bool, unsigned int, int, unsigned int, bool, bool, bool);
+ /* The battery temperature in tenths of a degree for the USB `temp` command; -32768 until the gauge was read. */
+ extern "C" { extern int pong_battery_last_decic; int pong_battery_last_decic = -32768; }
++extern "C" { extern uint8_t pong_charger_cnfg[14]; uint8_t pong_charger_cnfg[14]; }   /* USB `temp`; [13] = valid */
+ namespace {
+ constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
+ constexpr vm_size_t kT970TlmmBytes = 0x100000;
+@@ -794,6 +795,16 @@ static int sample(BatterySample *s) {
+ 	s->chargerValid = !drc;
+ 	s->details = details;
+ 	s->intOk = intOk;
++	if (s->chargerValid) {
++		/* CHG_CNFG_00..12 (0xb7..0xc3), read only: what the boot loader left as the input and charge current limits */
++		uint8_t cnfg[13] = {};
++		bool all = true;
++		for (unsigned i = 0; i < 13 && all; ++i) all = !readReg(kT970Charger, uint8_t(0xb7 + i), &cnfg[i], 1);
++		if (all) {
++			for (unsigned i = 0; i < 13; ++i) pong_charger_cnfg[i] = cnfg[i];
++			pong_charger_cnfg[13] = 1;
++		}
++	}
+ 	if (s->chargerValid) {
+ 		const unsigned state = details & 0x0f;
+ 		s->external = (intOk & 0x40) != 0;
+diff --git a/iokit/Kernel/PongBacklightT970.cpp b/iokit/Kernel/PongBacklightT970.cpp
+index a251df6..6723874 100644
+--- a/iokit/Kernel/PongBacklightT970.cpp
++++ b/iokit/Kernel/PongBacklightT970.cpp
+@@ -9,8 +9,8 @@
+  * it does not re-implement the transfer, does not do the DCS 0x52 read-back (a bus turnaround
+  * halted this SoC in rui's v84-v86), and never touches DSI1, the PLL, the PHY or a DMA buffer.
+  *
+- * Gated by the boot argument pong_backlight=1 (off by default): without it the kernel behaves
+- * exactly as before. The service publishes IODisplayParameters.brightness = {min=10, max=2047,
++ * On by default since the owner confirmed the slider (11-11); the boot argument pong_backlight=0
++ * turns it off, and then the kernel behaves exactly as before. The service publishes IODisplayParameters.brightness = {min=10, max=2047,
+  * value=...} and accepts brightness / FadePeriod in setProperties. The value CoreBrightness
+  * sends is the panel DBV directly (linear for now; a curve can replace brightness_to_dbv later).
+  * The service never writes a level at boot: it publishes a placeholder and waits for the first
+@@ -218,7 +218,7 @@ extern "C" void
+ pong_backlight_t970_start(IOService *display)
+ {
+ 	static bool started;
+-	unsigned enabled = 0;
++	unsigned enabled = 1;      /* pong_backlight=0 turns the service off (the owner confirmed the slider 11-11) */
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("pong_backlight", &enabled, sizeof(enabled));
