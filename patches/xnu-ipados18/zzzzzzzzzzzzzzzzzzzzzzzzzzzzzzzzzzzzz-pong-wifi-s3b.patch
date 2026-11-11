@@ -1,0 +1,829 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 497f169..d1139a7 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -68,6 +68,7 @@ extern int pong_wifi_link_up(char *reply, size_t reply_len);
+ extern int pong_wifi_link_down(char *reply, size_t reply_len);
+ extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ extern int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
++extern int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
+ /* pong_gpu_probe.c: staged Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ extern struct vc_info vinfo;
+@@ -1322,6 +1323,22 @@ cmd_handle_wifis3a(int banks)
+ 	send_str(reply[0] ? reply : "wifis3a: no reply\n");
+ }
+ 
++/*
++ * wifis3b [sid|bank|smr|undo]: Wi-Fi stage 3b, one class of writes per call (pong_wifi_link.c). Plain `wifis3b`
++ * only reads and shows the values the writes would use; `sid` writes the endpoint's BDF->SID table word; `bank`
++ * allocates the page tables and the DMA arena and programs a free SMMU context bank; `smr` routes PCIe0's streams
++ * into that bank; `undo` takes the stream match entry and the bank out again. Bus mastering and MSI stay off.
++ */
++static void
++cmd_handle_wifis3b(int what)
++{
++	char reply[640];
++
++	reply[0] = '\0';
++	(void)pong_wifi_stage3b(reply, sizeof(reply), what);
++	send_str(reply[0] ? reply : "wifis3b: no reply\n");
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1464,6 +1481,16 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifis3a(0);
+ 	} else if (strcmp(cmd, "wifis3a bank") == 0) {
+ 		cmd_handle_wifis3a(1);
++	} else if (strcmp(cmd, "wifis3b") == 0) {
++		cmd_handle_wifis3b(0);
++	} else if (strcmp(cmd, "wifis3b sid") == 0) {
++		cmd_handle_wifis3b(1);
++	} else if (strcmp(cmd, "wifis3b bank") == 0) {
++		cmd_handle_wifis3b(2);
++	} else if (strcmp(cmd, "wifis3b smr") == 0) {
++		cmd_handle_wifis3b(3);
++	} else if (strcmp(cmd, "wifis3b undo") == 0) {
++		cmd_handle_wifis3b(9);
+ 	} else if (strcmp(cmd, "gpuprobe") == 0) {
+ 		cmd_handle_gpuprobe(1);
+ 	} else if (strcmp(cmd, "gpuprobe cx") == 0) {
+@@ -1473,7 +1500,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index e0d0fe6..38ee80a 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -30,8 +30,10 @@
+ #include <mach/mach_types.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
++#include <IOKit/IOLib.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
+ extern uint64_t mach_absolute_time(void);
+@@ -40,6 +42,7 @@ int pong_wifi_link_up(char *reply, size_t reply_len);
+ int pong_wifi_link_down(char *reply, size_t reply_len);
+ int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
++int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
+ 
+ /* ---- tuning knobs ------------------------------------------------------------------------- */
+ #define WL_LINK_GEN        1u      /* LNKCTL2 target speed; stock DTS qcom,target-link-speed = 1 */
+@@ -1365,4 +1368,744 @@ pong_wifi_stage3a(char *reply, size_t reply_len, int banks)
+ 	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/*
++ * Stage 3b of the SM-T970 Wi-Fi bring-up: the PCIe0 BDF->SID table slot of the endpoint, a private
++ * stage-1 context bank of the apps SMMU for IOVA 0xa0000000..0xa03fffff, and the stream match entry
++ * that routes PCIe0's streams into it. The endpoint's bus mastering, MSI and BHI are NOT touched here
++ * (stages 3c/3d): after this stage the chip still cannot send a request.
++ *
++ * It uses these pieces of the code above unchanged:
++ *   rd(), wr(), wl_ptr(), wl_map(), wl_alive(), wl_halt(), wl_spin_us(), wm_link(), WL_FAIL(), struct wl,
++ *   wl_busy, WL_PAGE, PARF, PARF_SID_CFG, s3_mark(), s3_match(), SMMU, SMMU_SIZE, SMMU_SCR0, SMMU_IDR0..2,
++ *   SMMU_SGFSR, SMMU_SGFSYNR0, SMMU_SMR(), SMMU_S2CR(), SMMU_CBAR(), SMMU_CB_SCTLR, SMMU_CB_FSR,
++ *   SMMU_FSR_FAULT, S3_SID_RC, S3_SID_EP, S3_SID_MASK, S3_SID_UFS, PARF_SID_TABLE, S3_SID_SLOT_EP,
++ *   pong_ramoops_diagnostic_write().
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/T970WifiProbe.cpp bringUp() step 15 (the SID table slot, lines 372-385) and wdom::install()
++ *   (lines 485-611: page tables, context bank registers, S2CR then SMR);
++ *   package/T970WifiStack.cpp sdom::install() (lines 128-299: bank choice by SCTLR/FSR only, ASID 0xfb00,
++ *   VMID 0xfb, TLBIALL, dc civac cache maintenance, the claim check before programming).
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ * The fallback stream match 0x80001c01 is the G986N (y2q) port's (ref/G986N-iOS docs/y2q-wifi.md:71-74).
++ *
++ * Entry point (USB commands, after `wifiup`, `wifimhi`, `wifis3a`):
++ *   int pong_wifi_stage3b(char *reply, size_t reply_len, int what);   0 = done; reply >= 640 bytes
++ *     what 0 `wifis3b`       read only: survey, choose the bank, show every value the writes would use
++ *     what 1 `wifis3b sid`   one PARF SID table word (slot 0x15), read back
++ *     what 2 `wifis3b bank`  page tables + 4 MiB arena (once per boot), program the chosen bank, SCTLR last
++ *     what 3 `wifis3b smr`   S2CR[n] then SMR[n] (only after `wifis3b bank`), read back, fallback once
++ *     what 9 `wifis3b undo`  SMR[n] invalid, S2CR[n] as it was, bank SCTLR 0 (memory is kept)
++ * Steps (a negative step is the one that failed, `why` names the check):
++ *   1 mapped, 51 SMMU ID/geometry/global faults, 52 SMR/S2CR scan, 53 link and clocks, 54 SID table read,
++ *   55 bank choice (reads SCTLR/FSR of candidates), 61 SID write, 62 memory, 63 bank program,
++ *   64 S2CR/SMR write, 65 checks after the SMR write, 69 undo.
++ * pmsg: "[PONG_WIFI] S<step>" before each step, "S55 b<n>" before bank n is read, and
++ * "[PONG_WIFI] S<step> W<n>" just before write n of a step (the reply lists which register W<n> is).
++ */
++
++/* ---- tuning knobs ------------------------------------------------------------------------- */
++#define S3B_BANK_FROM      6u      /* lowest context bank considered: rui's bank (log17 `bank 6`); 3 was UFS's */
++#define S3B_BANK_TRIES     4u      /* candidate banks whose SCTLR/FSR are read, at most (as 3a) */
++#define S3B_ASID           0xfb00u /* stack:153-156 default (stage 5 used 0xfc00, rui:543) */
++#define S3B_VMID           0xfbu   /* stack:274-280: a VMID of its own, so no other VMID-0 bank's TLB entry matches */
++#define S3B_MAIR0          0xffu   /* attr 0 Normal write-back (rui:587-592, periph27; notes:69-70 "Normal-NC is fine") */
++#define S3B_TLB_POLLS      1000u   /* TLBSTATUS polls of 1 us (rui:599, stack:292) */
++
++/* ---- values (each from the precedent named) ------------------------------------------------ */
++#define S3B_SID_VAL        (0x100u << 16 | 1u << 8)  /* rui:382, pong:266 0x01000100: BDF 0x100 [31:16], SID offset 1 [15:8], next 0 [7:0] */
++#define S3B_SID_ADDR       (PARF_SID_TABLE + 4 * S3_SID_SLOT_EP)   /* 0x01c02054 */
++#define S3B_SMR_VAL        (1u << 31 | S3_SID_MASK << 16 | S3_SID_RC)   /* rui:607 0x807f1c00 */
++#define S3B_SMR_ALT        (1u << 31 | S3_SID_EP)                       /* y2q:72-74 0x80001c01 */
++#define S3B_CBA2R          1u                        /* rui:581 VA64 */
++#define S3B_CBAR           (0x1f300u | S3B_VMID)     /* rui:582 0x1f300 (S1 translate, S2 bypass); VMID stack:280 */
++#define S3B_TCR2_CLR       0x38017u                  /* rui:583 */
++#define S3B_TCR2_SET       0x38010u                  /* rui:583 SEP, 16-bit ASID; | PASize = IDR2[3:0] */
++#define S3B_TCR            0x803520u                 /* rui:584 T0SZ 32, WBWA inner-shareable walks, EPD1 */
++#define S3B_SCTLR          0x27u                     /* rui:602 CFRE AFE TRE M (CFIE 0, CFCFG 0: terminate) */
++#define S3B_CB_TCR2        0x010
++#define S3B_CB_TTBR0       0x020
++#define S3B_CB_TTBR1       0x028
++#define S3B_CB_TCR         0x030
++#define S3B_CB_CONTEXTIDR  0x034
++#define S3B_CB_MAIR0       0x038
++#define S3B_CB_MAIR1       0x03c
++#define S3B_CB_TLBIASID    0x610
++#define S3B_CB_TLBIALL     0x618
++#define S3B_CB_TLBSYNC     0x7f0
++#define S3B_CB_TLBSTATUS   0x7f4
++#define S3B_HALT_TBU       (1u << 7 | 1u << 8)       /* wl_branch[7] aggre_noc_pcie_tbu, [8] ddrss_pcie_sf_tbu */
++/* memory: rui wdom (rui:485-487): 4 MiB arena at IOVA 0xa0000000, 2 L3 tables, 4 table pages; sink = last page (rui:78) */
++#define S3B_IOVA           0xa0000000u
++#define S3B_ARENA          (4u << 20)
++#define S3B_SINK           (S3B_IOVA + S3B_ARENA - 4096u)
++#define S3B_L3             (S3B_ARENA >> 21)
++#define S3B_TABLE_BYTES    ((2u + S3B_L3) * 4096u)   /* 16 KiB = one kernel page = one wl_ptr() window */
++#define S3B_CHUNK          0x10000u                  /* the arena in physically contiguous 64 KiB pieces */
++#define S3B_CHUNKS         (S3B_ARENA / S3B_CHUNK)
++#define S3B_LEAF           0x0060000000000f43ull     /* rui:487, stack:83: AF, inner shareable, nG, AP, UXN/PXN, page, attr 0 */
++#define S3B_LINE           64u                       /* dc civac stride, as stack:203 and stack:682 */
++
++#define S3B_F_SID          1u      /* slot 0x15 read back as S3B_SID_VAL in this boot */
++#define S3B_F_MEM          2u      /* tables and arena allocated and filled */
++#define S3B_F_BANK         4u      /* s3b.cb programmed, SCTLR read back S3B_SCTLR */
++#define S3B_F_SMR          8u      /* s3b.smr written and read back non-zero */
++
++/* What this file did to the SMMU in this boot: the only memory of it (it survives between commands). */
++static struct {
++	uint32_t flags;
++	uint32_t cb;                                  /* the bank `wifis3b bank` programmed */
++	uint32_t smr, smr_val, s2cr_orig;             /* the SMR `wifis3b smr` wrote, its read back, S2CR before */
++	uint64_t *tables;                             /* cached kernel VA of the 4 table pages */
++	IOPhysicalAddress tpa;
++	void *chunk[S3B_CHUNKS];
++	IOPhysicalAddress chunk_pa[S3B_CHUNKS];
++	uint32_t chunks;                              /* chunks allocated so far (a failed run keeps them) */
++} s3b;
++
++struct s3b_run {
++	int step;                                     /* last step completed, or -(step that failed) */
++	const char *why;
++	int what;
++	/* survey */
++	uint32_t cr0, id1, id2, gfsr, gsyn1, groups, banks, ns2, shift, pages, gr1;
++	uint32_t valid, overlap, own;                 /* own: our SMR's value when S3B_F_SMR */
++	int free_smr;
++	uint32_t free_s2cr;
++	int ufs_i;
++	uint32_t ufs_smr, ufs_s2cr;
++	uint64_t routed[2];                           /* bit n: a valid translating SMR (not ours) points at bank n */
++	uint32_t halt, sid, sidcfg;
++	int bank;
++	uint32_t tried, last, sctlr, fsr, cbar, cba2r, tcr2;
++	/* results of the write steps: o = before, n = read back after */
++	uint32_t o[8], n[8];
++	uint32_t ttbr0_lo, ttbr0_hi, tlb, dram, alt, sidx, sidx2;
++};
++
++static void
++s3b_wmark(int step, unsigned n)
++{
++	char line[32];
++	int k = snprintf(line, sizeof(line), "[PONG_WIFI] S%d W%u\n", step, n);
++
++	if (k > 0) {
++		pong_ramoops_diagnostic_write(line, k < (int)sizeof(line) ? k : (int)sizeof(line) - 1);
++	}
++}
++
++/* Marker, write, read back. Only for registers that read back what was written. */
++static uint32_t
++s3b_put(int step, unsigned n, uint64_t pa, uint32_t value)
++{
++	s3b_wmark(step, n);
++	wr(pa, value);
++	return rd(pa);
++}
++
++static uint64_t
++s3b_cb(const struct s3b_run *w, uint32_t i)
++{
++	return SMMU + ((uint64_t)(w->pages + i) << w->shift);
++}
++
++static uint32_t
++s3b_tcr2(const struct s3b_run *w)
++{
++	return (w->tcr2 & ~S3B_TCR2_CLR) | S3B_TCR2_SET | (w->id2 & 15u);
++}
++
++/* Clean and invalidate to the point of coherency by VA (stack:203, 682; PongUfsTransport.cpp:99-104). */
++static void
++s3b_clean(const void *va, size_t bytes)
++{
++	uintptr_t p = (uintptr_t)va & ~(uintptr_t)(S3B_LINE - 1), end = (uintptr_t)va + bytes;
++
++	for (; p < end; p += S3B_LINE) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---- the survey: reads only, run first by every `what` --------------------------------------- */
++static bool
++s3b_survey(struct s3b_run *w, bool need_link)
++{
++	struct wl l = { .step = 0 };
++
++	/* 51: ID and global fault registers, geometry (as 3a step 41). Prerequisite: SMMU page mapped (step 1). */
++	s3_mark(51, -1);
++	w->cr0 = rd(SMMU + SMMU_SCR0);
++	w->id1 = rd(SMMU + SMMU_IDR1);
++	w->id2 = rd(SMMU + SMMU_IDR2);
++	w->gfsr = rd(SMMU + SMMU_SGFSR);
++	w->gsyn1 = rd(SMMU + SMMU_SGFSYNR0 + 4);
++	w->groups = rd(SMMU + SMMU_IDR0) & 0xffu;
++	w->banks = w->id1 & 0xffu;
++	w->ns2 = (w->id1 >> 16) & 0xffu;
++	w->shift = (w->id1 >> 31) ? 16 : 12;
++	w->pages = 2u << ((w->id1 >> 28) & 7u);
++	if ((w->cr0 & (1u << 3)) || !w->groups || w->groups > 128 || !w->banks || w->banks > 128 ||
++	    ((uint64_t)(w->pages + w->banks) << w->shift) > SMMU_SIZE || w->shift != 12) {
++		WL_FAIL(51, "smmu-geometry");               /* 3a measured 87 SMRs, 74 banks, 4K pages */
++	}
++	w->gr1 = 1u << w->shift;
++	if (!wl_ptr(SMMU + w->gr1) || !wl_ptr(SMMU + w->gr1 + 0x800)) {
++		WL_FAIL(51, "gr1-map");
++	}
++	w->step = 51;
++
++	/* 52: every SMR. Our own SMR (S3B_F_SMR) is reported apart and neither counted as an overlap nor
++	 * as routing. Prerequisite: geometry checked. */
++	s3_mark(52, -1);
++	for (uint32_t i = 0; i < w->groups; i++) {
++		uint32_t smr = rd(SMMU + SMMU_SMR(i)), s2cr, b;
++
++		if ((s3b.flags & S3B_F_SMR) && i == s3b.smr) {
++			w->own = smr;
++			continue;
++		}
++		if (!(smr & (1u << 31))) {
++			if (w->free_smr < 0) {
++				w->free_smr = (int)i;
++				w->free_s2cr = rd(SMMU + SMMU_S2CR(i));
++			}
++			continue;
++		}
++		s2cr = rd(SMMU + SMMU_S2CR(i));
++		b = s2cr & 0xffu;
++		w->valid++;
++		if (((s2cr >> 16) & 3u) == 0 && b < w->banks) {
++			w->routed[b / 64] |= 1ull << (b % 64);
++		}
++		if (s3_match(smr, S3_SID_RC, S3_SID_MASK)) {
++			w->overlap++;
++		}
++		if (w->ufs_i < 0 && s3_match(smr, S3_SID_UFS, 0)) {
++			w->ufs_i = (int)i;
++			w->ufs_smr = smr;
++			w->ufs_s2cr = s2cr;
++		}
++	}
++	w->step = 52;
++
++	/* 53: the link and the clocks. wl_alive() reads GDSC and the clock halt bits before any PARF/DBI
++	 * register. The two TBU branches carry PCIe0's SMMU traffic (NOTES.md 2.2). `undo` skips this. */
++	if (need_link) {
++		s3_mark(53, -1);
++		if (!wl_alive(&l)) {
++			WL_FAIL(53, "link-not-up");             /* run `wifiup` first */
++		}
++		if (!wm_link()) {
++			WL_FAIL(53, "dll-down");
++		}
++		w->halt = wl_halt();
++		if (w->halt & S3B_HALT_TBU) {
++			WL_FAIL(53, "tbu-clock-off");
++		}
++		w->step = 53;
++
++		/* 54: the endpoint's SID table slot and the table's bypass register. Prerequisite: PARF clocked (53). */
++		s3_mark(54, -1);
++		w->sid = rd(S3B_SID_ADDR);
++		w->sidcfg = rd(PARF_SID_CFG);
++		w->step = 54;
++	}
++
++	/* 55: the bank. Once programmed it is s3b.cb (only its SCTLR/FSR are read). Otherwise rui's rule from
++	 * S3B_BANK_FROM up: not routed to by a valid translating SMR, SCTLR.M clear, no fault in FSR
++	 * (stack:162-167; only SCTLR and FSR of a candidate are read: stack:151-153). */
++	if (s3b.flags & S3B_F_BANK) {
++		uint64_t cb = s3b_cb(w, s3b.cb);
++
++		s3_mark(55, (int)s3b.cb);
++		if (!wl_ptr(cb)) {
++			WL_FAIL(55, "bank-map");
++		}
++		w->bank = (int)s3b.cb;
++		w->last = s3b.cb;
++		w->sctlr = rd(cb + SMMU_CB_SCTLR);
++		w->fsr = rd(cb + SMMU_CB_FSR);
++	} else {
++		s3_mark(55, -1);
++		for (uint32_t i = w->ns2 > S3B_BANK_FROM ? w->ns2 : S3B_BANK_FROM; i < w->banks && w->tried < S3B_BANK_TRIES; i++) {
++			uint64_t cb = s3b_cb(w, i);
++
++			if (w->routed[i / 64] & (1ull << (i % 64))) {
++				continue;
++			}
++			s3_mark(55, (int)i);
++			if (!wl_ptr(cb)) {
++				WL_FAIL(55, "bank-map");            /* out of wl_page[] slots */
++			}
++			w->tried++;
++			w->last = i;
++			w->sctlr = rd(cb + SMMU_CB_SCTLR);
++			w->fsr = rd(cb + SMMU_CB_FSR);
++			if (!(w->sctlr & 1u) && !(w->fsr & SMMU_FSR_FAULT)) {
++				w->bank = (int)i;
++				break;
++			}
++		}
++		if (w->bank < 0) {
++			WL_FAIL(55, "no-free-bank");
++		}
++	}
++	w->cbar = rd(SMMU + w->gr1 + SMMU_CBAR((uint32_t)w->bank));
++	w->cba2r = rd(SMMU + w->gr1 + 0x800 + SMMU_CBAR((uint32_t)w->bank));
++	w->tcr2 = rd(s3b_cb(w, (uint32_t)w->bank) + S3B_CB_TCR2);
++	w->step = 55;
++	return true;
++}
++
++/* ---- what 1: the endpoint's SID table slot ------------------------------------------------ */
++/* XOR of every slot but 0x15: must not change across the write (the other 255 words are left alone). */
++static uint32_t
++s3b_sid_others(void)
++{
++	uint32_t x = 0;
++
++	for (uint32_t i = 0; i < 256; i++) {
++		if (i != S3_SID_SLOT_EP) {
++			x ^= rd(PARF_SID_TABLE + 4 * i) + i * 0x9e3779b9u;
++		}
++	}
++	return x;
++}
++
++static bool
++s3b_sid(struct s3b_run *w)
++{
++	/* 61. Prerequisite: survey through 54 (PARF clocked, link up). The bypass bit (PARF 0x2c00 bit 0) must
++	 * already be clear (rui:375 clears it; measured 0 on 11-11): it is never written here. */
++	s3_mark(61, -1);
++	if (w->sidcfg & 1u) {
++		WL_FAIL(61, "sid-bypass-set");
++	}
++	w->o[0] = w->sid;
++	w->sidx = s3b_sid_others();
++	if (w->sid != S3B_SID_VAL) {
++		if (!wm_link()) {
++			WL_FAIL(61, "link-dropped");
++		}
++		w->n[0] = s3b_put(61, 1, S3B_SID_ADDR, S3B_SID_VAL);
++	} else {
++		w->n[0] = w->sid;                           /* already there: no write */
++	}
++	w->sidx2 = s3b_sid_others();
++	if (w->n[0] != S3B_SID_VAL) {
++		WL_FAIL(61, "sid-rb");
++	}
++	if (w->sidx2 != w->sidx) {
++		WL_FAIL(61, "sid-others-moved");
++	}
++	s3b.flags |= S3B_F_SID;
++	w->step = 61;
++	return true;
++}
++
++/* ---- what 2: memory and the bank ----------------------------------------------------------- */
++/* 62: 4 table pages (one physically contiguous 16 KiB piece) and the 4 MiB arena (64 KiB pieces), once per
++ * boot; tables filled as rui:564-571 (L1[2] -> L2, L2[0x100 + k] -> L3 k, L3 leaves = arena pages), zeroed
++ * arena, dc civac of both, then the tables are read back from DRAM through an uncached window. */
++static bool
++s3b_memory(struct s3b_run *w)
++{
++	uint64_t pa_limit = 1ull << ((w->id2 & 15u) == 0 ? 32 : (w->id2 & 15u) == 1 ? 36 : 40);
++	volatile uint32_t *dram;
++	uint64_t *t;
++	static const uint32_t check[5] = { (S3B_IOVA >> 30) & 3u, 512u + ((S3B_IOVA >> 21) & 511u),
++		                           512u + ((S3B_IOVA >> 21) & 511u) + S3B_L3 - 1u, 1024u, 1024u + S3B_ARENA / 4096u - 1u };
++
++	s3_mark(62, -1);
++	if (!s3b.tables) {
++		IOPhysicalAddress pa = 0;
++		void *va = IOMallocContiguous(S3B_TABLE_BYTES, S3B_TABLE_BYTES, &pa);
++
++		if (!va || !pa || (pa & (S3B_TABLE_BYTES - 1))) {
++			WL_FAIL(62, "alloc-tables");            /* a failed piece is not freed: never reused */
++		}
++		s3b.tables = (uint64_t *)va;
++		s3b.tpa = pa;
++	}
++	for (; s3b.chunks < S3B_CHUNKS; s3b.chunks++) {
++		IOPhysicalAddress pa = 0;
++		void *va = IOMallocContiguous(S3B_CHUNK, 0x4000, &pa);
++
++		if (!va || !pa || (pa & 0xfffu)) {
++			WL_FAIL(62, "alloc-arena");             /* the pieces so far are kept; run again */
++		}
++		s3b.chunk[s3b.chunks] = va;
++		s3b.chunk_pa[s3b.chunks] = pa;
++	}
++	t = s3b.tables;
++	if (s3b.tpa + S3B_TABLE_BYTES > pa_limit) {
++		WL_FAIL(62, "tables-pa-range");
++	}
++	if (!(s3b.flags & S3B_F_MEM)) {
++		for (uint32_t i = 0; i < S3B_TABLE_BYTES / 8; i++) {
++			t[i] = 0;
++		}
++		t[(S3B_IOVA >> 30) & 3u] = (s3b.tpa + 4096) | 3;                                  /* rui:565 */
++		for (uint32_t k = 0; k < S3B_L3; k++) {
++			t[512 + (((S3B_IOVA >> 21) + k) & 511u)] = (s3b.tpa + 8192 + 4096ull * k) | 3;   /* rui:566 */
++		}
++		for (uint32_t c = 0; c < S3B_CHUNKS; c++) {
++			uint64_t *a = (uint64_t *)s3b.chunk[c];
++
++			if (s3b.chunk_pa[c] + S3B_CHUNK > pa_limit) {
++				WL_FAIL(62, "arena-pa-range");
++			}
++			for (uint32_t i = 0; i < S3B_CHUNK / 8; i++) {
++				a[i] = 0;
++			}
++			s3b_clean(a, S3B_CHUNK);                                                  /* stack:187-192 */
++			for (uint32_t p = 0; p < S3B_CHUNK / 4096; p++) {
++				t[1024 + c * (S3B_CHUNK / 4096) + p] =
++				    ((s3b.chunk_pa[c] + 4096ull * p) & 0x0000fffffffff000ull) | S3B_LEAF;      /* rui:570 */
++			}
++		}
++		s3b_clean(t, S3B_TABLE_BYTES);                                                    /* rui:577 (by PA there) */
++	}
++	/* DRAM, not the cache: an uncached (ml_io_map) window over the table page, read word by word (rui:657-679
++	 * does the same for the boot loader through IODeviceMemory). */
++	dram = wl_ptr(s3b.tpa);
++	if (!dram) {
++		WL_FAIL(62, "tables-map");
++	}
++	w->dram = 0;
++	for (unsigned k = 0; k < 5; k++) {
++		uint32_t e = check[k];
++
++		if (dram[2 * e] != (uint32_t)t[e] || dram[2 * e + 1] != (uint32_t)(t[e] >> 32) || !t[e]) {
++			w->dram |= 1u << k;
++		}
++	}
++	if (w->dram) {
++		WL_FAIL(62, "tables-dram");
++	}
++	s3b.flags |= S3B_F_MEM;
++	w->step = 62;
++	return true;
++}
++
++static bool
++s3b_bank(struct s3b_run *w)
++{
++	uint32_t cbi = (uint32_t)w->bank, asid_hi = S3B_ASID << 16;
++	uint64_t cb = s3b_cb(w, cbi), a2r = SMMU + w->gr1 + 0x800 + SMMU_CBAR(cbi), cbar = SMMU + w->gr1 + SMMU_CBAR(cbi);
++	uint32_t tcr2;
++
++	/* 63. Prerequisites: survey through 55 with a bank that no SMR routes to, SCTLR.M clear and no fault;
++	 * memory ready (62); no SMR of ours live. While SCTLR.M is 0 and no SMR points here, these writes
++	 * reach no device. Order and values as rui:580-602 (+ TLBIALL, VMID: stack:280, 289). */
++	s3_mark(63, -1);
++	if ((w->sctlr & 1u) || (w->fsr & SMMU_FSR_FAULT) || (w->routed[cbi / 64] & (1ull << (cbi % 64)))) {
++		WL_FAIL(63, "bank-taken");
++	}
++	/* claim check just before programming (stack:252-259): SCTLR read again */
++	if (rd(cb + SMMU_CB_SCTLR) & 1u) {
++		WL_FAIL(63, "bank-claimed");
++	}
++	w->o[0] = w->cba2r;
++	w->o[1] = w->cbar;
++	w->o[2] = w->tcr2;
++	w->o[3] = w->sctlr;
++	tcr2 = s3b_tcr2(w);
++	w->n[0] = s3b_put(63, 1, a2r, S3B_CBA2R);                                  /* rui:581 CBA2R */
++	if (w->n[0] != S3B_CBA2R) {
++		WL_FAIL(63, "rb-cba2r");
++	}
++	w->n[1] = s3b_put(63, 2, cbar, S3B_CBAR);                                  /* rui:582, stack:280 CBAR */
++	if (w->n[1] != S3B_CBAR) {
++		WL_FAIL(63, "rb-cbar");
++	}
++	w->n[2] = s3b_put(63, 3, cb + S3B_CB_TCR2, tcr2);                          /* rui:583 TCR2 */
++	if (w->n[2] != tcr2) {
++		WL_FAIL(63, "rb-tcr2");
++	}
++	w->n[4] = s3b_put(63, 4, cb + S3B_CB_TCR, S3B_TCR);                        /* rui:584 TCR */
++	if (w->n[4] != S3B_TCR) {
++		WL_FAIL(63, "rb-tcr");
++	}
++	/* 64-bit registers as two 32-bit writes, low word first (rui:497-498) */
++	w->ttbr0_lo = s3b_put(63, 5, cb + S3B_CB_TTBR0, (uint32_t)s3b.tpa);        /* rui:585 TTBR0 */
++	w->ttbr0_hi = s3b_put(63, 6, cb + S3B_CB_TTBR0 + 4, (uint32_t)(s3b.tpa >> 32) | asid_hi);
++	if (w->ttbr0_lo != (uint32_t)s3b.tpa || w->ttbr0_hi != ((uint32_t)(s3b.tpa >> 32) | asid_hi)) {
++		WL_FAIL(63, "rb-ttbr0");
++	}
++	w->n[5] = s3b_put(63, 7, cb + S3B_CB_TTBR1, 0);                            /* rui:586 TTBR1 */
++	w->n[6] = s3b_put(63, 8, cb + S3B_CB_TTBR1 + 4, asid_hi);
++	if (w->n[5] != 0 || w->n[6] != asid_hi) {
++		WL_FAIL(63, "rb-ttbr1");
++	}
++	w->n[7] = s3b_put(63, 9, cb + S3B_CB_MAIR0, S3B_MAIR0);                    /* rui:592 MAIR0, MAIR1 */
++	if (w->n[7] != S3B_MAIR0 || s3b_put(63, 10, cb + S3B_CB_MAIR1, 0) != 0) {
++		WL_FAIL(63, "rb-mair");
++	}
++	if (s3b_put(63, 11, cb + S3B_CB_CONTEXTIDR, 0) != 0) {                      /* rui:594 CONTEXTIDR */
++		WL_FAIL(63, "rb-contextidr");
++	}
++	/* write-only TLB maintenance: no read back (rui:596-600, stack:288-293) */
++	s3b_wmark(63, 12);
++	wr(cb + S3B_CB_TLBIASID, S3B_ASID);
++	s3b_wmark(63, 13);
++	wr(cb + S3B_CB_TLBIALL, 0);
++	s3b_wmark(63, 14);
++	wr(cb + S3B_CB_TLBSYNC, 0xffffffffu);
++	for (w->tlb = 0; w->tlb < S3B_TLB_POLLS && (rd(cb + S3B_CB_TLBSTATUS) & 1u); w->tlb++) {
++		wl_spin_us(1);
++	}
++	if (w->tlb == S3B_TLB_POLLS) {
++		WL_FAIL(63, "tlb-sync");                    /* SCTLR stays 0: the bank is still off */
++	}
++	w->n[3] = s3b_put(63, 15, cb + SMMU_CB_SCTLR, S3B_SCTLR);                 /* rui:602 SCTLR, last */
++	w->fsr = rd(cb + SMMU_CB_FSR);
++	if (w->n[3] != S3B_SCTLR) {
++		WL_FAIL(63, "rb-sctlr");                    /* undo (what 9) puts SCTLR back to 0 */
++	}
++	s3b.cb = cbi;
++	s3b.flags |= S3B_F_BANK;
++	if (w->fsr & SMMU_FSR_FAULT) {
++		WL_FAIL(63, "fsr-fault");
++	}
++	w->step = 63;
++	return true;
++}
++
++/* ---- what 3: S2CR, then SMR ---------------------------------------------------------------- */
++static bool
++s3b_smr(struct s3b_run *w)
++{
++	uint32_t n, smr;
++	uint64_t cb;
++
++	/* 64. Prerequisites: `wifis3b bank` done in this boot and its SCTLR still reads S3B_SCTLR with no fault;
++	 * a free SMR; no valid SMR already covering 0x1c00..0x1c7f; no other SMR routing to our bank. */
++	s3_mark(64, -1);
++	if (!(s3b.flags & S3B_F_BANK) || w->bank != (int)s3b.cb || w->sctlr != S3B_SCTLR || (w->fsr & SMMU_FSR_FAULT)) {
++		WL_FAIL(64, "bank-not-ready");              /* run `wifis3b bank` first */
++	}
++	if (w->free_smr < 0) {
++		WL_FAIL(64, "no-free-smr");
++	}
++	if (w->overlap) {
++		WL_FAIL(64, "stream-taken");
++	}
++	if (w->routed[s3b.cb / 64] & (1ull << (s3b.cb % 64))) {
++		WL_FAIL(64, "bank-routed");
++	}
++	n = (uint32_t)w->free_smr;
++	cb = s3b_cb(w, s3b.cb);
++	w->o[0] = w->free_s2cr;                         /* S2CR before */
++	w->o[1] = rd(SMMU + SMMU_SMR(n));               /* SMR before (bit 31 clear: free) */
++	w->o[2] = w->gfsr;
++	w->o[3] = w->fsr;
++	w->o[4] = w->ufs_i >= 0 ? w->ufs_smr : 0;
++	w->o[5] = w->ufs_i >= 0 ? w->ufs_s2cr : 0;
++	if (w->o[1] & (1u << 31)) {
++		WL_FAIL(64, "smr-claimed");
++	}
++	/* rui:604 S2CR first: translate (type 0) through our bank; harmless while SMR[n] is invalid */
++	w->n[0] = s3b_put(64, 1, SMMU + SMMU_S2CR(n), s3b.cb);
++	if (w->n[0] != s3b.cb) {
++		(void)s3b_put(64, 2, SMMU + SMMU_S2CR(n), w->o[0]);
++		WL_FAIL(64, "s2cr-rb");
++	}
++	/* rui:607 SMR valid, stream 0x1c00 mask 0x7f; y2q:71-74: a dropped write reads back 0 -> 0x80001c01 once */
++	smr = S3B_SMR_VAL;
++	w->n[1] = s3b_put(64, 3, SMMU + SMMU_SMR(n), smr);
++	if (w->n[1] == 0) {
++		w->alt = 1;
++		smr = S3B_SMR_ALT;
++		w->n[1] = s3b_put(64, 4, SMMU + SMMU_SMR(n), smr);
++	}
++	if (w->n[1] == 0) {
++		w->n[0] = s3b_put(64, 5, SMMU + SMMU_S2CR(n), w->o[0]);
++		WL_FAIL(64, "smr-dropped");
++	}
++	if (w->n[1] != smr) {
++		/* accepted, but not as written: take it out again (SMR first, then S2CR, as undo) */
++		(void)s3b_put(64, 6, SMMU + SMMU_SMR(n), 0);
++		w->n[0] = s3b_put(64, 7, SMMU + SMMU_S2CR(n), w->o[0]);
++		WL_FAIL(64, "smr-rb");
++	}
++	s3b.smr = n;
++	s3b.smr_val = w->n[1];
++	s3b.s2cr_orig = w->o[0];
++	s3b.flags |= S3B_F_SMR;
++	w->step = 64;
++
++	/* 65: nothing else moved. Global fault, our bank's FSR, UFS's SMR/S2CR (stream 0xe0, the root volume). */
++	s3_mark(65, -1);
++	w->n[2] = rd(SMMU + SMMU_SGFSR);
++	w->n[3] = rd(cb + SMMU_CB_FSR);
++	if (w->ufs_i >= 0) {
++		w->n[4] = rd(SMMU + SMMU_SMR((uint32_t)w->ufs_i));
++		w->n[5] = rd(SMMU + SMMU_S2CR((uint32_t)w->ufs_i));
++	}
++	if (w->n[2] != w->o[2] || (w->n[3] & SMMU_FSR_FAULT)) {
++		WL_FAIL(65, "fault-after");                 /* left in place: read the line, then `wifis3b undo` */
++	}
++	if (w->ufs_i < 0 || w->n[4] != w->o[4] || w->n[5] != w->o[5]) {
++		WL_FAIL(65, "ufs-moved");
++	}
++	w->step = 65;
++	return true;
++}
++
++/* ---- what 9: undo, in the order SMR, S2CR, SCTLR ------------------------------------------- */
++static bool
++s3b_undo(struct s3b_run *w)
++{
++	s3_mark(69, -1);
++	if (!(s3b.flags & (S3B_F_SMR | S3B_F_BANK))) {
++		WL_FAIL(69, "nothing");
++	}
++	if (s3b.flags & S3B_F_SMR) {
++		w->o[0] = rd(SMMU + SMMU_SMR(s3b.smr));
++		w->o[1] = rd(SMMU + SMMU_S2CR(s3b.smr));
++		if (w->o[0] != s3b.smr_val || w->o[1] != s3b.cb) {
++			WL_FAIL(69, "smr-changed");             /* not ours any more: left alone */
++		}
++		w->n[0] = s3b_put(69, 1, SMMU + SMMU_SMR(s3b.smr), 0);
++		w->n[1] = s3b_put(69, 2, SMMU + SMMU_S2CR(s3b.smr), s3b.s2cr_orig);
++		if (w->n[0] & (1u << 31)) {
++			WL_FAIL(69, "smr-still-valid");
++		}
++		s3b.flags &= ~S3B_F_SMR;
++	}
++	if (s3b.flags & S3B_F_BANK) {
++		uint64_t cb = s3b_cb(w, s3b.cb);
++
++		if (!wl_ptr(cb)) {
++			WL_FAIL(69, "bank-map");
++		}
++		w->o[2] = rd(cb + SMMU_CB_SCTLR);
++		w->n[2] = s3b_put(69, 3, cb + SMMU_CB_SCTLR, 0);
++		if (w->n[2] & 1u) {
++			WL_FAIL(69, "sctlr-still-on");
++		}
++		s3b.flags &= ~S3B_F_BANK;
++	}
++	w->step = 69;
++	return true;
++}
++
++/* ---- the reply ----------------------------------------------------------------------------- */
++static int
++s3b_report(const struct s3b_run *w, char *reply, size_t reply_len)
++{
++	char line[640];
++	int k, m = 0;
++
++	k = snprintf(line, sizeof(line),
++	    "[PONG_WIFI] s3b w%d st %d %s fl %x gf %x/%x smr %u/%u free %d ovl %u own %x ufs %d:%x/%x "
++	    "bank %d/%u last %u sctlr %x fsr %x ",
++	    w->what, w->step, w->why ? w->why : "?", s3b.flags, w->gfsr, w->gsyn1, w->valid, w->groups, w->free_smr,
++	    w->overlap, w->own, w->ufs_i, w->ufs_smr, w->ufs_s2cr, w->bank, w->tried, w->last, w->sctlr, w->fsr);
++	if (k > 0 && k < (int)sizeof(line)) {
++		m = k;
++	}
++	switch (w->what) {
++	case 0:
++		k = snprintf(line + m, sizeof(line) - (size_t)m,
++		    "sid %x>%x@%x cfg %x s2cr %x>%x smrv %x|%x a2r %x>%x cbar %x>%x tcr2 %x>%x tcr %x mair %x asid %x "
++		    "iova %x-%x sink %x tpa %llx\n",
++		    w->sid, S3B_SID_VAL, (uint32_t)S3B_SID_ADDR, w->sidcfg, w->free_s2cr, w->bank, S3B_SMR_VAL, S3B_SMR_ALT,
++		    w->cba2r, S3B_CBA2R, w->cbar, S3B_CBAR, w->tcr2, w->bank >= 0 ? s3b_tcr2(w) : 0u, S3B_TCR, S3B_MAIR0,
++		    S3B_ASID, S3B_IOVA, S3B_IOVA + S3B_ARENA - 1u, S3B_SINK, (unsigned long long)s3b.tpa);
++		break;
++	case 1:
++		k = snprintf(line + m, sizeof(line) - (size_t)m, "sid@%x %x>%x cfg %x others %x>%x\n",
++		    (uint32_t)S3B_SID_ADDR, w->o[0], w->n[0], w->sidcfg, w->sidx, w->sidx2);
++		break;
++	case 2:
++		k = snprintf(line + m, sizeof(line) - (size_t)m,
++		    "tpa %llx chunks %u dram %x a2r %x>%x cbar %x>%x tcr2 %x>%x tcr %x ttbr0 %x:%x ttbr1 %x:%x mair %x tlb %u "
++		    "sctlr %x>%x\n",
++		    (unsigned long long)s3b.tpa, s3b.chunks, w->dram, w->o[0], w->n[0], w->o[1], w->n[1], w->o[2], w->n[2],
++		    w->n[4], w->ttbr0_hi, w->ttbr0_lo, w->n[6], w->n[5], w->n[7], w->tlb, w->o[3], w->n[3]);
++		break;
++	case 3:
++		k = snprintf(line + m, sizeof(line) - (size_t)m,
++		    "n %d s2cr %x>%x smr %x>%x alt %u gf %x>%x cbfsr %x>%x ufs %x/%x>%x/%x\n",
++		    w->free_smr, w->o[0], w->n[0], w->o[1], w->n[1], w->alt, w->o[2], w->n[2], w->o[3], w->n[3],
++		    w->o[4], w->o[5], w->n[4], w->n[5]);
++		break;
++	default:
++		k = snprintf(line + m, sizeof(line) - (size_t)m, "n %u smr %x>%x s2cr %x>%x sctlr %x>%x\n",
++		    s3b.smr, w->o[0], w->n[0], w->o[1], w->n[1], w->o[2], w->n[2]);
++		break;
++	}
++	if (k > 0) {
++		m += k < (int)sizeof(line) - m ? k : (int)sizeof(line) - m - 1;       /* snprintf() cut the line */
++	}
++	pong_ramoops_diagnostic_write(line, m);
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++int
++pong_wifi_stage3b(char *reply, size_t reply_len, int what)
++{
++	struct s3b_run s = { .step = 0, .why = "OK", .what = what, .free_smr = -1, .ufs_i = -1, .bank = -1 };
++	int rc;
++
++	if (what != 0 && what != 1 && what != 2 && what != 3 && what != 9) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3b bad what\n", reply_len);
++		}
++		return -101;
++	}
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3b busy\n", reply_len);
++		}
++		return -100;
++	}
++	/* 1: the pages `wifiup` mapped plus the SMMU's first page (no register is touched). */
++	s3_mark(1, -1);
++	if (!wl_map() || !wl_ptr(SMMU)) {
++		s.step = -1;
++		s.why = "map";
++	} else {
++		s.step = 1;
++		if (s3b_survey(&s, what != 9)) {
++			switch (what) {
++			case 1:
++				(void)s3b_sid(&s);
++				break;
++			case 2:
++				if (s3b.flags & S3B_F_SMR) {
++					s.step = -63;
++					s.why = "smr-live";             /* `wifis3b undo` first */
++				} else if (s3b.flags & S3B_F_BANK) {
++					s.why = "already";              /* no write; the survey line shows the bank */
++				} else if (s3b_memory(&s)) {
++					(void)s3b_bank(&s);
++				}
++				break;
++			case 3:
++				if (s3b.flags & S3B_F_SMR) {
++					s.why = "already";
++				} else {
++					(void)s3b_smr(&s);
++				}
++				break;
++			case 9:
++				(void)s3b_undo(&s);
++				break;
++			default:
++				break;                              /* what 0: the survey is all */
++			}
++		}
++	}
++	rc = s3b_report(&s, reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif
