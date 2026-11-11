@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/PongBacklightT970.cpp b/iokit/Kernel/PongBacklightT970.cpp
+index 7966474..cf81c93 100644
+--- a/iokit/Kernel/PongBacklightT970.cpp
++++ b/iokit/Kernel/PongBacklightT970.cpp
+@@ -36,6 +36,7 @@
+ #include <libkern/c++/OSSymbol.h>
+ #include <libkern/OSKextLib.h>
+ #include <pexpert/pexpert.h>
++#include <kern/thread.h>
+ 
+ extern "C" int pong_backlight_set_dbv(uint32_t dbv);
+ 
+@@ -167,27 +168,63 @@ T970Backlight::getMetaClass() const
+ OSMetaClassConstructorInit(T970Backlight, IOService, )
+ OSDefineDefaultStructors(T970Backlight, IOService)
+ 
++/*
++ * The native class comes from AppleARMPlatform, which initializes asynchronously after the framebuffer has
++ * started (PongBacklight.cpp:222-233 polls for it every 100 ms until a deadline). So the service is brought up
++ * from a thread of its own that waits for the class, up to two minutes, and then attaches as before.
++ */
++static void
++t970_backlight_bringup(void *arg, wait_result_t)
++{
++	IOService *display = static_cast<IOService *>(arg);
++	const OSMetaClass *native = nullptr;
++	unsigned waited = 0;
++
++	for (; waited < 1200 && !native; waited++) {
++		const OSSymbol *name = OSSymbol::withCString("AppleARMBacklight");
++
++		native = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
++		OSSafeReleaseNULL(name);
++		if (!native) {
++			IOSleep(100);
++		}
++	}
++	if (!native) {
++		IOLog("T970Backlight: native AppleARMBacklight class still unavailable after %u ms; keep current brightness\n", waited * 100);
++		display->release();
++		return;
++	}
++	IOLog("T970Backlight: native AppleARMBacklight class ready after %u ms\n", waited * 100);
++	T970Backlight *service = OSTypeAlloc(T970Backlight);
++	if (service) {
++		if (!service->init() || !service->attach(display) || !service->start(display)) {
++			if (service->getProvider()) {
++				service->detach(display);
++			}
++			service->release();
++		}
++		/* on success the service and the DSI0 handoff persist until reboot */
++	}
++	display->release();
++}
++
+ extern "C" void
+ pong_backlight_t970_start(IOService *display)
+ {
+-	static T970Backlight *backlight;
++	static bool started;
+ 	unsigned enabled = 0;
++	thread_t thread;
+ 
+ 	PE_parse_boot_argn("pong_backlight", &enabled, sizeof(enabled));
+-	if (!enabled || backlight || !display) {
++	if (!enabled || started || !display) {
+ 		return;
+ 	}
+-	T970Backlight *service = OSTypeAlloc(T970Backlight);
+-	if (!service) {
+-		return;
+-	}
+-	if (!service->init() || !service->attach(display) || !service->start(display)) {
+-		if (service->getProvider()) {
+-			service->detach(display);
+-		}
+-		service->release();
+-		return;
++	started = true;
++	display->retain();
++	if (kernel_thread_start(t970_backlight_bringup, display, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		display->release();
+ 	}
+-	backlight = service;   /* the service and the DSI0 handoff persist until reboot */
+ }
+ #endif /* PONG && (DEVELOPMENT || DEBUG) && !SECURE_KERNEL */
