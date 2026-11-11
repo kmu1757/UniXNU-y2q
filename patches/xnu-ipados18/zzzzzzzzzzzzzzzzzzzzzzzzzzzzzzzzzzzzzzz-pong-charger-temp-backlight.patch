@@ -1,0 +1,678 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2d7f9fd..b269957 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -410,6 +410,7 @@ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_gpu_probe.c		standard
++bsd/dev/pong_backlight_t970.c		standard
+ bsd/pthread/pthread_kext.c			standard
+ bsd/kern/source_pthread_bootstrap.c			standard
+ bsd/kern/kern_event.c			standard
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+new file mode 100644
+index 0000000..8fb1e11
+--- /dev/null
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -0,0 +1,396 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SM-T970 (SM8250 / kona, Galaxy Tab S7+) panel backlight through the DSI0 command FIFO,
++ * first stage: a USB-only probe that changes brightness with three DCS writes over the link the
++ * boot loader left running. Runs ONLY when the USB CDC-ACM command `bl` asks; never runs at boot.
++ *
++ *   `bl`            (mode 0)  read-only: the DSI0 registers the transfer uses, plus the hardware
++ *                             version. Zero register writes.
++ *   `bl <10..2047>` (mode 1)  send Samsung's normal-level DCS sequence for that DBV once:
++ *                             68 19 20 00 14  ->  51 DBV[7:0] DBV[10:8]  ->  53 20
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/BacklightProbe.cpp (sendPacket :84-123, register offsets :57-59, writeBrightness
++ *   :142-152, why the DCS 0x52 read-back was dropped :275-276) and package/BacklightCore.h
++ *   (header/flags :36-51, long-write packing :55-68, DBV byte order :71-75, level range :20-22).
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ *
++ * The transfer discipline follows the same panel on this board (both are dsi_cmd_mode and the
++ * packet grammar is identical), and the same controller family on this kernel (bsd/dev/pong_gpu_probe.c:
++ * one ml_io_map window, strict volatile 32-bit access, no memcpy/memmove on Device memory, a
++ * "[PONG_BL] W<n>" pmsg line before every MMIO write, bounded polling, no panic, no unbounded wait).
++ *
++ * Safety of reading DSI0 at all: the running framebuffer is still scanned out through this same
++ * controller (the boot loader's pipeline; MDP and the command engine both live on ae94000), so its
++ * control block is powered and clocked and a read cannot hang the bus. That is the only reason a
++ * read-only `bl` is offered without a power/clock pre-check. DSI1 (0xae96000, DTS:23190) is NEVER
++ * read or written here: if its clock/PHY is off, the first access can hang or silently reset the
++ * SoC. Whether DSI1 is ever needed is not settled -- the S6TUUM3 node carries `dsi-ctrl-num =
++ * <0>` (DTS:22772) and mainline drives DSI0 only (gts7xl-panel-ctl.c:18), so the assumption here is
++ * DSI0 alone suffices.
++ *
++ * Not done here on purpose: the DCS 0x52 read-back (a bus turnaround halted this SoC in rui's
++ * v84-v86, BacklightProbe.cpp:275-276), any PLL/PHY/clock configuration, DMA buffers, and SMMU
++ * mappings. The TPG FIFO path needs none of those (BacklightProbe.cpp:11-16).
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern uint64_t mach_absolute_time(void);
++
++int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
++
++/* ---- addresses ---------------------------------------------------------------------------- */
++/* One 0x4000 window at ae94000 (one ml_io_map call). Every register this file touches is inside the
++ * first 0x400 bytes of the window (the DSI0 control block, DTS:23146). The window also covers DSI0's
++ * PHY (ae94400) and PLL (ae94900) and the start of DSI1 (ae96000); mapping them costs nothing and
++ * none of them is ever accessed, so the extent is harmless while the offsets stay below 0x400. */
++#define BL_DSI0_PHYS             0xae94000UL
++#define BL_DSI0_WINDOW           0x4000UL
++#define BL_REG_HW_VERSION        0x000u
++#define BL_REG_CTRL              0x004u
++#define BL_REG_STATUS            0x008u
++#define BL_REG_DMA_CTRL          0x03cu
++#define BL_REG_DMA_LEN           0x04cu
++#define BL_REG_SW_TRIGGER        0x090u
++#define BL_REG_INT_CTRL          0x110u
++#define BL_REG_TPG_CTRL          0x15cu
++#define BL_REG_TPG_INIT          0x17cu
++#define BL_REG_TPG_FIFO_RESET    0x1ecu
++
++/* ---- bit fields (BacklightProbe.cpp:60) ---------------------------------------------------- */
++#define BL_STATUS_MDP_BUSY       (1u << 2)          /* command-mode MDP busy: a packet is in flight */
++#define BL_INT_DMA_DONE          (1u << 0)          /* transfer-complete (read: sticky; write 1 clears) */
++#define BL_INT_CLEAR_ERRORS      ((1u << 24) | (1u << 28)) /* W1C only our command-error/signature bits */
++
++/* TPG enable (bit 1) | FIFO mode (bit 2) | custom command pattern (bits 17:16 = 3),
++ * BacklightProbe.cpp:95; PongBacklight.cpp:107 uses the same (3<<16) | mode. */
++#define BL_TPG_FIFO              ((1u << 1) | (1u << 2) | (3u << 16))
++#define BL_DMA_EMBEDDED          (1u << 28)         /* embedded (FIFO) command packet -- rui :103 */
++
++/* ---- DCS / level facts (BacklightCore.h:19-27) --------------------------------------------- */
++#define BL_DCS_BRIGHTNESS        0x51u
++#define BL_DCS_CONTROL           0x53u
++#define BL_DBV_MIN               10u               /* candela_map_table_revA bl_level 0  -> DBV 10, 2 nits */
++#define BL_DBV_MAX               2047u             /* candela_map_table_revA bl_level 255 -> DBV 2047, 420 nits */
++
++/* ---- timeouts (BacklightProbe.cpp:64) ------------------------------------------------------ */
++#define BL_IDLE_TIMEOUT_US       20000u
++#define BL_DONE_TIMEOUT_US       50000u
++
++/* ---- state -------------------------------------------------------------------------------- */
++static vm_offset_t g_bl_dsi;
++
++/* ---- small helpers ------------------------------------------------------------------------ */
++/* Strict 32-bit volatile helpers with barriers; no memcpy/memmove on Device memory. */
++static inline uint32_t
++bl_rd32(uint32_t byte_off)
++{
++	uint32_t val = *(volatile uint32_t *)(g_bl_dsi + byte_off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return val;
++}
++
++static inline void
++bl_wr32_raw(uint32_t byte_off, uint32_t val)
++{
++	*(volatile uint32_t *)(g_bl_dsi + byte_off) = val;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++bl_pmsg(const char *line)
++{
++	int len = 0;
++
++	if (!line) {
++		return;
++	}
++	while (line[len] != '\0') {
++		len++;
++	}
++	if (len > 0) {
++		pong_ramoops_diagnostic_write(line, len);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++/*
++ * Log "[PONG_BL] W<n>" to pmsg BEFORE every MMIO write (the discipline of wl_mark / gpu_probe_wmark),
++ * so a bus hang or silent SoC reset identifies the exact write. For one packet the writes run:
++ *   1  INT_CTRL     clear a stale DMA-done (W1C; the enable mask is preserved)
++ *   2  TPG_CTRL     FIFO mode
++ *   3..3+n-1        TPG_INIT, one word per packet word (+1 extra 0 word when n is odd)
++ *   then DMA_CTRL (embedded), DMA_LEN, SW_TRIGGER = 1,
++ *   then INT_CTRL (clear done), TPG_CTRL = 0, DMA_CTRL restore, TPG_FIFO_RESET = 1, = 0.
++ * <n> advances by one per write across the whole `bl` call, starting at 1.
++ */
++static void
++bl_wmark(unsigned int step)
++{
++	char line[24];
++	int n = snprintf(line, sizeof(line), "[PONG_BL] W%u\n", step);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static void
++bl_wr32(uint32_t byte_off, uint32_t val, unsigned int step)
++{
++	bl_wmark(step);
++	bl_wr32_raw(byte_off, val);
++}
++
++/* Microsecond spin (mach_absolute_time), as gpu_probe_spin_us: delay_for_interval sleeps on a timer. */
++static uint64_t
++bl_now_us(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++bl_spin_us(uint32_t us)
++{
++	uint64_t end = bl_now_us() + us;
++
++	while (bl_now_us() < end) {
++	}
++}
++
++/* DCS long-write header word (BacklightCore.h:36-38): byte 0..1 = word count, byte 2 = 0x39,
++ * byte 3 = flags (bit 6 payload present -> 1<<30, bit 7 last command -> 1<<31). */
++static uint32_t
++bl_long_header(uint32_t bytes)
++{
++	return (1u << 30) | (1u << 31) | (0x39u << 16) | (bytes & 0xffffu);
++}
++
++/* Pack a DCS long write into words little-endian, padded with 0xff (BacklightCore.h:55-68).
++ * Returns the word count, 0 if it does not fit. */
++static unsigned int
++bl_pack(const uint8_t *bytes, unsigned int count, uint32_t *words, unsigned int room)
++{
++	const unsigned int payload_words = (count + 3u) / 4u;
++
++	if (!count || 1u + payload_words > room) {
++		return 0;
++	}
++	words[0] = bl_long_header(count);
++	for (unsigned int w = 0; w < payload_words; w++) {
++		uint32_t word = 0;
++
++		for (unsigned int b = 0; b < 4; b++) {
++			const unsigned int i = w * 4u + b;
++
++			word |= (uint32_t)(i < count ? bytes[i] : 0xffu) << (8u * b);
++		}
++		words[1 + w] = word;
++	}
++	return 1u + payload_words;
++}
++
++/*
++ * One packet through the TPG FIFO, following BacklightProbe.cpp sendPacket :84-123 exactly.
++ *
++ * Competition with the MDP frame engine is avoided the way the precedent does it, not by masking
++ * CPU interrupts: (a) STATUS bit 2 (MDP busy) is polled until clear before the FIFO is taken, so an
++ * in-flight frame/packet wins and we wait; (b) the INT_CTRL writes are read-modify-write that only
++ * W1C the done/error status bits and leave the interrupt ENABLE mask untouched, so the display's own
++ * interrupt configuration is never disturbed (rui :94, :112). No CPU interrupt is disabled because
++ * completion is polled, not interrupt-driven, and the transfer retires within the 50 ms bound.
++ *
++ * On EVERY return the DMA_CTRL/TPG_CTRL registers are restored to their pre-packet values: the
++ * display keeps scanning out through this controller, and rui measured that leaving embedded mode
++ * set stopped the boot a few seconds later (:98-99). The restore runs inside this function on the
++ * timeout path too. The only early return that has not written anything is the idle-timeout, where
++ * there is nothing to restore.
++ *
++ * Returns 0 on success, -1 if the command path stayed busy (idle timeout), -2 if the DMA-done
++ * interrupt never came (done timeout; DMA_CTRL/TPG_CTRL already restored).
++ */
++static int
++bl_send(const uint32_t *words, unsigned int count, unsigned int *step)
++{
++	bool idle = false;
++	unsigned int waited;
++
++	for (waited = 0; waited < BL_IDLE_TIMEOUT_US; waited += 2) {
++		if ((bl_rd32(BL_REG_STATUS) & BL_STATUS_MDP_BUSY) == 0) {
++			idle = true;
++			break;
++		}
++		bl_spin_us(2);
++	}
++	if (!idle) {
++		return -1;                              /* nothing written yet: nothing to restore */
++	}
++
++	/* W1C a stale DMA-done; the ~(1<<24|1<<28) leaves the interrupt enable mask alone. */
++	bl_wr32(BL_REG_INT_CTRL,
++	    (bl_rd32(BL_REG_INT_CTRL) & ~BL_INT_CLEAR_ERRORS) | BL_INT_DMA_DONE, (*step)++);
++	bl_wr32(BL_REG_TPG_CTRL, BL_TPG_FIFO, (*step)++);
++	for (unsigned int i = 0; i < count; i++) {
++		bl_wr32(BL_REG_TPG_INIT, words[i], (*step)++);
++	}
++	if (count & 1u) {
++		bl_wr32(BL_REG_TPG_INIT, 0, (*step)++);    /* the extra DWORD the hardware wants */
++	}
++
++	const uint32_t dma_before = bl_rd32(BL_REG_DMA_CTRL);
++	uint32_t dma = dma_before & ~((1u << 31) | (1u << 30) | (1u << 26));
++	dma |= BL_DMA_EMBEDDED;
++	bl_wr32(BL_REG_DMA_CTRL, dma, (*step)++);
++	bl_wr32(BL_REG_DMA_LEN, count * 4u, (*step)++);
++	bl_wr32(BL_REG_SW_TRIGGER, 1u, (*step)++);
++
++	bool done = false;
++	for (waited = 0; waited < BL_DONE_TIMEOUT_US; waited += 20) {
++		if (bl_rd32(BL_REG_INT_CTRL) & BL_INT_DMA_DONE) {
++			done = true;
++			break;
++		}
++		bl_spin_us(20);
++	}
++
++	/* Restore in every case, timeout included (the display still drives this controller). */
++	bl_wr32(BL_REG_INT_CTRL,
++	    (bl_rd32(BL_REG_INT_CTRL) & ~BL_INT_CLEAR_ERRORS) | BL_INT_DMA_DONE, (*step)++);
++	bl_wr32(BL_REG_TPG_CTRL, 0, (*step)++);
++	bl_wr32(BL_REG_DMA_CTRL, dma_before, (*step)++);
++	bl_wr32(BL_REG_TPG_FIFO_RESET, 1u, (*step)++);
++	bl_spin_us(1);
++	bl_wr32(BL_REG_TPG_FIFO_RESET, 0, (*step)++);
++	return done ? 0 : -2;
++}
++
++int
++pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level)
++{
++	if (!reply || reply_cap == 0) {
++		return -1;
++	}
++	reply[0] = '\0';
++
++	if (!g_bl_dsi) {
++		g_bl_dsi = ml_io_map(BL_DSI0_PHYS, BL_DSI0_WINDOW);
++	}
++	if (!g_bl_dsi) {
++		snprintf(reply, reply_cap, "[PONG_BL] map ae94000 failed\n");
++		bl_pmsg(reply);
++		return -1;
++	}
++
++	if (mode == 0) {
++		/* Read-only survey: the controllers affected by a later write, plus the version.
++		 * No MMIO write; the pmsg line below is ramoops, not the DSI hardware. */
++		const uint32_t hw = bl_rd32(BL_REG_HW_VERSION);
++		const uint32_t ctrl = bl_rd32(BL_REG_CTRL);
++		const uint32_t status = bl_rd32(BL_REG_STATUS);
++		const uint32_t dma = bl_rd32(BL_REG_DMA_CTRL);
++		const uint32_t intr = bl_rd32(BL_REG_INT_CTRL);
++		const uint32_t tpg = bl_rd32(BL_REG_TPG_CTRL);
++
++		snprintf(reply, reply_cap,
++		    "[PONG_BL] rd hw=%08x ctrl=%08x status=%08x dma=%08x int=%08x tpg=%08x\n",
++		    hw, ctrl, status, dma, intr, tpg);
++		bl_pmsg(reply);
++		return 0;
++	}
++
++	if (mode == 1) {
++		if (level < BL_DBV_MIN || level > BL_DBV_MAX) {
++			snprintf(reply, reply_cap,
++			    "[PONG_BL] set dbv=%u rejected (dbv must be %u..%u)\n",
++			    level, BL_DBV_MIN, BL_DBV_MAX);
++			bl_pmsg(reply);
++			return -2;
++		}
++
++		/*
++		 * Go/no-go before any write, the predicate PongBacklight.cpp:343 uses at handoff:
++		 * the version word must be neither 0 nor all-ones (a dead or unmapped link reads both),
++		 * DSI_EN (CTRL bit 0) must be set, and the pattern engine must not already be active.
++		 * mainline additionally expects CTRL == 0x1f5 (gts7xl-panel-ctl.c:26); the raw value is
++		 * in the reply so the owner can judge without that equality baked in.
++		 */
++		const uint32_t hw = bl_rd32(BL_REG_HW_VERSION);
++		const uint32_t ctrl = bl_rd32(BL_REG_CTRL);
++		const uint32_t tpg_before = bl_rd32(BL_REG_TPG_CTRL);
++		const uint32_t dma_before = bl_rd32(BL_REG_DMA_CTRL);
++
++		if (!hw || hw == ~0u || (ctrl & 1u) == 0 || (tpg_before & 1u) != 0) {
++			snprintf(reply, reply_cap,
++			    "[PONG_BL] set dbv=%u no-go hw=%08x ctrl=%08x tpg=%08x\n",
++			    level, hw, ctrl, tpg_before);
++			bl_pmsg(reply);
++			return -3;
++		}
++
++		/* Three DCS long writes in Samsung's order (writeBrightness :142-152; DTS:22744):
++		 * 68 19 20 00 14, then 51 DBV[7:0] DBV[10:8], then 53 20. */
++		static const uint8_t gamma[] = { 0x68, 0x19, 0x20, 0x00, 0x14 };
++		const uint8_t dbv[3] = {
++			BL_DCS_BRIGHTNESS,
++			(uint8_t)(level & 0xffu),
++			(uint8_t)((level >> 8) & 0x7u),
++		};
++		const uint8_t control[2] = { BL_DCS_CONTROL, 0x20 };
++
++		uint32_t words[4];
++		unsigned int step = 1;
++		unsigned int sent = 0;
++		int rc;
++
++		bl_pmsg("[PONG_BL] set\n");
++		rc = bl_send(words, bl_pack(gamma, (unsigned)sizeof gamma, words, 4), &step);
++		if (rc) {
++			goto done;
++		}
++		sent++;
++		rc = bl_send(words, bl_pack(dbv, 3u, words, 4), &step);
++		if (rc) {
++			goto done;
++		}
++		sent++;
++		rc = bl_send(words, bl_pack(control, 2u, words, 4), &step);
++		if (rc) {
++			goto done;
++		}
++		sent++;
++
++done:
++	{
++		const uint32_t dma_after = bl_rd32(BL_REG_DMA_CTRL);
++		const uint32_t tpg_after = bl_rd32(BL_REG_TPG_CTRL);
++		const uint32_t intr = bl_rd32(BL_REG_INT_CTRL);
++
++		/* dma/tpg show the value before the run and after (must be equal -- the display lives here);
++		 * pkt/step name the first packet that failed, or 3/3 and the last write when all took. */
++		snprintf(reply, reply_cap,
++		    "[PONG_BL] set dbv=%u pkt=%u/3 step=%u rc=%d hw=%08x ctrl=%08x "
++		    "dma=%08x>%08x int=%08x tpg=%08x>%08x\n",
++		    level, sent, step, rc,
++		    hw, ctrl, dma_before, dma_after, intr, tpg_before, tpg_after);
++		bl_pmsg(reply);
++		return rc ? -4 : 0;
++	}
++	}
++
++	snprintf(reply, reply_cap, "[PONG_BL] mode %d unsupported\n", mode);
++	bl_pmsg(reply);
++	return -1;
++}
++#endif /* PONG */
+\ No newline at end of file
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index bd86ac8..8eb82cc 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -69,6 +69,10 @@ extern int pong_wifi_link_down(char *reply, size_t reply_len);
+ extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ extern int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ extern int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
++/* pong_backlight_t970.c: DSI0 DCS backlight probe; one result line (mode 0 read, 1 write) */
++extern int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
++/* IOPMPowerSource.cpp: battery temperature in tenths of a degree, -32768 until the gauge was read */
++extern int pong_battery_last_decic;
+ /* pong_gpu_probe.c: staged Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ extern struct vc_info vinfo;
+@@ -1340,6 +1344,91 @@ cmd_handle_wifis3b(int what)
+ 	send_str(reply[0] ? reply : "wifis3b: no reply\n");
+ }
+ 
++/*
++ * bl: read-only survey of the DSI0 register block the backlight transfer uses (mode 0, zero writes).
++ * `bl N` with N = 10..2047: send the three DCS long-write packets for that DBV once (mode 1).
++ * The reply is pong_backlight_t970.c's single result line; an out-of-range N is rejected there.
++ */
++static void
++cmd_handle_bl(const char *arg)
++{
++	char reply[512];
++	const char *p = arg;
++	bool has_num = false;
++	uint32_t level = 0;
++
++	reply[0] = '\0';
++	while (*p == ' ') {
++		p++;
++	}
++	if (*p >= '0' && *p <= '9') {
++		has_num = true;
++		level = parse_num(&p);
++	}
++	(void)pong_backlight_usb(reply, sizeof(reply), has_num ? 1 : 0, level);
++	send_str(reply[0] ? reply : "bl: no reply\n");
++}
++
++/*
++ * temp: the SoC's temperature sensors, read only. TSENS v2: sensor n at TM + 0xa0 + 4n, bits 11:0 signed tenths
++ * of a degree, bit 21 valid (UniXNU-gts7xlwifi package/CpuFreqProbe.cpp:121-134, same tablet). Stock DTS:
++ * tsens@c222000 TM 0xc263000, sensors 0-15 = aoss-0, cpu-0-0..3, cpuss-0, cpuss-1, cpu-1-0..7, gpuss-0;
++ * tsens@c223000 TM 0xc265000, sensors 0-8 = aoss-1, cwlan, video, ddr, q6-hvx, camera, cmpss, npu, gpuss-1.
++ * The reply lists whole degrees in that order ("-" = no valid reading), the hottest, and the battery's
++ * temperature in tenths when the battery worker has read the fuel gauge.
++ */
++static vm_offset_t tsens_va[2];
++
++static void
++cmd_handle_temp(void)
++{
++	static const vm_offset_t tm[2] = { 0x0c263000UL, 0x0c265000UL };
++	static const unsigned sensors[2] = { 16, 9 };
++	char reply[400];
++	int n = 0, k, hottest = -32768;
++
++	for (unsigned b = 0; b < 2; b++) {
++		if (!tsens_va[b]) {
++			tsens_va[b] = ml_io_map(tm[b], 0x1000);
++		}
++		k = snprintf(reply + n, sizeof(reply) - (size_t)n, "%s", b ? " | t1" : "temp: t0");
++		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++		if (!tsens_va[b]) {
++			k = snprintf(reply + n, sizeof(reply) - (size_t)n, " map-failed");
++			n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++			continue;
++		}
++		for (unsigned i = 0; i < sensors[b]; i++) {
++			uint32_t v = *(volatile uint32_t *)(tsens_va[b] + 0xa0 + 4 * i);
++			int t = (int)(v & 0xfffu);
++
++			if (t & 0x800) {
++				t -= 0x1000;
++			}
++			if (!(v & (1u << 21))) {
++				k = snprintf(reply + n, sizeof(reply) - (size_t)n, " -");
++			} else {
++				if (t > hottest) {
++					hottest = t;
++				}
++				k = snprintf(reply + n, sizeof(reply) - (size_t)n, " %d", t / 10);
++			}
++			n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++		}
++	}
++	if (hottest != -32768) {
++		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " | max %d.%d", hottest / 10, hottest < 0 ? -hottest % 10 : hottest % 10);
++		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++	}
++	if (pong_battery_last_decic != -32768) {
++		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " | batt %d.%d", pong_battery_last_decic / 10,
++		    pong_battery_last_decic < 0 ? -pong_battery_last_decic % 10 : pong_battery_last_decic % 10);
++		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++	}
++	(void)snprintf(reply + n, sizeof(reply) - (size_t)n, "\n");
++	send_str(reply);
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1492,6 +1581,12 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifis3b(3);
+ 	} else if (strcmp(cmd, "wifis3b undo") == 0) {
+ 		cmd_handle_wifis3b(9);
++	} else if (strcmp(cmd, "temp") == 0) {
++		cmd_handle_temp();
++	} else if (strcmp(cmd, "bl") == 0) {
++		cmd_handle_bl("");
++	} else if (strncmp(cmd, "bl ", 3) == 0) {
++		cmd_handle_bl(cmd + 3);
+ 	} else if (strcmp(cmd, "gpuprobe") == 0) {
+ 		cmd_handle_gpuprobe(1);
+ 	} else if (strcmp(cmd, "gpuprobe cx") == 0) {
+@@ -1503,7 +1598,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index 727ef14..49560f0 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -588,9 +588,9 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+ }
+ 
+ /*
+- * SM-T970 MAX77705 telemetry. All transactions below are I2C reads. The
+- * charger is observed for input/charge state; no charger configuration,
+- * watchdog, regulator, or MUIC command is written by this feature.
++ * SM-T970 MAX77705 telemetry. Every transaction below is an I2C read except
++ * one: the charger watchdog kick (kickChargerWatchdog). No other charger
++ * configuration, regulator, or MUIC command is written by this feature.
+  *
+  * DT evidence: work/gts7xlwifi.dtb, /soc/i2c@980000 (QUP SE0, Linux bus 2),
+  * with North TLMM GPIO 28 SDA / 29 SCL. Fuel gauge 0x36 and charger 0x69
+@@ -598,6 +598,8 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+  * 40-42 are not used. The bus is enabled only by pong_battery=1.
+  */
+ void pong_battery_publish(IOPMPowerSource *, unsigned int, unsigned int, bool, bool, unsigned int, int, unsigned int, bool, bool, bool);
++/* The battery temperature in tenths of a degree for the USB `temp` command; -32768 until the gauge was read. */
++extern "C" { extern int pong_battery_last_decic; int pong_battery_last_decic = -32768; }
+ namespace {
+ constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
+ constexpr vm_size_t kT970TlmmBytes = 0x100000;
+@@ -710,6 +712,30 @@ static int readReg(uint8_t address, uint8_t reg, uint8_t *out, unsigned count) {
+ 	busStop();
+ 	return 0;
+ }
++/*
++ * The one write. Samsung's charger driver arms the MAX77705 charger watchdog (CHG_CNFG_00 0xb7 bit 4 WDTEN)
++ * and kicks it (max77705_chg_set_wdtmr_kick: CHG_CNFG_06 0xbd bits 1:0 = 01). Under iPadOS nobody did, and the
++ * charger turned itself off with the cable in (CHG_DETAILS_01 state 0xb while CHGIN_OK is set). Same register,
++ * same value and same 10 s period as UniXNU-gts7xlwifi package/T970Battery.cpp:12-15, 170-172 (same tablet).
++ * Bits 7:2 of CHG_CNFG_06 (the CHGPROT unlock field among them) are written back as read.
++ */
++static int writeReg(uint8_t address, uint8_t reg, uint8_t value) {
++	if (!gT970Tlmm) return -1;
++	if (!busStart()) { busStop(); return -2; }
++	if (!putByte(uint8_t(address << 1))) { busStop(); return -3; }
++	if (!putByte(reg)) { busStop(); return -4; }
++	if (!putByte(value)) { busStop(); return -5; }
++	busStop();
++	return 0;
++}
++static int kickChargerWatchdog(uint8_t *before) {
++	uint8_t cnfg06 = 0;
++	int rc = readReg(kT970Charger, 0xbd, &cnfg06, 1);
++	if (rc) return rc;
++	*before = cnfg06;
++	rc = writeReg(kT970Charger, 0xbd, uint8_t((cnfg06 & ~3u) | 1u));
++	return rc ? rc - 10 : 0;
++}
+ static int readWord(uint8_t address, uint8_t reg, uint16_t *value) {
+ 	uint8_t b[2] = {};
+ 	const int rc = readReg(address, reg, b, 2);
+@@ -720,6 +746,9 @@ struct BatterySample {
+ 	unsigned permille, voltageMv, fullMah, designMah, cycles;
+ 	int currentMa;
+ 	int chargerRc;
++	int decic;
++	bool tempValid;
++	uint8_t details, intOk;
+ 	bool chargerValid, external, charging, full;
+ };
+ static int sample(BatterySample *s) {
+@@ -739,11 +768,16 @@ static int sample(BatterySample *s) {
+ 	s->fullMah = unsigned(full) * kT970RsenseMilliOhm / 2;
+ 	s->designMah = unsigned(design) * kT970RsenseMilliOhm / 2;
+ 	s->cycles = unsigned(cycles) / 100;
++	uint16_t temp = 0;
++	s->tempValid = !readWord(kT970Gauge, 0x08, &temp);        /* Temp: signed 1/256 C */
++	s->decic = int(int16_t(temp)) * 10 / 256;
+ 	uint8_t intOk = 0, details = 0;
+ 	const int irc = readReg(kT970Charger, 0xb2, &intOk, 1);
+ 	const int drc = irc ? irc : readReg(kT970Charger, 0xb4, &details, 1);
+ 	s->chargerRc = drc;
+ 	s->chargerValid = !drc;
++	s->details = details;
++	s->intOk = intOk;
+ 	if (s->chargerValid) {
+ 		const unsigned state = details & 0x0f;
+ 		s->external = (intOk & 0x40) != 0;
+@@ -770,6 +804,7 @@ static void publish(IOPMPowerSource *ps, const BatterySample &s) {
+ 	setNumber(ps, "DesignCapacity", s.designMah);
+ 	setNumber(ps, "AppleRawMaxCapacity", s.fullMah);
+ 	setNumber(ps, "InstantAmperage", uint32_t(s.currentMa));
++	if (s.tempValid) setNumber(ps, "Temperature", uint32_t(s.decic * 10));   /* hundredths of a degree */
+ 	if (s.chargerValid) {
+ 		setBoolean(ps, "FullyCharged", s.full);
+ 		setBoolean(ps, "BatteryIsCharging", s.charging);
+@@ -794,7 +829,19 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 	IODelay(100);
+ 	IOPMPowerSource *ps = nullptr;
+ 	unsigned failures = 0;
++	/* pong_charger_kick=0 leaves the charger watchdog alone (charging then stops, as before this change). */
++	unsigned kick = 1, kicks = 0, kickFails = 0, lastState = 0xff;
++	PE_parse_boot_argn("pong_charger_kick", &kick, sizeof(kick));
+ 	for (;;) {
++		if (kick == 1) {
++			uint8_t cnfg06 = 0;
++			const int krc = kickChargerWatchdog(&cnfg06);
++			if (krc) {
++				if (kickFails++ < 5) batteryPmsg("PONG_BATT fail wdt-kick rc=%d\n", krc);
++			} else if (kicks++ == 0) {
++				batteryPmsg("PONG_BATT wdt first kick cnfg06=%02x\n", cnfg06);
++			}
++		}
+ 		BatterySample s = {};
+ 		const int rc = sample(&s);
+ 		if (rc) {
+@@ -814,6 +861,12 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 					ps->setProperty("DeviceName", "MAX77705 Battery");
+ 				}
+ 			}
++			if (s.tempValid) pong_battery_last_decic = s.decic;
++			if (s.chargerValid && unsigned((s.details & 0x0f) | (s.intOk & 0x40)) != lastState) {
++				lastState = unsigned((s.details & 0x0f) | (s.intOk & 0x40));
++				batteryPmsg("PONG_BATT chg dtls=%02x ok=%02x ext=%u chg=%u ma=%d kicks=%u\n", s.details, s.intOk,
++				    s.external, s.charging, s.currentMa, kicks);
++			}
+ 			if (ps) {
+ 				publish(ps, s);
+ 				if (!ps->getProperty("PongBatteryPublished")) {
+@@ -825,7 +878,7 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 				}
+ 			}
+ 		}
+-		IOSleep(60000);
++		IOSleep(10000);
+ 	}
+ }
+ } // namespace
