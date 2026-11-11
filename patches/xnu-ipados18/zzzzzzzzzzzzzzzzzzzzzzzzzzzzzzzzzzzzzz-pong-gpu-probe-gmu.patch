@@ -1,0 +1,127 @@
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index fa55208..bb42d6d 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -8,6 +8,8 @@
+  * `gpuprobe gmuclk` (mode 6) additionally votes GPLL0 for GPU, sets GPU_CC_GMU_CLK_SRC to
+  * 200 MHz (GPLL0 div / 1.5), enables the five GMU branch clocks, reads AOP cmd-db ARC entries
+  * (`gfx.lvl`, `cx.lvl`, `mx.lvl`), and reads GMU status registers in Stage 3.
++ * `gpuprobe gmu` (mode 7) reuses mode 6's clocks, then reads the GMU cold-start preconditions
++ * only (RSCC sequencer, GMU2HOST fault info, the reset/HFI words); it never loads firmware.
+  *
+  * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
+  *   package/GpuPowerBoard.h and package/GpuProbe.cpp (modes 1, 3, 5, and 6).
+@@ -136,6 +138,18 @@ int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ #define GMU_AO_HOST_INT_STATUS_OFF      0xc14u  /* dword 0x9305 -> byte 0x24c14 */
+ #define GMU_AHB_FENCE_STATUS_OFF        0xc4cu  /* dword 0x9313 -> byte 0x24c4c */
+ 
++#define GMU_GMU2HOST_INTR_INFO_OFF      0x648u  /* dword 0x5192 -> byte 0x14648 (GMU2HOST_INTR_INFO) */
++
++/* RSCC block (gmu_write_rscc, 0x03de0000): read-only cold-start preconditions (A650Gmu.c:22-26, GpuPowerBoard.h:87) */
++#define GMU_RSCC_PAGE_PHYS              0x03de0000UL
++#define GMU_RSCC_PAGE_SIZE              0x00001000UL
++#define GMU_RSCC_RSC_STATUS0_OFF        0x010u  /* dword 0x004 -> byte 0x010 */
++#define GMU_RSCC_SEQ_BUSY_OFF           0x404u  /* dword 0x101 -> byte 0x404 */
++
++/* GMU fatal interrupt bits, a6xx_gmu (A650Gmu.c:29-30): WDOG_BITE | HOST_AHB_BUS_ERROR | FENCE_ERR, then CM3_FAULT. */
++#define GMU_AO_FATAL_BITS               0x00000029u
++#define GMU_CM3_FATAL_BITS              0x00800000u
++
+ /* ---- Stage 4: GPU RBBM (qcom,kgsl-3d0@3d00000, gts7xlwifi.dts:32550, GpuProbe.cpp:94) ----- */
+ #define GPU_RBBM_PAGE_PHYS              0x03d00000UL
+ #define GPU_RBBM_PAGE_SIZE              0x00001000UL
+@@ -152,6 +166,7 @@ static vm_offset_t g_gmu_14k_page;
+ static vm_offset_t g_gmu_24k_page;
+ static vm_offset_t g_gpu_rbbm_page;
+ static vm_offset_t g_cmd_db_page;
++static vm_offset_t g_rscc_page;
+ 
+ /* Strictly read-only 32-bit volatile MMIO helper with load barrier (no memcpy/memmove) */
+ static inline uint32_t
+@@ -674,7 +689,9 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	}
+ 
+ 	bool gmu_read = false;
++	bool gmupre_read = false;
+ 	uint32_t gmu_rst = 0, gmu_fw = 0, gmu_gx = 0, gmu_hfi = 0, gmu_irq = 0, gmu_fence = 0;
++	uint32_t gmu_intr = 0, rscc_seq = 0, rscc_rsc = 0;
+ 	if ((cc_ahb & CBCR_CLK_OFF_BIT) == 0 && (cc_gmu & CBCR_CLK_OFF_BIT) == 0) {
+ 		gpu_probe_pmsg("[PONG_GPU] P3b gmu_regs\n");
+ 		if (!g_gmu_14k_page) {
+@@ -692,12 +709,30 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 			gmu_fence = gpu_probe_rd32(g_gmu_24k_page, GMU_AHB_FENCE_STATUS_OFF);
+ 			gmu_read  = true;
+ 		}
++		/*
++		 * Mode 7 (`gpuprobe gmu`): read-only cold-start preconditions (A650Gmu.c:140-149, 51-55),
++		 * following GpuPowerBoard.h:324-339 which reads the RSCC only with CX on and the AHB + CX GMU
++		 * clocks running (both hold here). No register is written and no firmware is loaded.
++		 */
++		if (mode >= 7 && gmu_read) {
++			gpu_probe_pmsg("[PONG_GPU] P3c gmu_rscc_pre\n");
++			gmu_intr = gpu_probe_rd32(g_gmu_14k_page, GMU_GMU2HOST_INTR_INFO_OFF);
++			if (!g_rscc_page) {
++				g_rscc_page = ml_io_map(GMU_RSCC_PAGE_PHYS, GMU_RSCC_PAGE_SIZE);
++			}
++			if (g_rscc_page) {
++				rscc_seq = gpu_probe_rd32(g_rscc_page, GMU_RSCC_SEQ_BUSY_OFF);
++				rscc_rsc = gpu_probe_rd32(g_rscc_page, GMU_RSCC_RSC_STATUS0_OFF);
++				gmupre_read = true;
++			}
++		}
+ 	}
+ 
+-	char gmuclk_extra[256];
++	char gmuclk_extra[640];
++	size_t extra_len = 0;
+ 	gmuclk_extra[0] = '\0';
+ 	if (mode >= 6) {
+-		snprintf(gmuclk_extra, sizeof(gmuclk_extra),
++		extra_len = (size_t)snprintf(gmuclk_extra, sizeof(gmuclk_extra),
+ 		    " gmuclk[gpll0=0x%08x>0x%08x rcg=0x%08x/0x%08x>0x%08x/0x%08x "
+ 		    "gmu=0x%08x>0x%08x axi=0x%08x>0x%08x memnoc=0x%08x>0x%08x] "
+ 		    "cmddb[magic=0x%08x gfx=0x%x/%u cx=0x%x/%u mx=0x%x/%u]",
+@@ -706,6 +741,15 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 		    ddrss_axi_before, gcc_ddrss_axi, memnoc_before, gcc_memnoc,
+ 		    cmddb_magic, gfx_addr, gfx_len, cx_addr, cx_len, mx_addr, mx_len);
+ 	}
++	if (mode >= 7 && gmupre_read && extra_len < sizeof(gmuclk_extra)) {
++		const uint32_t ao_fault  = gmu_irq & GMU_AO_FATAL_BITS;
++		const uint32_t cm3_fault = gmu_intr & GMU_CM3_FATAL_BITS;
++		const unsigned int ready = (gmu_rst == 1u) && (rscc_seq == 0u) &&
++		    ((gmu_hfi & 1u) == 0u) && (ao_fault == 0u) && (cm3_fault == 0u);
++		extra_len += (size_t)snprintf(gmuclk_extra + extra_len, sizeof(gmuclk_extra) - extra_len,
++		    " gmupre[ready=%u sysreset=%u seqbusy=%u rsc=%#x intr=%#x next=fwload]",
++		    ready, gmu_rst, rscc_seq, rscc_rsc, gmu_intr);
++	}
+ 
+ 	/*
+ 	 * Gate 3 -> 4:
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index d1139a7..bd86ac8 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1278,11 +1278,12 @@ cmd_handle_wifi(bool up)
+ }
+ 
+ /*
+- * gpuprobe [cx|gmuclk]: staged Adreno 650 probe (GCC -> GPUCC -> SMMU GR0 -> RBBM_STATUS).
++ * gpuprobe [cx|gmuclk|gmu]: staged Adreno 650 probe (GCC -> GPUCC -> SMMU GR0 -> RBBM_STATUS).
+  * Plain `gpuprobe` (mode 1) is strictly read-only (zero writes); `gpuprobe cx` (mode 3)
+  * powers on GPU_CC_CX_GDSCR and enables AHB + SMMU vote clocks before reading SMMU GR0;
+  * `gpuprobe gmuclk` (mode 6) also brings up the GMU 200 MHz RCG + 5 GMU branches and reads
+- * AOP cmd-db ARC entries and GMU status registers.
++ * AOP cmd-db ARC entries and GMU status registers; `gpuprobe gmu` (mode 7) reuses mode 6's
++ * clocks and reads the GMU cold-start preconditions (RSCC + fault words) read-only.
+  */
+ static void
+ cmd_handle_gpuprobe(int mode)
+@@ -1497,6 +1498,8 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_gpuprobe(3);
+ 	} else if (strcmp(cmd, "gpuprobe gmuclk") == 0) {
+ 		cmd_handle_gpuprobe(6);
++	} else if (strcmp(cmd, "gpuprobe gmu") == 0) {
++		cmd_handle_gpuprobe(7);
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
