@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/PongBacklightT970.cpp b/iokit/Kernel/PongBacklightT970.cpp
+index 688baa6..7966474 100644
+--- a/iokit/Kernel/PongBacklightT970.cpp
++++ b/iokit/Kernel/PongBacklightT970.cpp
+@@ -39,9 +39,10 @@
+ 
+ extern "C" int pong_backlight_set_dbv(uint32_t dbv);
+ 
++class T970Backlight;
++
+ namespace {
+ const OSMetaClass *gAppleClass;
+-class T970Backlight;
+ T970Backlight *gPublished;
+ 
+ /* The one place the service's brightness unit maps to a panel DBV. Linear for now: the unit IS
