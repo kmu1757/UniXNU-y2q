@@ -1,0 +1,71 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 130637e..7fbed62 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -34,6 +34,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
+ extern void IOFreeContiguous(void *address, vm_size_t size);
+ int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
++int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern unsigned int vm_page_free_count;
+ 
+@@ -1750,6 +1751,38 @@ cmd_handle_wifis3cd(int stage, int what)
+ 	send_str(reply[0] ? reply : "wifis3: no reply\n");
+ }
+ 
++/*
++ * irqdbg [N]: read, and with N set, the development kernel's "interrupts were held disabled too long" check
++ * (kern.interrupt_masked_debug_mode: 0 off, 1 trace, 2 panic). On 11-11 this check panicked the tablet twice, in
++ * bzero_phys / bcopy_phys of ordinary user tasks, 0.66 ms and about 2.5 ms against a 0.625 ms limit; the cause of
++ * the long section is not known yet. Setting it from here, after boot, leaves early boot exactly as it was.
++ */
++static void
++cmd_handle_irqdbg(const char *arg)
++{
++	char reply[120];
++	const char *p = arg;
++	unsigned was = 0xffffffffu, now = 0xffffffffu, mode = 0;
++	size_t len = sizeof(was);
++	int rc, rc_set = 0, rc_now;
++	bool set = false;
++
++	while (*p == ' ') {
++		p++;
++	}
++	rc = kernel_sysctlbyname("kern.interrupt_masked_debug_mode", &was, &len, NULL, 0);
++	if (*p >= '0' && *p <= '2') {
++		set = true;
++		mode = parse_num(&p);
++		rc_set = kernel_sysctlbyname("kern.interrupt_masked_debug_mode", NULL, NULL, &mode, sizeof(mode));
++	}
++	len = sizeof(now);
++	rc_now = kernel_sysctlbyname("kern.interrupt_masked_debug_mode", &now, &len, NULL, 0);
++	snprintf(reply, sizeof(reply), "irqdbg: was %u (rc %d) set %u (%s rc %d) now %u (rc %d)\n",
++	    was, rc, mode, set ? "yes" : "no", rc_set, now, rc_now);
++	send_str(reply);
++}
++
+ /* Dispatch Received Command String */
+ static void
+ dispatch_command(const char *cmd)
+@@ -1840,6 +1873,10 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_fwput(cmd + 6);
+ 	} else if (strcmp(cmd, "fwlist") == 0) {
+ 		cmd_handle_fwlist();
++	} else if (strcmp(cmd, "irqdbg") == 0) {
++		cmd_handle_irqdbg("");
++	} else if (strncmp(cmd, "irqdbg ", 7) == 0) {
++		cmd_handle_irqdbg(cmd + 7);
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
+@@ -1857,7 +1894,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, fwput, fwlist, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, fwput, fwlist, irqdbg, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
