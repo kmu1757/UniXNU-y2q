@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index cf2b5a4..7eef260 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -16,11 +16,13 @@
+  *      - `kgsl-smmu@3da0000`:     reg = <0x03da0000 0x10000> (qcom,kgsl-smmu-v2, lines 32270-32271)
+  *      - `pil_gpu_region@8681a000`: reg = <0x0 0x9031a000 0x0 0x2000> (gpu_zap_shader, lines 34582-34585)
+  *   2. Linux mainline `drivers/clk/qcom/gcc-sm8250.c` and `drivers/clk/qcom/gpucc-sm8250.c`.
+- *   3. Measured SM-T970 mode-1 boot log in `ref/rui-gts7xlwifi/docs/evidence/periph15-bootlog.txt`:
+- *      - GCC: cfg_ahb=0x80002003, memnoc=0x80000000, snoc_dvm=0x80000000, ddrss_axi=0x80002220,
+- *             misc=0x00000000, gpll0=0x00007927
+- *      - GPUCC (before CX_GDSC power-up): cx_gdscr=0x00000001, gx_gdscr=0x00022005,
+- *             ahb=0x80000002, smmu=0x80000001, gmu=0x80000000, cxo=0x80000000, cxo_aon=0x80000001
++ *   3. Measured SM-T970 (`half16` = `e70272e`, 2026-11-11 09:34, read-only `gpuprobe` over USB):
++ *      - Stage 1 (GCC): `cfg_ahb=0x00000001` (`CLK_OFF=0`, `CLK_ENABLE=1`), `memnoc=0x80004221`,
++ *        `snoc_dvm=0x80000001`, `ddrss_axi=0x00100000` (`CLK_OFF=0`), `misc=0x00000000`, `gpll0=0x01206d7f`.
++ *      - Stage 2 (GPUCC, before CX_GDSC power-up): `cx_gdscr=0x00222001` (`PWR_ON=0`, `SW_COLLAPSE=1`),
++ *        `cx_hw=0x00005ff4`, `gx_gdscr=0x00222001`, `ahb=0x80000001`, `smmu=0x80000000`,
++ *        `gmu=0x80004220`, `cxo=0x80000001`, `cxo_aon=0x00000000`, `rcgr_cmd=0x80000000`,
++ *        `rcgr_cfg=0x00000001`, `pll1=0x00000000` -> stops at `stage=2(gpucc) stop=cx_gdsc_off`.
+  *
+  * Staged gating discipline (prevents unclocked MMIO bus hangs / silent SoC resets):
+  *   Stage 1 (gcc):         Read GCC GPU branch CBCRs (0x00171000) and GPLL0 vote (0x00152000).
+@@ -93,18 +95,18 @@ int pong_gpu_probe_usb(char *reply, size_t reply_cap);
+ #define SMMU_GR0_SMR_BASE_OFF           0x800u
+ #define SMMU_GR0_S2CR_BASE_OFF          0xc00u
+ 
+-/* GMU status windows inside qcom,gmu@3d6a000 (gts7xlwifi.dts:32333, GpuProbe.cpp:80-92) */
++/* GMU status windows inside qcom,gmu@3d6a000 (gts7xlwifi.dts:32333, GpuPowerBoard.h:80-86) */
+ #define GMU_PAGE_14K_PHYS               (0x03d6a000UL + 0x14000UL)
+ #define GMU_PAGE_14K_SIZE               0x00001000UL
+ #define GMU_CM3_SYSRESET_OFF            0x000u  /* dword 0x5000 -> byte 0x14000 */
+ #define GMU_CM3_FW_INIT_RESULT_OFF      0x070u  /* dword 0x501c -> byte 0x14070 */
+-#define GMU_GX_PWR_CLK_STATUS_OFF       0x300u  /* dword 0x50c0 -> byte 0x14300 */
++#define GMU_GX_PWR_CLK_STATUS_OFF       0x340u  /* dword 0x50d0 -> byte 0x14340 (SPTPRAC_PWR_CLK_STATUS) */
+ #define GMU_HFI_CTRL_STATUS_OFF         0x600u  /* dword 0x5180 -> byte 0x14600 */
+ 
+ #define GMU_PAGE_24K_PHYS               (0x03d6a000UL + 0x24000UL)
+ #define GMU_PAGE_24K_SIZE               0x00001000UL
+ #define GMU_AO_HOST_INT_STATUS_OFF      0xc14u  /* dword 0x9305 -> byte 0x24c14 */
+-#define GMU_AHB_FENCE_STATUS_OFF        0xc40u  /* dword 0x9310 -> byte 0x24c40 */
++#define GMU_AHB_FENCE_STATUS_OFF        0xc4cu  /* dword 0x9313 -> byte 0x24c4c */
+ 
+ /* ---- Stage 4: GPU RBBM (qcom,kgsl-3d0@3d00000, gts7xlwifi.dts:32550, GpuProbe.cpp:94) ----- */
+ #define GPU_RBBM_PAGE_PHYS              0x03d00000UL
+@@ -175,9 +177,9 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap)
+ 	const uint32_t gcc_gpll0     = gpu_probe_rd32(g_gcc_vote_page, GCC_APCS_GPLL0_ENA_VOTE_OFF);
+ 
+ 	/*
+-	 * Gate 1 -> 2 (GpuProbe.cpp:424):
++	 * Gate 1 -> 2 (GpuPowerBoard.h:117-119, 152):
+ 	 * GPUCC register space (0x03d90000) is clocked by GCC_GPU_CFG_AHB_CBCR.
+-	 * On SM8250, UEFI leaves GCC_GPU_CFG_AHB_CBCR = 0x80002003 (CLK_ENABLE=1, HW_CLK_CTRL=1).
++	 * On SM-T970 (`half16`), UEFI leaves GCC_GPU_CFG_AHB_CBCR = 0x00000001 (CLK_OFF=0, CLK_ENABLE=1).
+ 	 * Require CLK_ENABLE (bit 0) before touching GPUCC.
+ 	 */
+ 	if ((gcc_cfg_ahb & CBCR_CLK_ENABLE_BIT) == 0) {
