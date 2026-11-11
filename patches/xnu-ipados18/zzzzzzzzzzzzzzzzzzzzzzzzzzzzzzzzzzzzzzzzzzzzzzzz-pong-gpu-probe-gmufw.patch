@@ -1,0 +1,352 @@
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index bb42d6d..84cc6c8 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -10,6 +10,9 @@
+  * (`gfx.lvl`, `cx.lvl`, `mx.lvl`), and reads GMU status registers in Stage 3.
+  * `gpuprobe gmu` (mode 7) reuses mode 6's clocks, then reads the GMU cold-start preconditions
+  * only (RSCC sequencer, GMU2HOST fault info, the reset/HFI words); it never loads firmware.
++ * `gpuprobe gmufw` (mode 8) reuses mode 6's clocks and mode 7's preconditions, then loads
++ * `a650_gmu.bin`'s ITCM/DTCM blocks into GMU memory and reads them back (a6xx_gmu_fw_load,
++ * A650Gmu.c:194-223). The CM3 reset is NOT released; icache/dummy blocks are only summarized.
+  *
+  * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
+  *   package/GpuPowerBoard.h and package/GpuProbe.cpp (modes 1, 3, 5, and 6).
+@@ -59,6 +62,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern uint64_t mach_absolute_time(void);
++extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ 
+ int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ 
+@@ -150,6 +154,26 @@ int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ #define GMU_AO_FATAL_BITS               0x00000029u
+ #define GMU_CM3_FATAL_BITS              0x00800000u
+ 
++/* ---- Mode 8: GMU firmware load (a650_gmu.bin TCM blocks, a6xx_gmu_fw_load) ------------------ */
++/* GMU TCM register window (A650Gmu.c:8, 34-36, 122-126): ITCM dword 0x0c00 -> byte 0x3000, DTCM
++ * dword 0x1c00 -> byte 0x7000, each TCM_BYTES (0x4000) long, so one 0x8000 window covers both. */
++#define GMU_TCM_PHYS                    (0x03d6a000UL + 0x3000UL)
++#define GMU_TCM_SIZE                    0x00008000UL
++#define GMU_ITCM_BASE                   0x00000000u
++#define GMU_DTCM_BASE                   0x10004000u
++#define GMU_TCM_BYTES                   0x4000u
++#define GMU_ICACHE_IOVA                 0x00004000u
++#define GMU_DUMMY_IOVA                  0x60000000u
++/* a650_gmu.bin block header (AdrenoFirmware.c:33-65): 16-byte {addr,len,type,value} LE32, then
++ * `len` payload bytes; blocks are contiguous to the end. A zero-length block is metadata. */
++#define GMUFW_BLOCK_HDR                 16u
++#define GMUFW_MAX_BLOCKS                48u
++/* Region identifiers (AdrenoFirmware.c regions, A650Gmu.c:134-135): 1 ITCM, 2 icache, 3 DTCM, 4 dummy. */
++#define GMUFW_REGION_ITCM               1u
++#define GMUFW_REGION_ICACHE             2u
++#define GMUFW_REGION_DTCM               3u
++#define GMUFW_REGION_DUMMY              4u
++
+ /* ---- Stage 4: GPU RBBM (qcom,kgsl-3d0@3d00000, gts7xlwifi.dts:32550, GpuProbe.cpp:94) ----- */
+ #define GPU_RBBM_PAGE_PHYS              0x03d00000UL
+ #define GPU_RBBM_PAGE_SIZE              0x00001000UL
+@@ -167,6 +191,7 @@ static vm_offset_t g_gmu_24k_page;
+ static vm_offset_t g_gpu_rbbm_page;
+ static vm_offset_t g_cmd_db_page;
+ static vm_offset_t g_rscc_page;
++static vm_offset_t g_gmu_tcm_page;
+ 
+ /* Strictly read-only 32-bit volatile MMIO helper with load barrier (no memcpy/memmove) */
+ static inline uint32_t
+@@ -307,6 +332,143 @@ gpu_cmddb_find(vm_offset_t db_va, const char *name, uint32_t *out_addr, uint32_t
+ 	return 1;
+ }
+ 
++/* ---- Mode 8 helpers: a650_gmu.bin block plan and TCM write/verify --------------------------- */
++
++struct gmufw_block {
++	uint32_t addr;
++	uint32_t len;
++	uint32_t payload_off;
++	uint32_t region;   /* GMUFW_REGION_*; UINT32_MAX for a zero-size metadata block */
++};
++
++static uint32_t
++gpu_gmufw_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/*
++ * Plan a650_gmu.bin's blocks (AdrenoFirmware.c:33-65): walk the 16-byte headers, classify each
++ * block into a region, and reject anything truncated, unaligned, or outside the four regions.
++ * The header's type/value words (off+8, off+12) are not needed for a TCM load and are skipped.
++ * Returns 0 on success, -1 truncated, -2 unaligned, -3 unmapped/out-of-range, -4 no space.
++ */
++static int
++gpu_gmufw_parse(const uint8_t *fw, uint32_t fw_len, struct gmufw_block *blocks, uint32_t cap,
++    uint32_t *count)
++{
++	uint32_t off = 0, n = 0;
++
++	*count = 0;
++	if (!fw || fw_len < GMUFW_BLOCK_HDR) {
++		return -1;
++	}
++	while (off < fw_len) {
++		if (fw_len - off < GMUFW_BLOCK_HDR) {
++			return -1;
++		}
++		const uint32_t addr = gpu_gmufw_le32(fw + off);
++		const uint32_t len  = gpu_gmufw_le32(fw + off + 4);
++		if (len > fw_len - off - GMUFW_BLOCK_HDR) {
++			return -1;
++		}
++		uint32_t region = UINT32_MAX;
++		if (len) {
++			if ((addr & 3u) || (len & 3u)) {
++				return -2;
++			}
++			if (addr < GMU_ITCM_BASE + GMU_TCM_BYTES) {
++				region = GMUFW_REGION_ITCM;
++			} else if (addr < GMU_DTCM_BASE) {
++				region = GMUFW_REGION_ICACHE;
++			} else if (addr < GMU_DTCM_BASE + GMU_TCM_BYTES) {
++				region = GMUFW_REGION_DTCM;
++			} else if (addr >= GMU_DUMMY_IOVA) {
++				region = GMUFW_REGION_DUMMY;
++			} else {
++				return -3;
++			}
++			/* A TCM block must fit inside its 0x4000-byte TCM (A650Gmu.c:36). */
++			if ((region == GMUFW_REGION_ITCM || region == GMUFW_REGION_DTCM) && len > GMU_TCM_BYTES) {
++				return -3;
++			}
++			if ((region == GMUFW_REGION_ITCM &&
++			    addr - GMU_ITCM_BASE > GMU_TCM_BYTES - len) ||
++			    (region == GMUFW_REGION_DTCM &&
++			    addr - GMU_DTCM_BASE > GMU_TCM_BYTES - len)) {
++				return -3;
++			}
++		}
++		if (n >= cap) {
++			return -4;
++		}
++		blocks[n].addr = addr;
++		blocks[n].len = len;
++		blocks[n].payload_off = off + GMUFW_BLOCK_HDR;
++		blocks[n].region = region;
++		n++;
++		off += GMUFW_BLOCK_HDR + len;
++	}
++	*count = n;
++	return 0;
++}
++
++/* Byte offset of a TCM block inside the GMU_TCM window (ITCM at 0, DTCM at GMU_TCM_BYTES). */
++static uint32_t
++gpu_gmufw_tcm_off(const struct gmufw_block *b)
++{
++	if (b->region == GMUFW_REGION_ITCM) {
++		return b->addr - GMU_ITCM_BASE;
++	}
++	return GMU_TCM_BYTES + (b->addr - GMU_DTCM_BASE);
++}
++
++/* `[PONG_GPU] W<n> blk<i> addr=… len=…` before each TCM block write (block granularity, not per word). */
++static void
++gpu_probe_blkmark(unsigned int wstep, unsigned int blk, uint32_t addr, uint32_t len)
++{
++	char line[64];
++	int n = snprintf(line, sizeof(line), "[PONG_GPU] W%u blk%u addr=0x%08x len=%u\n",
++	    wstep, blk, addr, len);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++/* Write one TCM block word by word (the GMU is still in reset), one pmsg marker for the block. */
++static void
++gpu_probe_blk_write(vm_offset_t base, unsigned int byte_off, const uint8_t *src, uint32_t len,
++    unsigned int wstep, unsigned int blk, uint32_t addr)
++{
++	gpu_probe_blkmark(wstep, blk, addr, len);
++	for (uint32_t at = 0; at < len; at += 4) {
++		*(volatile uint32_t *)(base + byte_off + at) = gpu_gmufw_le32(src + at);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Read a TCM block back and count mismatched words; *first_off is the first mismatch byte offset. */
++static uint32_t
++gpu_probe_blk_verify(vm_offset_t base, unsigned int byte_off, const uint8_t *src, uint32_t len,
++    uint32_t *first_off)
++{
++	uint32_t mismatch = 0;
++
++	for (uint32_t at = 0; at < len; at += 4) {
++		const uint32_t got  = gpu_probe_rd32(base, byte_off + at);
++		const uint32_t want = gpu_gmufw_le32(src + at);
++		if (got != want) {
++			if (mismatch == 0) {
++				*first_off = at;
++			}
++			mismatch++;
++		}
++	}
++	return mismatch;
++}
++
+ int
+ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ {
+@@ -692,6 +854,8 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	bool gmupre_read = false;
+ 	uint32_t gmu_rst = 0, gmu_fw = 0, gmu_gx = 0, gmu_hfi = 0, gmu_irq = 0, gmu_fence = 0;
+ 	uint32_t gmu_intr = 0, rscc_seq = 0, rscc_rsc = 0;
++	char gmufw_extra[256];
++	gmufw_extra[0] = '\0';
+ 	if ((cc_ahb & CBCR_CLK_OFF_BIT) == 0 && (cc_gmu & CBCR_CLK_OFF_BIT) == 0) {
+ 		gpu_probe_pmsg("[PONG_GPU] P3b gmu_regs\n");
+ 		if (!g_gmu_14k_page) {
+@@ -726,6 +890,100 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 				gmupre_read = true;
+ 			}
+ 		}
++		/*
++		 * Mode 8 (`gpuprobe gmufw`): load a650_gmu.bin's TCM blocks into GMU memory and read them
++		 * back (a6xx_gmu_fw_load, A650Gmu.c:194-223). The GMU is still held in reset (CM3_SYSRESET
++		 * is not released here), so only the ITCM/DTCM blocks are written through the GMU register
++		 * window; the icache/dummy blocks need the GMU's SMMU context and are only summarized.
++		 * Precondition is mode 7's `ready` (sysreset==1, sequencer idle, no stale HFI, no faults).
++		 */
++		if (mode >= 8 && gmu_read && gmupre_read) {
++			const uint32_t ao_f8  = gmu_irq & GMU_AO_FATAL_BITS;
++			const uint32_t cm3_f8 = gmu_intr & GMU_CM3_FATAL_BITS;
++			const bool ready8 = (gmu_rst == 1u) && (rscc_seq == 0u) &&
++			    ((gmu_hfi & 1u) == 0u) && (ao_f8 == 0u) && (cm3_f8 == 0u);
++			if (!ready8) {
++				snprintf(gmufw_extra, sizeof(gmufw_extra),
++				    " gmufw[stop=not_ready rst=%u seq=%u hfi=%u ao=%#x cm3=%#x]",
++				    gmu_rst, rscc_seq, gmu_hfi & 1u, ao_f8, cm3_f8);
++			} else {
++				const uint8_t *fw = NULL;
++				uint32_t fw_len = 0;
++				if (pong_fw_lookup("a650_gmu.bin", &fw, &fw_len) != 0 || !fw ||
++				    fw_len < GMUFW_BLOCK_HDR) {
++					snprintf(gmufw_extra, sizeof(gmufw_extra),
++					    " gmufw[stop=firmware_missing]");
++				} else {
++					struct gmufw_block blocks[GMUFW_MAX_BLOCKS];
++					uint32_t nblocks = 0;
++					const int prc = gpu_gmufw_parse(fw, fw_len, blocks,
++					    GMUFW_MAX_BLOCKS, &nblocks);
++					if (prc != 0) {
++						snprintf(gmufw_extra, sizeof(gmufw_extra),
++						    " gmufw[stop=bad_fw rc=%d fw=%u]", prc, fw_len);
++					} else if (!g_gmu_tcm_page &&
++					    !(g_gmu_tcm_page = ml_io_map(GMU_TCM_PHYS, GMU_TCM_SIZE))) {
++						snprintf(gmufw_extra, sizeof(gmufw_extra),
++						    " gmufw[stop=tcm_map_failed]");
++					} else {
++						uint32_t tcm_blocks = 0, mismatch = 0;
++						uint32_t first_blk = UINT32_MAX, first_off = 0;
++						uint32_t icache_blocks = 0, icache_bytes = 0;
++						uint32_t dummy_blocks = 0, dummy_bytes = 0;
++						unsigned int wstep = 15;
++						for (uint32_t i = 0; i < nblocks; i++) {
++							if (blocks[i].region != GMUFW_REGION_ITCM &&
++							    blocks[i].region != GMUFW_REGION_DTCM) {
++								continue;
++							}
++							gpu_probe_blk_write(g_gmu_tcm_page,
++							    gpu_gmufw_tcm_off(&blocks[i]),
++							    fw + blocks[i].payload_off, blocks[i].len,
++							    wstep++, i, blocks[i].addr);
++							tcm_blocks++;
++						}
++						for (uint32_t i = 0; i < nblocks; i++) {
++							if (blocks[i].region != GMUFW_REGION_ITCM &&
++							    blocks[i].region != GMUFW_REGION_DTCM) {
++								continue;
++							}
++							uint32_t off = 0;
++							const uint32_t m = gpu_probe_blk_verify(g_gmu_tcm_page,
++							    gpu_gmufw_tcm_off(&blocks[i]),
++							    fw + blocks[i].payload_off, blocks[i].len, &off);
++							if (m && first_blk == UINT32_MAX) {
++								first_blk = i;
++								first_off = off;
++							}
++							mismatch += m;
++						}
++						for (uint32_t i = 0; i < nblocks; i++) {
++							if (blocks[i].region == GMUFW_REGION_ICACHE) {
++								icache_blocks++;
++								icache_bytes += blocks[i].len;
++							} else if (blocks[i].region == GMUFW_REGION_DUMMY) {
++								dummy_blocks++;
++								dummy_bytes += blocks[i].len;
++							}
++						}
++						if (mismatch) {
++							snprintf(gmufw_extra, sizeof(gmufw_extra),
++							    " gmufw[fw=%u blk=%u tcm=%u mis=%u first=blk%u:%u "
++							    "next=ic:%u/%u,dm:%u/%u]",
++							    fw_len, nblocks, tcm_blocks, mismatch,
++							    first_blk, first_off,
++							    icache_blocks, icache_bytes, dummy_blocks, dummy_bytes);
++						} else {
++							snprintf(gmufw_extra, sizeof(gmufw_extra),
++							    " gmufw[fw=%u blk=%u tcm=%u mis=0 first=- "
++							    "next=ic:%u/%u,dm:%u/%u]",
++							    fw_len, nblocks, tcm_blocks,
++							    icache_blocks, icache_bytes, dummy_blocks, dummy_bytes);
++						}
++					}
++				}
++			}
++		}
+ 	}
+ 
+ 	char gmuclk_extra[640];
+@@ -750,6 +1008,10 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 		    " gmupre[ready=%u sysreset=%u seqbusy=%u rsc=%#x intr=%#x next=fwload]",
+ 		    ready, gmu_rst, rscc_seq, rscc_rsc, gmu_intr);
+ 	}
++	if (mode >= 8 && gmufw_extra[0] != '\0' && extra_len < sizeof(gmuclk_extra)) {
++		extra_len += (size_t)snprintf(gmuclk_extra + extra_len, sizeof(gmuclk_extra) - extra_len,
++		    "%s", gmufw_extra);
++	}
+ 
+ 	/*
+ 	 * Gate 3 -> 4:
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 809bb91..23dbaad 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1288,12 +1288,14 @@ cmd_handle_wifi(bool up)
+ }
+ 
+ /*
+- * gpuprobe [cx|gmuclk|gmu]: staged Adreno 650 probe (GCC -> GPUCC -> SMMU GR0 -> RBBM_STATUS).
++ * gpuprobe [cx|gmuclk|gmu|gmufw]: staged Adreno 650 probe (GCC -> GPUCC -> SMMU GR0 -> RBBM_STATUS).
+  * Plain `gpuprobe` (mode 1) is strictly read-only (zero writes); `gpuprobe cx` (mode 3)
+  * powers on GPU_CC_CX_GDSCR and enables AHB + SMMU vote clocks before reading SMMU GR0;
+  * `gpuprobe gmuclk` (mode 6) also brings up the GMU 200 MHz RCG + 5 GMU branches and reads
+  * AOP cmd-db ARC entries and GMU status registers; `gpuprobe gmu` (mode 7) reuses mode 6's
+- * clocks and reads the GMU cold-start preconditions (RSCC + fault words) read-only.
++ * clocks and reads the GMU cold-start preconditions (RSCC + fault words) read-only;
++ * `gpuprobe gmufw` (mode 8) reuses mode 6's clocks and mode 7's preconditions, then loads
++ * `a650_gmu.bin`'s ITCM/DTCM blocks into GMU memory and reads them back (CM3 reset not released).
+  */
+ static void
+ cmd_handle_gpuprobe(int mode)
+@@ -1906,6 +1908,8 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_gpuprobe(6);
+ 	} else if (strcmp(cmd, "gpuprobe gmu") == 0) {
+ 		cmd_handle_gpuprobe(7);
++	} else if (strcmp(cmd, "gpuprobe gmufw") == 0) {
++		cmd_handle_gpuprobe(8);
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
