@@ -1,0 +1,138 @@
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index f324c50..5308e98 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -3350,8 +3350,6 @@ _Static_assert(S4_CTL_CHUNK + 1u < S3B_CHUNKS, "the control chunk must lie below
+ 
+ static struct {
+ 	uint32_t flags, segs, seq;
+-	vm_offset_t ctl;                              /* uncached (ml_io_map) view of the control chunk */
+-	vm_offset_t dram[S4_IMG_CHUNKS];              /* and of each image chunk */
+ } s4;
+ 
+ struct s4_run {
+@@ -3374,21 +3372,26 @@ s4_cb(const struct s4_run *w)
+ 	return SMMU + ((uint64_t)(w->pages + w->cb) << w->shift);
+ }
+ 
+-/* What the chip wrote: read from DRAM through the uncached view. */
++/* What the chip wrote. DRAM, not the cache: the lines are invalidated right before the read and again after it,
++ * so none stays behind (the precedent's way, T970WifiStack.cpp:728-751). An uncached ml_io_map view of every
++ * chunk is not possible: 67 of them ran the kernel's I/O map out of space on 11-11 ("kmem_alloc(..., 65536,
++ * 0x200041): failed with 3"). */
+ static void
+ s4_events(struct s4_run *w)
+ {
+-	const volatile uint32_t *u = (const volatile uint32_t *)s4.ctl;
++	const uint32_t *u = (const uint32_t *)s3b.chunk[S4_CTL_CHUNK];
+ 
+ 	if (!u) {
+ 		return;
+ 	}
++	s3b_clean(u + S4_EV_OFF / 4, S4_ER0_OFF + S4_ER0_LEN - S4_EV_OFF);
+ 	w->er0_rp = u[(S4_EV_OFF + 28u) / 4];
+ 	w->er1_rp = u[(S4_EV_OFF + S4_CTX_BYTES + 28u) / 4];
+ 	for (uint32_t i = 0; i < 4; i++) {
+ 		w->ev[2 * i] = u[(S4_ER0_OFF + S4_EL_BYTES * i + 8u) / 4];
+ 		w->ev[2 * i + 1] = u[(S4_ER0_OFF + S4_EL_BYTES * i + 12u) / 4];
+ 	}
++	s3b_clean(u + S4_EV_OFF / 4, S4_ER0_OFF + S4_ER0_LEN - S4_EV_OFF);
+ }
+ 
+ static void
+@@ -3558,7 +3561,6 @@ s4_copy(struct s4_run *w)
+ 	const uint8_t *fw = NULL;
+ 	uint32_t len = 0, segs, want[4 * S4_MAX_SEGS];
+ 	uint32_t *vec = (uint32_t *)s3b.chunk[S4_CTL_CHUNK];
+-	const volatile uint32_t *u;
+ 
+ 	s3b_wmark(95, 0);
+ 	if (s4.flags & S4_F_GO) {
+@@ -3576,12 +3578,6 @@ s4_copy(struct s4_run *w)
+ 	if (!vec) {
+ 		WL_FAIL(95, "arena-hole");
+ 	}
+-	if (!s4.ctl) {
+-		s4.ctl = ml_io_map((vm_offset_t)s3b.chunk_pa[S4_CTL_CHUNK], S3B_CHUNK);
+-	}
+-	if (!s4.ctl) {
+-		WL_FAIL(95, "dram-map");
+-	}
+ 	for (uint32_t off = 0, c = S4_IMG_CHUNK; off < len; off += S3B_CHUNK, c++) {
+ 		uint32_t n = len - off < S3B_CHUNK ? len - off : S3B_CHUNK;
+ 
+@@ -3604,40 +3600,28 @@ s4_copy(struct s4_run *w)
+ 		}
+ 	}
+ 	s3b_clean(vec, segs * 16u);
+-	/* DRAM, not the cache: every word through an uncached mapping, against the file (the precedent's ef128100
+-	 * was cache and DRAM disagreeing). a[0] differing words, a[1] the first one's byte offset + 1, a[2] table. */
+-	for (uint32_t off = 0, c = 0; off < len; off += S3B_CHUNK, c++) {
++	/* DRAM, not the cache (the precedent's ef128100 was the two disagreeing): every line was just cleaned and
++	 * invalidated, so these reads come from DRAM; they are compared with the file and the lines invalidated again.
++	 * a[0] differing bytes, a[1] the first one's offset + 1, a[2] differing words of the table. */
++	for (uint32_t off = 0, c = S4_IMG_CHUNK; off < len; off += S3B_CHUNK, c++) {
+ 		uint32_t n = len - off < S3B_CHUNK ? len - off : S3B_CHUNK;
+-		const uint32_t *src = (const uint32_t *)(const void *)(fw + off);
++		const uint8_t *d = (const uint8_t *)s3b.chunk[c];
+ 
+-		if (!s4.dram[c]) {
+-			s4.dram[c] = ml_io_map((vm_offset_t)s3b.chunk_pa[S4_IMG_CHUNK + c], S3B_CHUNK);
+-		}
+-		if (!s4.dram[c]) {
+-			WL_FAIL(95, "dram-map");
+-		}
+-		u = (const volatile uint32_t *)s4.dram[c];
+-		for (uint32_t k = 0; k < n / 4; k++) {
+-			if (u[k] != src[k]) {
+-				if (!w->a[0]++) {
+-					w->a[1] = off + 4 * k + 1;
+-				}
+-			}
+-		}
+-		for (uint32_t k = n & ~3u; k < n; k++) {
+-			if (((const volatile uint8_t *)u)[k] != fw[off + k]) {
++		for (uint32_t k = 0; k < n; k++) {
++			if (d[k] != fw[off + k]) {
+ 				if (!w->a[0]++) {
+ 					w->a[1] = off + k + 1;
+ 				}
+ 			}
+ 		}
++		s3b_clean(d, n);
+ 	}
+-	u = (const volatile uint32_t *)s4.ctl;
+ 	for (uint32_t i = 0; i < 4 * segs; i++) {
+-		if (u[S4_VEC_OFF / 4 + i] != want[i]) {
++		if (vec[S4_VEC_OFF / 4 + i] != want[i]) {
+ 			w->a[2]++;
+ 		}
+ 	}
++	s3b_clean(vec, segs * 16u);
+ 	w->a[3] = segs;
+ 	w->a[4] = len;
+ 	if (w->a[0] || w->a[2]) {
+@@ -3667,12 +3651,6 @@ s4_m0(struct s4_run *w)
+ 	if (db < 0x100 || (db & 3u) || db + 16u > S3D_WIN_PAGE || !wl_ptr(bar + db) || !wl_ptr(bar + db + 12u)) {
+ 		WL_FAIL(94, "erdb-off");
+ 	}
+-	if (!s4.ctl) {
+-		s4.ctl = ml_io_map((vm_offset_t)s3b.chunk_pa[S4_CTL_CHUNK], S3B_CHUNK);
+-	}
+-	if (!s4.ctl) {
+-		WL_FAIL(94, "dram-map");
+-	}
+ 	/* mhi_ready_state_transition: each event ring's doorbell = its write pointer (mhi_write_db: upper half first) */
+ 	s3b_wmark(94, 1);
+ 	wr(bar + db + 4u, 0);
+@@ -3791,8 +3769,8 @@ static bool
+ s4_poll(struct s4_run *w)
+ {
+ 	s3b_wmark(97, 0);
+-	if (!s4.ctl) {
+-		WL_FAIL(97, "not-started");                 /* nothing to read before `wifis4 copy` or `wifis4 m0` */
++	if (!(s4.flags & S4_F_CTX)) {
++		WL_FAIL(97, "not-started");                 /* nothing to read before `wifis4 ctx` */
+ 	}
+ 	return s4_wait(w, 97, 0);
+ }
