@@ -279,6 +279,41 @@ def add_ipi_late(txt: str) -> str:
     return txt + IPI_LATE_TAIL
 
 
+IPI_TIMED_HELPER = """// How long raising one IPI takes, in counter ticks (19.2 MHz): the longest since the USB command `ipis` last
+// read it, and how many took more than 100 us. On 11-11 the development kernel's "interrupts held disabled"
+// check fired in the thread wake-up path (0.4 to 2.5 ms); a write the hypervisor traps would look like that.
+static inline void armcpuIpiTimed(uint64_t t0)
+{
+  const uint64_t ticks = counter() - t0;
+  if (ticks > armcpu_ipi_max_ticks) armcpu_ipi_max_ticks = ticks;
+  if (ticks > 1920) armcpu_ipi_slow = armcpu_ipi_slow + 1;
+}
+
+"""
+IPI_TIMED = (
+    ('volatile uint64_t armcpu_ipi_sent[8], armcpu_ipi_recv[8], armcpu_timer_recv[8];\n',
+     'volatile uint64_t armcpu_ipi_sent[8], armcpu_ipi_recv[8], armcpu_timer_recv[8];\n'
+     'volatile uint64_t armcpu_ipi_max_ticks, armcpu_ipi_slow;\n'),
+    ('void ArmCpu::signalCPU(IOCPU *target)\n{\n', IPI_TIMED_HELPER + 'void ArmCpu::signalCPU(IOCPU *target)\n{\n'),
+    ('  armcpu_ipi_sent[cpu->logicalId & 7]++;\n',
+     '  armcpu_ipi_sent[cpu->logicalId & 7]++;\n  const uint64_t ipiT0 = counter();\n'),
+    ('      spiIpiSend(gDist, cpu->logicalId & 7);\n    }\n    return;\n',
+     '      spiIpiSend(gDist, cpu->logicalId & 7);\n    }\n    armcpuIpiTimed(ipiT0);\n    return;\n'),
+    ('  __asm__ volatile("dsb ishst\\n\\tmsr icc_sgi1r_el1, %0\\n\\tisb" :: "r"(sgi) : "memory");\n}\n',
+     '  __asm__ volatile("dsb ishst\\n\\tmsr icc_sgi1r_el1, %0\\n\\tisb" :: "r"(sgi) : "memory");\n  armcpuIpiTimed(ipiT0);\n}\n'),
+)
+
+
+def add_ipi_timing(txt: str) -> str:
+    """Longest IPI send and the count of slow ones (USB command `ipis`). Runs after add_gic_bench."""
+    if 'armcpu_ipi_max_ticks' in txt:
+        return txt
+    for old, new in IPI_TIMED:
+        assert txt.count(old) == 1, 'expected exactly one: ' + old.strip()[:60]
+        txt = txt.replace(old, new)
+    return txt
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
@@ -288,7 +323,7 @@ def patch_armcpu(armcpu_source: Path):
     txt = add_idle_latency_knob(disable_cpu_policy(target.read_text(encoding='utf-8')))
     if 'armcpu-spi-ipi' in txt:
         # already carries the SPI IPI patch; still make sure the policy is off
-        target.write_text(add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt)))), encoding='utf-8')
+        target.write_text(add_ipi_timing(add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt))))), encoding='utf-8')
         return
 
     # 1. Add SPI IPI state and helper functions after gBootAffinity
@@ -393,7 +428,7 @@ static void spiIpiSend(uintptr_t dist, uint32_t core)
       if (ipi_handler) ipi_handler();"""
     txt = txt.replace(needle_irq, replacement_irq)
 
-    txt = add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt))))
+    txt = add_ipi_timing(add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt)))))
     target.write_text(txt, encoding='utf-8')
     print(f'Applied SM-T970 ArmCpu patch to {target}', flush=True)
 
