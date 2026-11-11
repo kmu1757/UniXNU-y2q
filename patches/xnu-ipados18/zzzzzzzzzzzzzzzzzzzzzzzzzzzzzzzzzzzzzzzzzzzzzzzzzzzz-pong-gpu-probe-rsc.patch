@@ -1,0 +1,247 @@
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index 84cc6c8..27ed743 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -13,6 +13,8 @@
+  * `gpuprobe gmufw` (mode 8) reuses mode 6's clocks and mode 7's preconditions, then loads
+  * `a650_gmu.bin`'s ITCM/DTCM blocks into GMU memory and reads them back (a6xx_gmu_fw_load,
+  * A650Gmu.c:194-223). The CM3 reset is NOT released; icache/dummy blocks are only summarized.
++ * `gpuprobe rsc` (mode 9) then sets up and wakes the GMU's RSC (A650Gmu.c Phase 2 and 3); the CM3
++ * reset is still not released. Modes 8 and up answer with a short line.
+  *
+  * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
+  *   package/GpuPowerBoard.h and package/GpuProbe.cpp (modes 1, 3, 5, and 6).
+@@ -174,6 +176,32 @@ int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ #define GMUFW_REGION_DTCM               3u
+ #define GMUFW_REGION_DUMMY              4u
+ 
++/* ---- Mode 9: the GMU's RSC (a6xx_gmu_rpmh_init, a6xx_rpmh_stop, a6xx_gmu_fw_start's wake-up) ---- */
++/* GMU dwords (A650Gmu.c:7-19) as byte offsets inside the 14K / 24K pages above. */
++#define GMU_CX_FAL_INTF_OFF             0x3c0u  /* dword 0x50f0 -> byte 0x143c0 */
++#define GMU_CX_FALNEXT_INTF_OFF         0x3c4u  /* dword 0x50f1 -> byte 0x143c4 */
++#define GMU_GMU2HOST_INTR_CLR_OFF       0x644u  /* dword 0x5191 -> byte 0x14644 */
++#define GMU_GENERAL_7_OFF               0x730u  /* dword 0x51cc -> byte 0x14730 */
++#define GMU_AO_HOST_INTERRUPT_CLR_OFF   0xc10u  /* dword 0x9304 -> byte 0x24c10 */
++#define GMU_AO_HOST_INTERRUPT_MASK_OFF  0xc18u  /* dword 0x9306 -> byte 0x24c18 */
++#define GMU_RSCC_CONTROL_REQ_OFF        0xc1cu  /* dword 0x9307 -> byte 0x24c1c */
++#define GMU_RSCC_CONTROL_ACK_OFF        0xc20u  /* dword 0x9308 -> byte 0x24c20 */
++/* RSCC dwords (A650Gmu.c:21-26) as byte offsets in the RSCC page. */
++#define GMU_RSCC_PDC_SEQ_START_ADDR_OFF 0x020u  /* dword 0x008 */
++#define GMU_RSCC_PDC_MATCH_VALUE_LO_OFF 0x024u  /* dword 0x009 */
++#define GMU_RSCC_PDC_MATCH_VALUE_HI_OFF 0x028u  /* dword 0x00a */
++#define GMU_RSCC_PDC_SLAVE_ID_OFF       0x02cu  /* dword 0x00b */
++#define GMU_RSCC_HIDDEN_TCS_ADDR_OFF    0x034u  /* dword 0x00d */
++#define GMU_RSCC_HIDDEN_TCS_DATA_OFF    0x038u  /* dword 0x00e */
++#define GMU_RSCC_OVERRIDE_START_OFF     0x400u  /* dword 0x100 */
++#define GMU_RSCC_SEQ_MEM_0_OFF          0x600u  /* dword 0x180 */
++/* The GPU's PDC block (GpuProbe.cpp:248 kPdcPhys 0x0b290000, 64 KiB): both dwords written here are in its fifth
++ * 4 KiB page, so only that page is mapped (the kernel's I/O map is small). */
++#define GMU_PDC_PAGE_PHYS               (0x0b290000UL + 0x4000UL)
++#define GMU_PDC_PAGE_SIZE               0x00001000UL
++#define GMU_PDC_GPU_ENABLE_PDC_OFF      0x500u  /* dword 0x1140 -> byte 0x4500 */
++#define GMU_PDC_GPU_SEQ_START_ADDR_OFF  0x520u  /* dword 0x1148 -> byte 0x4520 */
++
+ /* ---- Stage 4: GPU RBBM (qcom,kgsl-3d0@3d00000, gts7xlwifi.dts:32550, GpuProbe.cpp:94) ----- */
+ #define GPU_RBBM_PAGE_PHYS              0x03d00000UL
+ #define GPU_RBBM_PAGE_SIZE              0x00001000UL
+@@ -192,6 +220,8 @@ static vm_offset_t g_gpu_rbbm_page;
+ static vm_offset_t g_cmd_db_page;
+ static vm_offset_t g_rscc_page;
+ static vm_offset_t g_gmu_tcm_page;
++static vm_offset_t g_pdc_page;
++static int g_gmu_rsc_state;      /* mode 9 in this boot: 0 not run, 1 done, -1 failed (no second attempt) */
+ 
+ /* Strictly read-only 32-bit volatile MMIO helper with load barrier (no memcpy/memmove) */
+ static inline uint32_t
+@@ -469,6 +499,49 @@ gpu_probe_blk_verify(vm_offset_t base, unsigned int byte_off, const uint8_t *src
+ 	return mismatch;
+ }
+ 
++/* ---- Mode 9 helpers ------------------------------------------------------------------------------ */
++/* gmu_poll_timeout(.., 100, 10000) as A650Gmu.c:57-72: a read every 100 us for at most 10 ms. 0 = matched. */
++static int
++gpu_probe_poll32(vm_offset_t base, unsigned int byte_off, uint32_t mask, uint32_t expected, uint32_t *seen)
++{
++	const uint64_t start = gpu_probe_now_us();
++
++	for (;;) {
++		*seen = gpu_probe_rd32(base, byte_off);
++		if ((*seen & mask) == expected) {
++			return 0;
++		}
++		if (gpu_probe_now_us() - start >= 10000) {
++			return 1;
++		}
++		gpu_probe_spin_us(100);
++	}
++}
++
++/* a6xx_gmu_rpmh_init for the a650 family, in the order A650Gmu.c:157-173 writes it. pdc: 0 = the RSCC page,
++ * 1 = the PDC page (the PDC's own sequence belongs to the AOP; only its start address and enable are written). */
++static const struct { uint8_t pdc; uint16_t off; uint32_t val; } gmu_rsc_table[] = {
++	{ 0, GMU_RSCC_RSC_STATUS0_OFF, 1u << 24 },              /* disable SDE clock gating */
++	{ 0, GMU_RSCC_PDC_SLAVE_ID_OFF, 1 },
++	{ 0, GMU_RSCC_HIDDEN_TCS_DATA_OFF, 0 },
++	{ 0, GMU_RSCC_HIDDEN_TCS_ADDR_OFF, 0 },
++	{ 0, GMU_RSCC_HIDDEN_TCS_DATA_OFF + 8, 0 },             /* dword + 2 */
++	{ 0, GMU_RSCC_HIDDEN_TCS_ADDR_OFF + 8, 0 },
++	{ 0, GMU_RSCC_HIDDEN_TCS_DATA_OFF + 16, 0x80000000u },  /* dword + 4 */
++	{ 0, GMU_RSCC_HIDDEN_TCS_ADDR_OFF + 16, 0 },
++	{ 0, GMU_RSCC_OVERRIDE_START_OFF, 0 },
++	{ 0, GMU_RSCC_PDC_SEQ_START_ADDR_OFF, 0x4520 },
++	{ 0, GMU_RSCC_PDC_MATCH_VALUE_LO_OFF, 0x4510 },
++	{ 0, GMU_RSCC_PDC_MATCH_VALUE_HI_OFF, 0x4514 },
++	{ 0, GMU_RSCC_SEQ_MEM_0_OFF, 0xeaaae5a0u },             /* the a650 family's sleep / wake-up microcode */
++	{ 0, GMU_RSCC_SEQ_MEM_0_OFF + 4, 0xe1a1ebabu },
++	{ 0, GMU_RSCC_SEQ_MEM_0_OFF + 8, 0xa2e0a581u },
++	{ 0, GMU_RSCC_SEQ_MEM_0_OFF + 12, 0xecac82e2u },
++	{ 0, GMU_RSCC_SEQ_MEM_0_OFF + 16, 0x0020edadu },
++	{ 1, GMU_PDC_GPU_SEQ_START_ADDR_OFF, 0 },
++	{ 1, GMU_PDC_GPU_ENABLE_PDC_OFF, 0x80000001u },
++};
++
+ int
+ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ {
+@@ -856,6 +929,9 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	uint32_t gmu_intr = 0, rscc_seq = 0, rscc_rsc = 0;
+ 	char gmufw_extra[256];
+ 	gmufw_extra[0] = '\0';
++	char rsc_extra[200];
++	rsc_extra[0] = '\0';
++	bool gmufw_ok = false;
+ 	if ((cc_ahb & CBCR_CLK_OFF_BIT) == 0 && (cc_gmu & CBCR_CLK_OFF_BIT) == 0) {
+ 		gpu_probe_pmsg("[PONG_GPU] P3b gmu_regs\n");
+ 		if (!g_gmu_14k_page) {
+@@ -974,6 +1050,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 							    first_blk, first_off,
+ 							    icache_blocks, icache_bytes, dummy_blocks, dummy_bytes);
+ 						} else {
++							gmufw_ok = true;
+ 							snprintf(gmufw_extra, sizeof(gmufw_extra),
+ 							    " gmufw[fw=%u blk=%u tcm=%u mis=0 first=- "
+ 							    "next=ic:%u/%u,dm:%u/%u]",
+@@ -984,12 +1061,83 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 				}
+ 			}
+ 		}
++		/*
++		 * Mode 9 (`gpuprobe rsc`): A650Gmu.c Phase 2 (:150-182: the interrupt clear and mask, the RSC set-up
++		 * table, a6xx_rpmh_stop) and Phase 3 (:183-192: the FAL interfaces, register retention, the RSC
++		 * wake-up). Only after mode 8 read the firmware back without a difference. The CM3 stays in reset. Once
++		 * per boot: a later call only reads. A failure puts the GMU back in reset as reset_after_failure does
++		 * and there is no second attempt.
++		 */
++		if (mode >= 9 && gmufw_ok) {
++			if (!g_pdc_page) {
++				g_pdc_page = ml_io_map(GMU_PDC_PAGE_PHYS, GMU_PDC_PAGE_SIZE);
++			}
++			if (!g_pdc_page) {
++				snprintf(rsc_extra, sizeof(rsc_extra), " rsc[stop=pdc_map_failed]");
++			} else if (g_gmu_rsc_state != 0) {
++				snprintf(rsc_extra, sizeof(rsc_extra), " rsc[%s ack=%#x seqbusy=%u status0=%#x]",
++				    g_gmu_rsc_state > 0 ? "done" : "poisoned",
++				    gpu_probe_rd32(g_gmu_24k_page, GMU_RSCC_CONTROL_ACK_OFF),
++				    gpu_probe_rd32(g_rscc_page, GMU_RSCC_SEQ_BUSY_OFF),
++				    gpu_probe_rd32(g_rscc_page, GMU_RSCC_RSC_STATUS0_OFF));
++			} else {
++				const char *stop = NULL, *rstop = "-";
++				uint32_t status0 = 0, ack = 0, seq = 0, ao, cm3;
++				unsigned int w = 40;
++
++				gpu_probe_pmsg("[PONG_GPU] P3e rsc_phase2\n");
++				gpu_probe_wr32(g_gmu_24k_page, GMU_AO_HOST_INTERRUPT_CLR_OFF, ~0u, w++);
++				gpu_probe_wr32(g_gmu_24k_page, GMU_AO_HOST_INTERRUPT_MASK_OFF, ~GMU_AO_FATAL_BITS, w++);
++				gpu_probe_wr32(g_gmu_14k_page, GMU_GMU2HOST_INTR_CLR_OFF, ~0u, w++);
++				ao = gpu_probe_rd32(g_gmu_24k_page, GMU_AO_HOST_INT_STATUS_OFF) & GMU_AO_FATAL_BITS;
++				cm3 = gpu_probe_rd32(g_gmu_14k_page, GMU_GMU2HOST_INTR_INFO_OFF) & GMU_CM3_FATAL_BITS;
++				if (ao || cm3) {
++					stop = "fault";
++				} else {
++					for (unsigned int i = 0; i < sizeof(gmu_rsc_table) / sizeof(gmu_rsc_table[0]); i++) {
++						gpu_probe_wr32(gmu_rsc_table[i].pdc ? g_pdc_page : g_rscc_page, gmu_rsc_table[i].off,
++						    gmu_rsc_table[i].val, w++);
++					}
++					/* a6xx_rpmh_stop: Linux reports a timeout here and goes on; so does the precedent */
++					gpu_probe_wr32(g_gmu_24k_page, GMU_RSCC_CONTROL_REQ_OFF, 1u, w++);
++					rstop = gpu_probe_poll32(g_rscc_page, GMU_RSCC_RSC_STATUS0_OFF, 1u << 16, 1u << 16,
++					    &status0) ? "timeout" : "ok";
++					gpu_probe_wr32(g_gmu_24k_page, GMU_RSCC_CONTROL_REQ_OFF, 0u, w++);
++					gpu_probe_pmsg("[PONG_GPU] P3f rsc_phase3\n");
++					gpu_probe_wr32(g_gmu_14k_page, GMU_CX_FALNEXT_INTF_OFF, 1u, w++);
++					gpu_probe_wr32(g_gmu_14k_page, GMU_CX_FAL_INTF_OFF, 1u, w++);
++					gpu_probe_wr32(g_gmu_14k_page, GMU_GENERAL_7_OFF, 1u, w++);
++					gpu_probe_wr32(g_gmu_24k_page, GMU_RSCC_CONTROL_REQ_OFF, 1u << 1, w++);
++					if (gpu_probe_poll32(g_gmu_24k_page, GMU_RSCC_CONTROL_ACK_OFF, 1u << 1, 1u << 1, &ack)) {
++						stop = "ack_timeout";
++					} else if (gpu_probe_poll32(g_rscc_page, GMU_RSCC_SEQ_BUSY_OFF, ~0u, 0u, &seq)) {
++						stop = "seq_timeout";
++					} else {
++						gpu_probe_wr32(g_gmu_24k_page, GMU_RSCC_CONTROL_REQ_OFF, 0u, w++);
++					}
++					ao = gpu_probe_rd32(g_gmu_24k_page, GMU_AO_HOST_INT_STATUS_OFF) & GMU_AO_FATAL_BITS;
++					cm3 = gpu_probe_rd32(g_gmu_14k_page, GMU_GMU2HOST_INTR_INFO_OFF) & GMU_CM3_FATAL_BITS;
++					if (!stop && (ao || cm3)) {
++						stop = "fault";
++					}
++				}
++				if (stop) {
++					gpu_probe_wr32(g_gmu_14k_page, GMU_CM3_SYSRESET_OFF, 1u, w++);
++					g_gmu_rsc_state = -1;
++				} else {
++					g_gmu_rsc_state = 1;
++				}
++				snprintf(rsc_extra, sizeof(rsc_extra),
++				    " rsc[stop=%s rstop=%s/%#x ack=%#x seqbusy=%u ao=%#x cm3=%#x w=%u next=smmu]",
++				    stop ? stop : "none", rstop, status0, ack, seq, ao, cm3, w - 40u);
++			}
++		}
+ 	}
+ 
+ 	char gmuclk_extra[640];
+ 	size_t extra_len = 0;
+ 	gmuclk_extra[0] = '\0';
+-	if (mode >= 6) {
++	if (mode >= 6 && mode < 8) {      /* modes 8 and up leave these out: confirmed on the tablet, and the line was 885 of 896 bytes */
+ 		extra_len = (size_t)snprintf(gmuclk_extra, sizeof(gmuclk_extra),
+ 		    " gmuclk[gpll0=0x%08x>0x%08x rcg=0x%08x/0x%08x>0x%08x/0x%08x "
+ 		    "gmu=0x%08x>0x%08x axi=0x%08x>0x%08x memnoc=0x%08x>0x%08x] "
+@@ -1012,6 +1160,10 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 		extra_len += (size_t)snprintf(gmuclk_extra + extra_len, sizeof(gmuclk_extra) - extra_len,
+ 		    "%s", gmufw_extra);
+ 	}
++	if (mode >= 9 && rsc_extra[0] != '\0' && extra_len < sizeof(gmuclk_extra)) {
++		extra_len += (size_t)snprintf(gmuclk_extra + extra_len, sizeof(gmuclk_extra) - extra_len,
++		    "%s", rsc_extra);
++	}
+ 
+ 	/*
+ 	 * Gate 3 -> 4:
+@@ -1021,6 +1173,14 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	const bool gpucc_ahb_on = (cc_ahb & CBCR_CLK_OFF_BIT) == 0;
+ 	const bool gx_gdsc_on   = (gx_gdscr & GDSCR_PWR_ON_BIT) != 0;
+ 	if (!gpucc_ahb_on || !gx_gdsc_on) {
++		if (mode >= 8) {
++			snprintf(reply, reply_cap,
++			    "gpuprobe: stage=3(smmu_gr0) stop=%s gmu[rst=0x%x fw=0x%x gx=0x%x hfi=0x%x irq=0x%x fence=0x%x]%s\n",
++			    !gpucc_ahb_on ? "gpucc_ahb_off" : "gx_gdsc_off", gmu_rst, gmu_fw, gmu_gx, gmu_hfi, gmu_irq, gmu_fence,
++			    gmuclk_extra);
++			gpu_probe_pmsg(reply);
++			return 3;
++		}
+ 		const char *why = !gpucc_ahb_on ? "gpucc_ahb_off" : "gx_gdsc_off";
+ 		snprintf(reply, reply_cap,
+ 		    "gpuprobe: stage=3(smmu_gr0) stop=%s "
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index deedf62..84cb25b 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1883,6 +1883,8 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_gpuprobe(7);
+ 	} else if (strcmp(cmd, "gpuprobe gmufw") == 0) {
+ 		cmd_handle_gpuprobe(8);
++	} else if (strcmp(cmd, "gpuprobe rsc") == 0) {
++		cmd_handle_gpuprobe(9);
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
