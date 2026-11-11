@@ -1,0 +1,337 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index f031398..3982d0e 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -66,6 +66,7 @@ extern uint64_t armcpu_now_ms(void);
+ /* pong_wifi_link.c: PCIe0 power-up and link training to the Wi-Fi chip; one result line each */
+ extern int pong_wifi_link_up(char *reply, size_t reply_len);
+ extern int pong_wifi_link_down(char *reply, size_t reply_len);
++extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ /* pong_gpu_probe.c: staged read-only Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap);
+ extern struct vc_info vinfo;
+@@ -1288,6 +1289,20 @@ cmd_handle_gpuprobe(void)
+ 	send_str(reply[0] ? reply : "gpuprobe: no reply\n");
+ }
+ 
++/*
++ * wifimhi: after `wifiup`, give the Wi-Fi chip's BAR0 an address, turn on its memory decoding only and read the
++ * MHI and BHI registers (no DMA, no firmware). The reply is pong_wifi_link.c's result line.
++ */
++static void
++cmd_handle_wifimhi(void)
++{
++	char reply[400];
++
++	reply[0] = '\0';
++	(void)pong_wifi_mhi_read(reply, sizeof(reply));
++	send_str(reply[0] ? reply : "wifimhi: no reply\n");
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1424,12 +1439,14 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifi(true);
+ 	} else if (strcmp(cmd, "wifidown") == 0) {
+ 		cmd_handle_wifi(false);
++	} else if (strcmp(cmd, "wifimhi") == 0) {
++		cmd_handle_wifimhi();
+ 	} else if (strcmp(cmd, "gpuprobe") == 0) {
+ 		cmd_handle_gpuprobe();
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index 885701c..ed0694b 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -38,6 +38,7 @@ extern uint64_t mach_absolute_time(void);
+ 
+ int pong_wifi_link_up(char *reply, size_t reply_len);
+ int pong_wifi_link_down(char *reply, size_t reply_len);
++int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ 
+ /* ---- tuning knobs ------------------------------------------------------------------------- */
+ #define WL_LINK_GEN        1u      /* LNKCTL2 target speed; stock DTS qcom,target-link-speed = 1 */
+@@ -740,4 +741,275 @@ pong_wifi_link_down(char *reply, size_t reply_len)
+ 	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/*
++ * Stage 2 of the SM-T970 Wi-Fi bring-up: with the PCIe0 link up
++ * (USB command `wifiup`), give the QCA6390's BAR0 an address inside the pcie0 memory window, turn
++ * on memory decoding ONLY, and READ the MHI/BHI registers the BAR starts with.
++ * No DMA, no MSI, no SMMU, no firmware. The endpoint's bus mastering stays off; the root port gets
++ * memory decoding and bus mastering, as the three reference ports set it before their first BAR read.
++ *
++ * It uses these pieces of the code above unchanged:
++ *   rd(), wr(), wl_ptr(), wl_map(), wl_wait(), wl_alive(), WL_FAIL(), struct wl, wl_busy, WL_PAGE,
++ *   PARF, DBI, ATU, CFGSPACE, DBI_LNKCTL, DBI_DEBUG0, DBI_DEBUG1, pong_ramoops_diagnostic_write().
++ * wl_alive() is true only after a successful pong_wifi_link_up() in this boot, so the call order
++ * is `wifiup` first; without it this stops at step 17 with "link-not-up" and touches nothing.
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/T970WifiProbe.cpp endpointProbe() (memory window, BAR0 sizing and assignment, the MHI
++ *   and BHI register reads) and the field order of package/BootLog.c's "[t970 wifi ep]" row.
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ * Cross-checked against the stock T970 DTS (pcie0 `ranges`) and two other SM8250/SM8475 ports.
++ *
++ * Entry point (to be called from a pong_usb_ctl.c command, e.g. `wifimhi`):
++ *   int pong_wifi_mhi_read(char *reply, size_t reply_len);   0 = all registers read
++ * Steps (rui's `st` numbers where they exist: 18 window, 19 BAR + command, 20 registers read):
++ *   1 mapped, 17 link/endpoint checked, 18 memory window, 19 BAR0 sized and assigned,
++ *   20 endpoint memory decoding on, 21 MHI registers read, 22 BHI registers read.
++ * A negative step is the step that failed; `why` names the check. Before each step a short
++ * "[PONG_WIFI] M<step>" line goes to pmsg, so a silent SoC reset still shows the step.
++ */
++
++
++/* ---- tuning knob -------------------------------------------------------------------------- */
++/* Root port Command bits set here: memory decoding and bus mastering, as rui (T970WifiProbe.cpp:387),
++ * pong-wifi and the S20+ port set them before the first BAR read. The endpoint's own Command gets
++ * Memory Space only (step 20), so the chip still cannot start a transfer. */
++#define WM_RP_CMD          0x6u
++
++/* ---- addresses ---------------------------------------------------------------------------- */
++/* stock DTS qcom,pcie@1c00000 `ranges`, second entry: 32-bit memory, bus 0x60300000 = CPU 0x60300000, 0x3d00000 bytes */
++#define WM_MEM_BASE        0x60300000UL
++#define WM_MEM_SIZE        0x03d00000UL
++#define WM_MEM_LAST        (WM_MEM_BASE + WM_MEM_SIZE - 1)
++#define ATU_MEM            (ATU + 0x200)     /* outbound region 1 (region 0 is the config window) */
++#define DBI_COMMAND        (DBI + 0x004)     /* root port */
++#define DBI_CLASS          (DBI + 0x008)
++#define DBI_MEM_WINDOW     (DBI + 0x020)     /* base [15:4], limit [31:20] */
++#define EP_ID              (CFGSPACE + 0x00) /* endpoint, through the CFG0 window `wifiup` left */
++#define EP_COMMAND         (CFGSPACE + 0x04) /* bit 1 memory space, bit 2 bus master */
++#define EP_CLASS           (CFGSPACE + 0x08)
++#define EP_BAR0            (CFGSPACE + 0x10)
++#define EP_BAR1            (CFGSPACE + 0x14)
++/* Read only, never written here: the BDF->SID table slot rui used (crc8 of 01 00 = 0x15) and the table's bypass register */
++#define PARF_SID_SLOT      (PARF + 0x2000 + 4 * 0x15)
++#define PARF_SID_CFG       (PARF + 0x2c00)
++
++/* MHIREGLEN, MHIVER, MHICFG, BHIOFF, MHICTRL, MHISTATUS: offsets in BAR0 */
++static const uint16_t wm_mhi_reg[6] = { 0x00, 0x08, 0x10, 0x28, 0x38, 0x48 };
++#define WM_BHIOFF          3                 /* index of BHIOFF in wm_mhi_reg */
++#define BHI_EXECENV        0x28              /* offsets from BHIOFF */
++#define BHI_STATUS         0x2c
++#define BHI_ERRCODE        0x30
++
++struct wm {
++	int step;                 /* last step completed, or -(step that failed) */
++	const char *why;
++	uint32_t ep;
++	uint32_t cls0, cls1;      /* endpoint class/revision: on entry / after memory decoding is on */
++	uint32_t rpcls;           /* the root port's own class/revision (control for the endpoint's) */
++	uint32_t rpcmd, memwin;   /* root port Command/Status and memory window, read back */
++	uint32_t mask, bar, cmd;  /* BAR0 sizing mask, BAR0 read back, endpoint Command/Status read back */
++	uint32_t mhi[6];
++	uint32_t ee, bhi_status, bhi_err;
++	uint32_t sid, sidcfg;
++};
++
++static void
++wm_mark(int step)
++{
++	char line[24];
++	int n = snprintf(line, sizeof(line), "[PONG_WIFI] M%d\n", step);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n);
++	}
++}
++
++/* Link up, in L0, data link layer active: the root port's own registers, no request on the wire.
++ * A request sent with no link is not answered (rui T970WifiStack.cpp: it stalls the bus). */
++static bool
++wm_link(void)
++{
++	return (rd(DBI_DEBUG1) & (1u << 4)) && (rd(DBI_DEBUG0) & 0x3fu) == 0x11u && (rd(DBI_LNKCTL) & (1u << 29));
++}
++
++static bool
++wm_run(struct wm *w)
++{
++	struct wl l = { .step = 0 };
++	uint32_t cmd, saved, size, address, bhi;
++
++	/* 17: prerequisites. wl_alive() reads GDSC and the clock halt bits before any PARF/DBI register. */
++	wm_mark(17);
++	if (!wl_alive(&l)) {
++		WL_FAIL(17, "link-not-up");                 /* run `wifiup` first */
++	}
++	if (!wm_link()) {
++		WL_FAIL(17, "dll-down");
++	}
++	if (!(rd(ATU + 0x04) & (1u << 31))) {
++		WL_FAIL(17, "cfg-window");                  /* region 0 (CFG0 to bus 1) is not enabled */
++	}
++	w->sid = rd(PARF_SID_SLOT);
++	w->sidcfg = rd(PARF_SID_CFG);
++	w->rpcls = rd(DBI_CLASS);
++	w->ep = rd(EP_ID);
++	w->cls0 = rd(EP_CLASS);                         /* seconds after the link came up, not 14 ms */
++	if ((w->ep & 0xffffu) != 0x17cbu) {
++		WL_FAIL(17, "ep-id");
++	}
++	w->step = 17;
++
++	/* 18: outbound iATU region 1 = memory, identity, the whole DTS window; root port window and
++	 * Memory Space. Prerequisite: DBI/iATU reachable (step 17). Nothing goes on the wire here. */
++	wm_mark(18);
++	wr(ATU_MEM + 0x08, (uint32_t)WM_MEM_BASE);      /* base */
++	wr(ATU_MEM + 0x0c, 0);
++	wr(ATU_MEM + 0x10, (uint32_t)WM_MEM_LAST);      /* limit */
++	wr(ATU_MEM + 0x20, 0);
++	wr(ATU_MEM + 0x14, (uint32_t)WM_MEM_BASE);      /* target: the same address on the bus */
++	wr(ATU_MEM + 0x18, 0);
++	wr(ATU_MEM + 0x00, 0x0);                        /* MEM */
++	wr(ATU_MEM + 0x04, 1u << 31);                   /* enable */
++	if (!wl_wait(ATU_MEM + 0x04, 1u << 31, 1u << 31, 5, 10, NULL)) {
++		WL_FAIL(18, "iatu-mem");
++	}
++	wr(DBI_MEM_WINDOW, ((uint32_t)WM_MEM_LAST & 0xfff00000u) | ((uint32_t)(WM_MEM_BASE >> 16) & 0xfff0u));
++	wr(DBI_COMMAND, (rd(DBI_COMMAND) & 0xffffu) | WM_RP_CMD);   /* status half written as 0: nothing cleared */
++	w->memwin = rd(DBI_MEM_WINDOW);
++	w->rpcmd = rd(DBI_COMMAND);
++	if ((w->rpcmd & WM_RP_CMD) != WM_RP_CMD) {
++		WL_FAIL(18, "rp-cmd");
++	}
++	w->step = 18;
++
++	/* 19: BAR0 size and address. Prerequisite: link still up; the endpoint's memory decoding and
++	 * bus mastering off while the BAR is changed (they are after a power cycle; a second call
++	 * finds memory decoding on and turns it off first). Config writes only. */
++	wm_mark(19);
++	if (!wm_link()) {
++		WL_FAIL(19, "link-dropped");
++	}
++	cmd = rd(EP_COMMAND);
++	if (cmd & 0x6u) {
++		wr(EP_COMMAND, cmd & 0xffffu & ~0x6u);
++		if (rd(EP_COMMAND) & 0x6u) {
++			WL_FAIL(19, "cmd-clear");
++		}
++	}
++	saved = rd(EP_BAR0);
++	wr(EP_BAR0, 0xffffffffu);
++	w->mask = rd(EP_BAR0);
++	wr(EP_BAR0, saved);
++	if (w->mask == 0xffffffffu || (w->mask & 1u)) {
++		WL_FAIL(19, "bar-mask");                    /* no answer, or an I/O BAR (rui read fff00004) */
++	}
++	size = ~(w->mask & ~0xfu) + 1;
++	if (!(w->mask & ~0xfu) || size < WL_PAGE || size > WM_MEM_SIZE) {
++		WL_FAIL(19, "bar-size");                    /* rui: 0x100000 */
++	}
++	address = (uint32_t)((WM_MEM_BASE + size - 1) & ~(uint64_t)(size - 1));   /* first aligned address of the window */
++	if ((uint64_t)address + size - 1 > WM_MEM_LAST) {
++		WL_FAIL(19, "bar-fit");
++	}
++	wr(EP_BAR0, address | (w->mask & 0xfu));
++	if ((w->mask & 6u) == 4u) {
++		wr(EP_BAR1, 0);                             /* 64-bit BAR: upper half */
++	}
++	w->bar = rd(EP_BAR0);
++	if ((w->bar & ~0xfu) != address || ((w->mask & 6u) == 4u && rd(EP_BAR1) != 0)) {
++		WL_FAIL(19, "bar-readback");
++	}
++	w->step = 19;
++
++	/* 20: endpoint Command = Memory Space on, Bus Master off (rui sets both; this stage must not
++	 * let the chip start a transfer). Prerequisite: BAR0 read back as written. */
++	wm_mark(20);
++	wr(EP_COMMAND, (rd(EP_COMMAND) & 0xffffu & ~0x4u) | 0x2u);
++	w->cmd = rd(EP_COMMAND);
++	if ((w->cmd & 0x6u) != 0x2u) {
++		WL_FAIL(20, "cmd-readback");
++	}
++	w->cls1 = rd(EP_CLASS);
++	w->step = 20;
++
++	/* 21: the first memory request to the chip: one 16K page at BAR0, MHI registers, reads only.
++	 * Prerequisite: link up and data link active right now, window + BAR + decoding in place. */
++	wm_mark(21);
++	if (!wm_link()) {
++		WL_FAIL(21, "link-dropped");
++	}
++	if (!wl_ptr(address)) {
++		WL_FAIL(21, "bar-map");
++	}
++	w->mhi[0] = rd(address + wm_mhi_reg[0]);
++	if (w->mhi[0] == 0xffffffffu) {
++		WL_FAIL(21, "bar-read-ones");               /* not answered by the chip: no further reads (rui: 100) */
++	}
++	for (unsigned i = 1; i < 6; i++) {
++		w->mhi[i] = rd(address + wm_mhi_reg[i]);
++	}
++	w->step = 21;
++
++	/* 22: BHI block. Prerequisite: BHIOFF is word aligned and its registers lie in the mapped page. */
++	wm_mark(22);
++	bhi = w->mhi[WM_BHIOFF];
++	if (!bhi || (bhi & 3u) || bhi >= WL_PAGE - 0x40) {
++		WL_FAIL(22, "bhi-off");                     /* rui: 0x100 */
++	}
++	w->ee = rd(address + bhi + BHI_EXECENV);
++	w->bhi_status = rd(address + bhi + BHI_STATUS);
++	w->bhi_err = rd(address + bhi + BHI_ERRCODE);
++	w->step = 22;
++	return true;
++}
++
++/* One line to pmsg and to the caller. From "bar" on, the fields are rui's "[t970 wifi ep]" row
++ * (sid differs: rui printed the slot it wrote; this prints the slot and the bypass register as found). */
++static int
++wm_report(const struct wm *w, char *reply, size_t reply_len)
++{
++	char line[400];
++	int n = snprintf(line, sizeof(line),
++	    "[PONG_WIFI] mhi st %d %s ep %08x cls %08x/%08x rpcls %08x rp %x/%08x bar %x/%x cmd %x "
++	    "mhi len %x ver %x cfg %x bhi %x ctrl %x status %x | ee %x st %x err %x sid %x/%x\n",
++	    w->step, w->why ? w->why : "?", w->ep, w->cls0, w->cls1, w->rpcls, w->rpcmd, w->memwin, w->mask, w->bar, w->cmd,
++	    w->mhi[0], w->mhi[1], w->mhi[2], w->mhi[3], w->mhi[4], w->mhi[5], w->ee, w->bhi_status, w->bhi_err,
++	    w->sid, w->sidcfg);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++	}
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++int
++pong_wifi_mhi_read(char *reply, size_t reply_len)
++{
++	struct wm m = { .step = 0, .why = "OK" };
++	int rc;
++
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] mhi busy\n", reply_len);
++		}
++		return -100;
++	}
++	/* 1: the pages `wifiup` mapped (no register is touched); the BAR page is mapped in step 21. */
++	wm_mark(1);
++	if (!wl_map()) {
++		m.step = -1;
++		m.why = "map";
++	} else {
++		m.step = 1;
++		(void)wm_run(&m);
++	}
++	rc = wm_report(&m, reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif
