@@ -1,0 +1,445 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 3982d0e..473df85 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -67,6 +67,7 @@ extern uint64_t armcpu_now_ms(void);
+ extern int pong_wifi_link_up(char *reply, size_t reply_len);
+ extern int pong_wifi_link_down(char *reply, size_t reply_len);
+ extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
++extern int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ /* pong_gpu_probe.c: staged read-only Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap);
+ extern struct vc_info vinfo;
+@@ -1303,6 +1304,21 @@ cmd_handle_wifimhi(void)
+ 	send_str(reply[0] ? reply : "wifimhi: no reply\n");
+ }
+ 
++/*
++ * wifis3a [bank]: after `wifiup` and `wifimhi`, read (never write) what the Wi-Fi chip's first DMA will depend on:
++ * the Apps SMMU's ID, fault and stream match registers, the PCIe controller's BDF->SID table, the endpoint's MSI and
++ * PCIe capabilities and the chip's boot state. `wifis3a bank` also reads the context bank a later stage would take.
++ */
++static void
++cmd_handle_wifis3a(int banks)
++{
++	char reply[640];
++
++	reply[0] = '\0';
++	(void)pong_wifi_stage3a(reply, sizeof(reply), banks);
++	send_str(reply[0] ? reply : "wifis3a: no reply\n");
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -1441,12 +1457,16 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_wifi(false);
+ 	} else if (strcmp(cmd, "wifimhi") == 0) {
+ 		cmd_handle_wifimhi();
++	} else if (strcmp(cmd, "wifis3a") == 0) {
++		cmd_handle_wifis3a(0);
++	} else if (strcmp(cmd, "wifis3a bank") == 0) {
++		cmd_handle_wifis3a(1);
+ 	} else if (strcmp(cmd, "gpuprobe") == 0) {
+ 		cmd_handle_gpuprobe();
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index ed0694b..e0d0fe6 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -39,6 +39,7 @@ extern uint64_t mach_absolute_time(void);
+ int pong_wifi_link_up(char *reply, size_t reply_len);
+ int pong_wifi_link_down(char *reply, size_t reply_len);
+ int pong_wifi_mhi_read(char *reply, size_t reply_len);
++int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);
+ 
+ /* ---- tuning knobs ------------------------------------------------------------------------- */
+ #define WL_LINK_GEN        1u      /* LNKCTL2 target speed; stock DTS qcom,target-link-speed = 1 */
+@@ -163,7 +164,7 @@ struct wl {
+ 	uint32_t ep, cls;
+ };
+ 
+-static struct { uint64_t pa; vm_offset_t va; } wl_page[16];
++static struct { uint64_t pa; vm_offset_t va; } wl_page[32];
+ static vm_offset_t wl_cmddb;
+ static bool wl_is_up;             /* this file trained the link and has not taken it down since */
+ static volatile uint32_t wl_busy;
+@@ -175,12 +176,12 @@ wl_ptr(uint64_t phys)
+ 	uint64_t pa = phys & ~(uint64_t)(WL_PAGE - 1);
+ 	unsigned i;
+ 
+-	for (i = 0; i < 16 && wl_page[i].va; i++) {
++	for (i = 0; i < 32 && wl_page[i].va; i++) {
+ 		if (wl_page[i].pa == pa) {
+ 			return (volatile uint32_t *)(wl_page[i].va + (vm_offset_t)(phys - pa));
+ 		}
+ 	}
+-	if (i == 16) {
++	if (i == 32) {
+ 		return NULL;
+ 	}
+ 	vm_offset_t va = ml_io_map((vm_offset_t)pa, WL_PAGE);
+@@ -1012,4 +1013,356 @@ pong_wifi_mhi_read(char *reply, size_t reply_len)
+ 	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/*
++ * Stage 3a of the SM-T970 Wi-Fi bring-up: a READ-ONLY survey of everything the first DMA (the BHI
++ * load of the QCA6390's boot loader) will depend on. No hardware register is written here; the
++ * only side effects are ml_io_map() windows and pmsg lines.
++ *
++ * It uses these pieces of the code above unchanged:
++ *   rd(), wl_ptr(), wl_map(), wl_alive(), wm_link(), WL_FAIL(), struct wl, wl_busy, WL_PAGE,
++ *   PARF, DBI, ATU, CFGSPACE, DBI_COMMAND, EP_ID, EP_COMMAND, EP_BAR0, WM_MEM_BASE, WM_MEM_LAST,
++ *   PARF_SID_CFG, wm_mhi_reg[], WM_BHIOFF, BHI_EXECENV, BHI_STATUS, BHI_ERRCODE,
++ *   pong_ramoops_diagnostic_write().
++ * wl_ptr() has 32 window slots; `wifiup` + `wifimhi` use 14, this adds 2 or more (the SMMU's
++ * global page, one per group of four context banks looked at).
++ *
++ * Ported from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790):
++ *   package/T970WifiProbe.cpp smmuSurvey() (SMR/S2CR scan for streams 0x1c00/0x1c01),
++ *   wdom::install() steps 2..5 (ID registers, geometry, free SMR, free context bank; the reads
++ *   only), the capability walk of endpointProbe() (reads only), the SID table slot of bringUp();
++ *   package/T970WifiStack.cpp sdom::install() (bank choice by SCTLR/FSR only), smrMatches().
++ *   Copyright (c) 2026, UniXNU-gts7xlwifi contributors. All rights reserved. BSD-2-Clause-Patent.
++ * Cross-checked against the stock T970 DTS (apps-smmu@15000000, pcie0 iommu-map) and this
++ * kernel's own UFS takeover (drivers/NativeUfs: stream 0xe0, measured in SMR 3 -> bank 73).
++ *
++ * Entry point (USB commands `wifis3a` and `wifis3a bank`, after `wifiup` and `wifimhi`):
++ *   int pong_wifi_stage3a(char *reply, size_t reply_len, int banks);   0 = everything read; reply >= 640 bytes
++ * Without `banks` it stops after step 46: step 47 reads context bank registers this kernel has never
++ * read (a hypervisor-owned bank may not answer), so it only runs when asked for, after the rest of the
++ * line has been seen once.
++ * Steps (a negative step is the one that failed, `why` names the check):
++ *   1 mapped, 41 SMMU ID and global fault registers, 42 SMR/S2CR scan, 43 link and endpoint
++ *   present, 44 PARF BDF->SID table, 45 endpoint capabilities (MSI, PCIe), 46 chip state through
++ *   BAR0 (MHISTATUS, BHI EE/status/error), 47 the context bank stage 3b would take.
++ * Before each step "[PONG_WIFI] S<step>" goes to pmsg ("S47 b<n>" before bank n is read), and the
++ * result so far goes to pmsg before step 47, so a stalled bank read still leaves the rest.
++ */
++
++/* ---- tuning knobs ------------------------------------------------------------------------- */
++#define S3_BANK_FROM       0u      /* lowest context bank considered (never below NUMS2CB) */
++#define S3_BANK_TRIES      4u      /* banks whose SCTLR/FSR are read, at most */
++
++/* ---- addresses ---------------------------------------------------------------------------- */
++/* stock DTS apps-smmu@15000000: reg 0x15000000, 0x100000 bytes. SMMUv2 global space 0. */
++#define SMMU               0x15000000UL
++#define SMMU_SIZE          0x100000UL
++#define SMMU_SCR0          0x000   /* bit 0 CLIENTPD, bit 3 EXIDENABLE, bit 10 USFCFG (unmatched streams fault) */
++#define SMMU_IDR0          0x020   /* bits 7:0 NUMSMRG */
++#define SMMU_IDR1          0x024   /* bit 31 64K pages, 30:28 NUMPAGENDXB, 23:16 NUMS2CB, 7:0 NUMCB */
++#define SMMU_IDR2          0x028
++#define SMMU_SGFSR         0x048
++#define SMMU_SGFSYNR0      0x050   /* +4 SGFSYNR1 (stream ID of an unmatched access), +8 SGFSYNR2 */
++#define SMMU_SMR(n)        (0x800 + 4 * (n))   /* bit 31 valid, 30:16 mask, 14:0 stream */
++#define SMMU_S2CR(n)       (0xc00 + 4 * (n))   /* 17:16 type (0 translate, 1 bypass, 2 fault), 7:0 bank */
++#define SMMU_CBAR(n)       (4 * (n))           /* in global space 1 (one SMMU page up); CBA2R at +0x800 */
++#define SMMU_CB_SCTLR      0x000   /* bit 0 M */
++#define SMMU_CB_FSR        0x058
++#define SMMU_FSR_FAULT     0xc00001feu
++/* stock DTS pcie0 iommu-map: requester 0 -> 0x1c00 (root port), 0x100 -> 0x1c01 (endpoint).
++ * rui routes 0x1c00 mask 0x7f; the UFS takeover of this kernel owns 0xe0. */
++#define S3_SID_RC          0x1c00u
++#define S3_SID_EP          0x1c01u
++#define S3_SID_MASK        0x7fu
++#define S3_SID_UFS         0xe0u
++#define PARF_SID_TABLE     (PARF + 0x2000)     /* 256 words; slot = crc8 of the requester ID */
++#define S3_SID_SLOT_EP     0x15u               /* crc8(01 00): the endpoint's slot (rui's row: sid 80000015) */
++
++struct s3 {
++	int step;                 /* last step completed, or -(step that failed) */
++	const char *why;
++	uint32_t cr0, id0, id1, id2, gfsr, gsyn[3];
++	uint32_t groups, banks, valid, overlap;       /* overlap: valid SMRs touching 0x1c00..0x1c7f */
++	int free_smr;                                 /* first invalid SMR, -1 none */
++	int ep_i, rc_i, ufs_i;                        /* first valid SMR matching the stream, -1 none */
++	uint32_t ep_smr, ep_s2cr, rc_smr, rc_s2cr, ufs_smr, ufs_s2cr;
++	uint32_t sid0, sid15, sidn, sidcfg;           /* table slots 0 and 0x15, non-zero slots, bypass register */
++	uint32_t pcap, mcap, msi, msia, msib, lnk, dev;   /* capability offsets; MSI words 0, +4, +8; LNKCTL; DEVCTL */
++	uint32_t cmd, bar, rpcmd;
++	uint32_t mhist, ee, bhi_status, bhi_err;
++	int bank;                                     /* the bank stage 3b would take, -1 none */
++	uint32_t tried, last, sctlr, fsr, cbar, cba2r;    /* last: the last bank read; sctlr/fsr are that bank's */
++};
++
++static void
++s3_mark(int step, int bank)
++{
++	char line[32];
++	int n = bank < 0 ? snprintf(line, sizeof(line), "[PONG_WIFI] S%d\n", step) :
++	    snprintf(line, sizeof(line), "[PONG_WIFI] S%d b%d\n", step, bank);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++	}
++}
++
++/* True when a valid SMR covers `stream`, or any stream of stream..stream|span (rui install()). */
++static bool
++s3_match(uint32_t smr, uint32_t stream, uint32_t span)
++{
++	return ((stream ^ smr) & ~((smr >> 16) | span) & 0x7fffu) == 0;
++}
++
++/* One line to pmsg and, when a reply buffer is given, to the caller. */
++static int
++s3_report(const struct s3 *w, char *reply, size_t reply_len)
++{
++	char line[640];
++	int n = snprintf(line, sizeof(line),
++	    "[PONG_WIFI] s3a st %d %s scr0 %x id %x/%x/%x gf %x/%x/%x/%x smr %u/%u free %d ep %d:%x/%x rc %d:%x/%x "
++	    "ovl %u ufs %d:%x/%x sid %x/%x/%u cfg %x cap %x/%x msi %x a %x/%x lnk %x dev %x cmd %x bar %x rp %x "
++	    "mhi %x ee %x bhi %x/%x bank %d/%u last %u sctlr %x fsr %x cbar %x a2r %x\n",
++	    w->step, w->why ? w->why : "?", w->cr0, w->id0, w->id1, w->id2, w->gfsr, w->gsyn[0], w->gsyn[1], w->gsyn[2],
++	    w->valid, w->groups, w->free_smr, w->ep_i, w->ep_smr, w->ep_s2cr, w->rc_i, w->rc_smr, w->rc_s2cr,
++	    w->overlap, w->ufs_i, w->ufs_smr, w->ufs_s2cr, w->sid0, w->sid15, w->sidn, w->sidcfg, w->pcap, w->mcap,
++	    w->msi, w->msia, w->msib, w->lnk, w->dev, w->cmd, w->bar, w->rpcmd,
++	    w->mhist, w->ee, w->bhi_status, w->bhi_err, w->bank, w->tried, w->last, w->sctlr, w->fsr, w->cbar, w->cba2r);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++	}
++	if (reply && reply_len) {
++		strlcpy(reply, line, reply_len);
++	}
++	return w->step < 0 ? w->step : 0;
++}
++
++static bool
++s3_run(struct s3 *w, bool banks)
++{
++	struct wl l = { .step = 0 };
++	uint64_t routed[2] = { 0, 0 };            /* bit n: a valid translating SMR points at bank n */
++	uint32_t shift, pages, ns2, gr1, cap, bar, bhi;
++
++	/* 41: ID and global fault registers. Prerequisite: the SMMU's first page is mapped (step 1).
++	 * This kernel already reads them at boot (pong_usb_ctl.c step 3, the UFS takeover). */
++	s3_mark(41, -1);
++	w->cr0 = rd(SMMU + SMMU_SCR0);
++	w->id0 = rd(SMMU + SMMU_IDR0);
++	w->id1 = rd(SMMU + SMMU_IDR1);
++	w->id2 = rd(SMMU + SMMU_IDR2);
++	w->gfsr = rd(SMMU + SMMU_SGFSR);
++	for (unsigned i = 0; i < 3; i++) {
++		w->gsyn[i] = rd(SMMU + SMMU_SGFSYNR0 + 4 * i);
++	}
++	w->groups = w->id0 & 0xffu;
++	w->banks = w->id1 & 0xffu;
++	ns2 = (w->id1 >> 16) & 0xffu;
++	shift = (w->id1 >> 31) ? 16 : 12;
++	pages = 2u << ((w->id1 >> 28) & 7u);
++	if ((w->cr0 & (1u << 3)) || !w->groups || w->groups > 128 || !w->banks || w->banks > 128 ||
++	    ((uint64_t)(pages + w->banks) << shift) > SMMU_SIZE) {
++		WL_FAIL(41, "smmu-geometry");               /* rui: 87 groups, 74 banks, 4K pages, 128 global pages */
++	}
++	gr1 = 1u << shift;
++	if (!wl_ptr(SMMU + gr1) || !wl_ptr(SMMU + gr1 + 0x800)) {
++		WL_FAIL(41, "gr1-map");
++	}
++	w->step = 41;
++
++	/* 42: every stream match register. Prerequisite: geometry checked (groups <= 128, so the
++	 * SMRs and S2CRs lie in the page mapped in step 1). */
++	s3_mark(42, -1);
++	for (uint32_t i = 0; i < w->groups; i++) {
++		uint32_t smr = rd(SMMU + SMMU_SMR(i)), s2cr, b;
++
++		if (!(smr & (1u << 31))) {
++			if (w->free_smr < 0) {
++				w->free_smr = (int)i;
++			}
++			continue;
++		}
++		s2cr = rd(SMMU + SMMU_S2CR(i));
++		b = s2cr & 0xffu;
++		w->valid++;
++		if (((s2cr >> 16) & 3u) == 0 && b < w->banks) {
++			routed[b / 64] |= 1ull << (b % 64);
++		}
++		if (s3_match(smr, S3_SID_RC, S3_SID_MASK)) {
++			w->overlap++;
++		}
++		if (w->ep_i < 0 && s3_match(smr, S3_SID_EP, 0)) {
++			w->ep_i = (int)i;
++			w->ep_smr = smr;
++			w->ep_s2cr = s2cr;
++		}
++		if (w->rc_i < 0 && s3_match(smr, S3_SID_RC, 0)) {
++			w->rc_i = (int)i;
++			w->rc_smr = smr;
++			w->rc_s2cr = s2cr;
++		}
++		if (w->ufs_i < 0 && s3_match(smr, S3_SID_UFS, 0)) {
++			w->ufs_i = (int)i;
++			w->ufs_smr = smr;
++			w->ufs_s2cr = s2cr;
++		}
++	}
++	w->step = 42;
++
++	/* 43: the link and the endpoint, as `wifimhi` step 17. wl_alive() reads GDSC and the clock
++	 * halt bits before any PARF/DBI register; nothing below may run without it. */
++	s3_mark(43, -1);
++	if (!wl_alive(&l)) {
++		WL_FAIL(43, "link-not-up");                 /* run `wifiup` first */
++	}
++	if (!wm_link()) {
++		WL_FAIL(43, "dll-down");
++	}
++	if (!(rd(ATU + 0x04) & (1u << 31))) {
++		WL_FAIL(43, "cfg-window");
++	}
++	if ((rd(EP_ID) & 0xffffu) != 0x17cbu) {
++		WL_FAIL(43, "ep-id");
++	}
++	w->step = 43;
++
++	/* 44: the controller's BDF->SID table as it is now. Prerequisite: PARF clocked (step 43).
++	 * `wifimhi` read slot 0x15 and the bypass register on 11-11 (cb8274ba / 0). */
++	s3_mark(44, -1);
++	w->sidcfg = rd(PARF_SID_CFG);
++	for (uint32_t i = 0; i < 256; i++) {
++		uint32_t v = rd(PARF_SID_TABLE + 4 * i);
++
++		if (v) {
++			w->sidn++;
++		}
++		if (i == 0) {
++			w->sid0 = v;
++		} else if (i == S3_SID_SLOT_EP) {
++			w->sid15 = v;
++		}
++	}
++	w->step = 44;
++
++	/* 45: endpoint Command, BAR0, capability list (configuration reads only). Prerequisite:
++	 * link up and data link active right now, CFG0 window enabled (step 43). */
++	s3_mark(45, -1);
++	if (!wm_link()) {
++		WL_FAIL(45, "link-dropped");
++	}
++	w->rpcmd = rd(DBI_COMMAND);
++	w->cmd = rd(EP_COMMAND);
++	w->bar = rd(EP_BAR0);
++	if (!(w->cmd & (1u << 20))) {
++		WL_FAIL(45, "no-cap-list");                 /* Status bit 4 */
++	}
++	cap = rd(CFGSPACE + 0x34) & 0xfcu;
++	for (unsigned guard = 0; cap >= 0x40 && guard < 48; guard++) {
++		uint32_t v = rd(CFGSPACE + cap);
++
++		if ((v & 0xffu) == 0x10u) {
++			w->pcap = cap;
++		} else if ((v & 0xffu) == 0x05u) {
++			w->mcap = cap;
++		}
++		cap = (v >> 8) & 0xfcu;
++	}
++	if (!w->pcap || !w->mcap) {
++		WL_FAIL(45, "no-msi-cap");                  /* stage 3c cannot enable MSI */
++	}
++	w->msi = rd(CFGSPACE + w->mcap);                /* control in the upper half: bit 16 enable, 19:17 capable, 22:20 enabled, 23 64-bit */
++	w->msia = rd(CFGSPACE + w->mcap + 4);
++	w->msib = rd(CFGSPACE + w->mcap + 8);
++	w->dev = rd(CFGSPACE + w->pcap + 0x08);         /* DEVCTL */
++	w->lnk = rd(CFGSPACE + w->pcap + 0x10);         /* LNKCTL: bits 1:0 ASPM */
++	w->step = 45;
++
++	/* 46: is the chip still in its boot ROM? Prerequisite: `wifimhi` left BAR0 inside the window
++	 * with memory decoding on; link up right now. Reads only, the registers `wifimhi` read. */
++	s3_mark(46, -1);
++	bar = w->bar & ~0xfu;
++	if (!(w->cmd & 0x2u) || bar < WM_MEM_BASE || bar > WM_MEM_LAST) {
++		WL_FAIL(46, "no-bar");                      /* run `wifimhi` first */
++	}
++	if (!wm_link()) {
++		WL_FAIL(46, "link-dropped");
++	}
++	if (!wl_ptr(bar)) {
++		WL_FAIL(46, "bar-map");
++	}
++	w->mhist = rd(bar + wm_mhi_reg[5]);
++	if (w->mhist == 0xffffffffu) {
++		WL_FAIL(46, "bar-read-ones");
++	}
++	bhi = rd(bar + wm_mhi_reg[WM_BHIOFF]);
++	if (!bhi || (bhi & 3u) || bhi >= WL_PAGE - 0x40) {
++		WL_FAIL(46, "bhi-off");
++	}
++	w->ee = rd(bar + bhi + BHI_EXECENV);
++	w->bhi_status = rd(bar + bhi + BHI_STATUS);
++	w->bhi_err = rd(bar + bhi + BHI_ERRCODE);
++	w->step = 46;
++	if (!banks) {
++		return true;
++	}
++	(void)s3_report(w, NULL, 0);
++
++	/* 47: the context bank stage 3b would take, by rui's rule: the first bank from NUMS2CB up
++	 * that no valid translating SMR points at, with translation off and no recorded fault. Only
++	 * SCTLR and FSR of such a bank are read (rui's stage 6 froze while reading CBAR/TTBR of every
++	 * bank; its SCTLR/FSR reads never did). Prerequisite: the scan of step 42. */
++	s3_mark(47, -1);
++	for (uint32_t i = ns2 > S3_BANK_FROM ? ns2 : S3_BANK_FROM; i < w->banks && w->tried < S3_BANK_TRIES; i++) {
++		uint64_t cb = SMMU + ((uint64_t)(pages + i) << shift);
++
++		if (routed[i / 64] & (1ull << (i % 64))) {
++			continue;
++		}
++		s3_mark(47, (int)i);
++		if (!wl_ptr(cb)) {
++			WL_FAIL(47, "bank-map");                /* out of wl_page[] slots */
++		}
++		w->tried++;
++		w->last = i;
++		w->sctlr = rd(cb + SMMU_CB_SCTLR);
++		w->fsr = rd(cb + SMMU_CB_FSR);
++		if (!(w->sctlr & 1u) && !(w->fsr & SMMU_FSR_FAULT)) {
++			w->bank = (int)i;
++			break;
++		}
++	}
++	if (w->bank < 0) {
++		WL_FAIL(47, "no-free-bank");
++	}
++	w->cbar = rd(SMMU + gr1 + SMMU_CBAR((uint32_t)w->bank));
++	w->cba2r = rd(SMMU + gr1 + 0x800 + SMMU_CBAR((uint32_t)w->bank));
++	w->step = 47;
++	return true;
++}
++
++int
++pong_wifi_stage3a(char *reply, size_t reply_len, int banks)
++{
++	struct s3 s = { .step = 0, .why = "OK", .free_smr = -1, .ep_i = -1, .rc_i = -1, .ufs_i = -1, .bank = -1 };
++	int rc;
++
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		if (reply && reply_len) {
++			strlcpy(reply, "[PONG_WIFI] s3a busy\n", reply_len);
++		}
++		return -100;
++	}
++	/* 1: the pages `wifiup` mapped plus the SMMU's first page (no register is touched). */
++	s3_mark(1, -1);
++	if (!wl_map() || !wl_ptr(SMMU)) {
++		s.step = -1;
++		s.why = "map";
++	} else {
++		s.step = 1;
++		(void)s3_run(&s, banks != 0);
++	}
++	rc = s3_report(&s, reply, reply_len);
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif
