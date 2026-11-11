@@ -1,0 +1,183 @@
+diff --git a/bsd/dev/pong_buttons.c b/bsd/dev/pong_buttons.c
+index 8d579b4..06abe1b 100644
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -7,10 +7,12 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/thread_call.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/pong_input.h>
++#include <sys/reboot.h>
+ #include <sys/systm.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -18,6 +20,8 @@ extern kern_return_t thread_terminate(thread_t);
+ extern void pong_ramoops_diagnostic_write(const char *, int);
+ 
+ static vm_offset_t core, cnfg, observer;
++static uint64_t chnls_pa;                 /* the arbiter's write channels ("chnls"); only known for the SM8250 */
++static volatile uint32_t power_down_started;   /* the polling loop stops: the PON channel is the power-down's */
+ static bool v7;
+ static uint32_t channels;
+ static uint32_t buttons_mask;
+@@ -96,6 +100,7 @@ static bool configuration(void)
+         c = 0x0c440000ULL;
+         n = 0x0c40a000ULL;
+         o = 0x0e600000ULL;
++        chnls_pa = 0x0c600000ULL;          /* gts7xlwifi.dts qcom,spmi@c440000 reg-names "chnls" */
+         a = 0x008;
+         b = 0x4c2;
+     } else if (c == 0x0c400000ULL && n == 0x0c42d000ULL && o == 0x0c440000ULL) {
+@@ -268,6 +273,8 @@ static void keys_thread(__unused void *arg, __unused wait_result_t wait_res)
+     for (;;) {
+         bool good = true;
+ 
++        if (power_down_started) break;
++
+         if (keys[0].usable || keys[2].usable) {
+             if (read_registers(&pon, 0x10, &state, 1)) {
+                 if (keys[0].usable) look(&keys[0], (state & pwr_mask) != 0, 0);
+@@ -332,6 +339,102 @@ out:
+     thread_terminate(current_thread());
+ }
+ 
++/* ---- power off and restart through the PMIC ----------------------------------------------------------------
++ * Nothing answers PEHaltRestart on this board (panic "Halt/Restart Timed Out" 30 s later) and PSCI SYSTEM_RESET
++ * returns without a reset (both measured 11-10), so "power off" in iPadOS left the tablet running. The stock
++ * kernel's way: gts7xlwifi.dts restart@c264000 "qcom,pshold" and qcom,power-on@800 with "qcom,system-reset" on the
++ * PM8150 (SID 0). The PON peripheral says what PS_HOLD going low means; then PS_HOLD is dropped.
++ * Values as Linux drivers/input/misc/pm8941-pwrkey.c (no code taken): PS_HOLD_RST_CTL 0x5a type [3:0], 4 = shutdown;
++ * PS_HOLD_RST_CTL2 0x5b bit 7 = enable, cleared while the type changes. SPMI write as spmi-pmic-arb.c for arbiter
++ * v5: the peripheral's channel at chnls + 0x10000 * apid, WDATA0 +0x10, CMD +0 (extended write long = opcode 0),
++ * STATUS +8; only for a channel this execution environment (0) owns.
++ * A restart leaves the type as the boot loader set it: dropping PS_HOLD alone restarted the tablet on 11-10.
++ * With a charger or USB host attached the PMIC powers the board up again right after a shutdown.
++ */
++void pong_power_down(int howto);
++void pong_shutdown_failsafe(int howto);
++
++static bool write_register(const struct peripheral *p, uint8_t reg, uint8_t value)
++{
++    static vm_offset_t ch;
++
++    if (!p->found || v7 || !chnls_pa || !cnfg) return false;
++    if ((rd(cnfg + 0x700 + 4 * p->channel) & 7) != 0) return false;
++    if (!ch) ch = ml_io_map(chnls_pa + 0x10000ULL * p->channel, 0x1000);
++    if (!ch) return false;
++    uint64_t limit = 0;
++    clock_interval_to_deadline(2000, NSEC_PER_USEC, &limit);
++    wr(ch + 0x10, value);
++    wr(ch, (uint32_t)reg << 4);
++    uint32_t status;
++    do {
++        status = rd(ch + 8);
++    } while (!(status & 1) && mach_absolute_time() < limit);
++    return (status & 0xf) == 1;
++}
++
++/* howto: reboot(2) flags. Returns only when the board stayed up. */
++void pong_power_down(int howto)
++{
++    static vm_offset_t pshold;
++    bool halt = (howto & RB_HALT) != 0;
++
++    if (__atomic_exchange_n(&power_down_started, 1, __ATOMIC_ACQUIRE)) return;
++    delay_for_interval(80, NSEC_PER_MSEC);          /* the polling loop's last read is over */
++    if (halt) {
++        uint8_t ctl = 0, ctl2 = 0, after = 0, after2 = 0;
++        bool ok = read_registers(&pon, 0x5a, &ctl, 1) && read_registers(&pon, 0x5b, &ctl2, 1) &&
++            write_register(&pon, 0x5b, (uint8_t)(ctl2 & 0x7f));
++
++        if (ok) {
++            delay_for_interval(1, NSEC_PER_MSEC);   /* a few sleep clock cycles between the enable bit's writes */
++            ok = write_register(&pon, 0x5a, (uint8_t)((ctl & 0xf0) | 4)) &&
++                write_register(&pon, 0x5b, (uint8_t)(ctl2 | 0x80)) &&
++                read_registers(&pon, 0x5a, &after, 1) && read_registers(&pon, 0x5b, &after2, 1) &&
++                (after & 0x0f) == 4 && (after2 & 0x80);
++        }
++        pmsg_log("[PONG_PWR] off: pon=%d ctl %02x>%02x ctl2 %02x>%02x ok=%d\n", pon.found, ctl, after, ctl2, after2, ok);
++        if (!ok) {
++            /* PS_HOLD would restart the board instead: leave it, the caller goes on as before */
++            __atomic_store_n(&power_down_started, 0, __ATOMIC_RELEASE);
++            return;
++        }
++    }
++    if (!pshold) pshold = ml_io_map(0x0c264000UL, 0x1000);
++    if (!pshold) {
++        pmsg_log("[PONG_PWR] no PS_HOLD mapping\n");
++        return;
++    }
++    pmsg_log("[PONG_PWR] dropping PS_HOLD (%s)\n", halt ? "off" : "restart");
++    wr(pshold, 0);
++    delay_for_interval(1000, NSEC_PER_MSEC);
++    pmsg_log("[PONG_PWR] PS_HOLD dropped, still running\n");
++}
++
++static void shutdown_failsafe_fire(thread_call_param_t howto, __unused thread_call_param_t p1)
++{
++    pmsg_log("[PONG_PWR] shutdown stalled after the data volume was unmounted\n");
++    pong_power_down((int)(uintptr_t)howto);
++}
++
++/* reboot_kernel() calls this once the writable volumes are unmounted: if the rest of the shutdown (the sealed system
++ * volume's unmount took minutes on the same tablet, UniXNU-gts7xlwifi t970-shutdown-failsafe.patch) is not over in
++ * pong_shutdown_wait seconds (default 10, 0 = off), the board is powered down or restarted from here. */
++void pong_shutdown_failsafe(int howto)
++{
++    static thread_call_t call;
++    uint32_t seconds = 10;
++    uint64_t deadline = 0;
++
++    (void)PE_parse_boot_argn("pong_shutdown_wait", &seconds, sizeof(seconds));
++    if (!seconds || (howto & RB_PANIC) || call) return;
++    call = thread_call_allocate(shutdown_failsafe_fire, (thread_call_param_t)(uintptr_t)(unsigned)howto);
++    if (!call) return;
++    clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
++    thread_call_enter_delayed(call, deadline);
++    pmsg_log("[PONG_PWR] shutdown failsafe armed, %u s\n", seconds);
++}
++
+ void pong_buttons_init(void)
+ {
+     thread_t th = THREAD_NULL;
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index d3d2517..4347f62 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -85,6 +85,9 @@ static int  sd_openlog(vfs_context_t);
+ static int  sd_closelog(vfs_context_t);
+ static void sd_log(vfs_context_t, const char *, ...);
+ static void proc_shutdown(int only_non_dext);
++/* SM-T970 (bsd/dev/pong_buttons.c): power off / restart through the PMIC; nothing answers PEHaltRestart there. */
++extern void pong_power_down(int howto) __attribute__((weak_import));
++extern void pong_shutdown_failsafe(int howto) __attribute__((weak_import));
+ static void zprint_panic_info(void);
+ extern void halt_log_enter(const char * what, const void * pc, uint64_t time);
+ 
+@@ -275,6 +278,11 @@ reboot_kernel(int howto, char *message)
+ 
+ 		IOSystemShutdownNotification(howto, kIOSystemShutdownNotificationTerminateDEXTs);
+ 
++		/* the writable volumes are unmounted: bound the time the rest may take */
++		if (pong_shutdown_failsafe) {
++			pong_shutdown_failsafe(howto);
++		}
++
+ 		startTime = mach_absolute_time();
+ 		proc_shutdown(FALSE);
+ 		halt_log_enter("proc_shutdown", 0, mach_absolute_time() - startTime);
+@@ -338,6 +346,10 @@ force_reboot:
+ 		hostboot_option = HOST_REBOOT_UPSDELAY;
+ 	}
+ 
++	if (pong_power_down) {
++		pong_power_down(howto);                 /* returns only when the board stayed up */
++	}
++
+ 	host_reboot(host_priv_self(), hostboot_option);
+ 	/*
+ 	 * should not be reached
