@@ -1,0 +1,14 @@
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index e045e03..cb95b40 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -854,8 +854,7 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 	PE_parse_boot_argn("pong_batt_sample_ticks", &sampleTicks, sizeof(sampleTicks));
+ 	if (sampleTicks < 1 || sampleTicks > 360) sampleTicks = 6;
+ 	PE_parse_boot_argn("pong_batt_spin", &gT970Spin, sizeof(gT970Spin));
+-	batteryPmsg("PONG_BATT cfg kick=%u sample_ticks=%u spin=%u
+-", kick, sampleTicks, gT970Spin);
++	batteryPmsg("PONG_BATT cfg kick=%u sample_ticks=%u spin=%u\n", kick, sampleTicks, gT970Spin);
+ 	for (;;) {
+ 		if (kick == 1) {
+ 			uint8_t cnfg06 = 0;
