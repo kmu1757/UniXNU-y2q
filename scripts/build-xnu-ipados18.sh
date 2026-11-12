@@ -315,6 +315,12 @@ if [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
     --output-dir "$ROOT/build/pong-ath11k" --jobs "${JOBS:-4}"
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-wifi-native.py" --tree "$ROOT"
 fi
+if [ "${XNU_T970_ATH11K_LINK:-0}" = 1 ]; then
+  # SM-T970 (QCA6390), first step of the Wi-Fi integration: the Linux ath11k / MHI / QMI stack and the shared
+  # station are compiled and linked into this kernel and nothing calls them yet (no board file starts nw_wifi_start).
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/fetch-pong-native-sources.py" --only wifi_linux --only wifi_shared
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-t970-ath11k-link.py" --output-dir "$ROOT/build/t970-ath11k" --jobs "${JOBS:-4}"
+fi
 if [ "${XNU_PONG_POWER:-0}" = 1 ]; then
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-power-native.py" --tree "$ROOT"
 fi
@@ -1068,6 +1074,12 @@ PY_RAM_BLOCK_BINDINGS
     test -f "$WIFI_ARCHIVE"
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$WIFI_ARCHIVE"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $WIFI_ARCHIVE"
+  fi
+  if [ "${XNU_T970_ATH11K_LINK:-0}" = 1 ]; then
+    T970_ATH11K_ARCHIVE=$ROOT/build/t970-ath11k/libT970Ath11k.a
+    test -f "$T970_ATH11K_ARCHIVE"
+    PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$T970_ATH11K_ARCHIVE"
+    PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $T970_ATH11K_ARCHIVE"
   fi
   EXTRA_MAKE_ARGS+=("LD_KERNEL_ARCHIVES=$PLATFORM_ARCHIVES")
   EXTRA_MAKE_ARGS+=("XNU_EXTERNAL_KERNEL_ARCHIVES=$PLATFORM_DEPENDENCIES")
