@@ -318,6 +318,10 @@ fi
 if [ "${XNU_T970_ATH11K_LINK:-0}" = 1 ]; then
   # SM-T970 (QCA6390), first step of the Wi-Fi integration: the Linux ath11k / MHI / QMI stack and the shared
   # station are compiled and linked into this kernel and nothing calls them yet (no board file starts nw_wifi_start).
+  # The two source trees stay outside the build output (the CI's artifact step copies every */kernel/* path under it).
+  T970_WIFI_INPUTS=${T970_WIFI_INPUTS:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/pong-native-inputs}
+  export PONG_WIFI_SOURCE=${PONG_WIFI_SOURCE:-$T970_WIFI_INPUTS/linux-7.0.14}
+  export PONG_WIFI_SHARED=${PONG_WIFI_SHARED:-$T970_WIFI_INPUTS/Ath12kWifi}
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/fetch-pong-native-sources.py" --only wifi_linux --only wifi_shared
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-t970-ath11k-link.py" --output-dir "$ROOT/build/t970-ath11k" --jobs "${JOBS:-4}"
 fi
