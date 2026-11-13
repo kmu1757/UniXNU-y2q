@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 7adb7d4..2f0ac71 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -6,7 +6,8 @@
+  * The worker
+  *   1. brings the chip up with the stages the tablet has passed (pong_wifi_link.c): rails, WLAN_EN, PCIe0 link,
+  *      BAR0, the apps SMMU bank for streams 0x1c00/0x7f. Only the bank's translation table is another one: the
+- *      stack's own DMA window, WS_IOVA .. + 64 MiB, one physically contiguous block mapped with 2 MiB entries;
++ *      stack's own DMA window, WS_IOVA .. + 64 MiB: wired kernel memory that is contiguous for the CPU and, page
++ *      by page through the table, for the endpoint;
+  *   2. hands the module its two tables of callbacks (struct lx_platform, struct nw_board: the layout of
+  *      include/nw_abi.h in UniXNU/Ath12kWifi f6bf561) and calls nw_wifi_start();
+  *   3. calls nw_wifi_step() for ever. The module raises its interrupt handlers itself once per millisecond
+@@ -38,6 +39,7 @@ extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalA
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
+ extern uint64_t mach_absolute_time(void);
++extern uint64_t kvtophys(vm_offset_t va);
+ extern boolean_t pmap_valid_page(ppnum_t pn);
+ extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
+ extern unsigned int pmap_cache_attributes(ppnum_t pn);
+@@ -100,10 +102,9 @@ extern volatile uint64_t nw_wifi_where[4];
+ #define WS_IOVA          0xa0000000ull           /* as the hand-driven stages and both reference ports */
+ #define WS_ARENA_MAX     (64u << 20)             /* the Nothing Phone's and rui's size */
+ #define WS_ARENA_MIN     (16u << 20)
+-#define WS_BLOCK_2M      0x200000u
+ #define WS_HEAD          4096u                   /* the window's first page: MSI target, never handed out */
+-#define WS_TABLE_BYTES   0x4000u                 /* level 1 at +0, level 2 at +4096 */
+-#define WS_L2_BLOCK      0x0060000000000f41ull   /* S3B_LEAF of pong_wifi_link.c as a level-2 block */
++#define WS_TABLE_BYTES   0x40000u                /* level 1 at +0, level 2 at +4096, 32 level-3 pages from +8192 */
++#define WS_LEAF          0x0060000000000f43ull   /* S3B_LEAF of pong_wifi_link.c: a 4 KiB page */
+ #define WS_BLOCKS        4096u
+ #define WS_BAR_BYTES     0x100000u               /* QCA6390 BAR0 (wifimhi: mask fff00004) */
+ #define WS_DEVICE_ID     0x1101u
+@@ -421,58 +422,67 @@ ws_map_phys(uint64_t pa, size_t n)
+ static bool
+ ws_window(void)
+ {
+-	IOPhysicalAddress pa = 0, tpa = 0;
++	IOPhysicalAddress tpa = 0;
+ 	uint64_t *t;
+ 	uint8_t *va = NULL;
+ 	uint32_t bytes;
+ 
+-	for (bytes = WS_ARENA_MAX; bytes >= WS_ARENA_MIN && !va; bytes >>= 1) {
+-		va = IOMallocContiguous(bytes, WS_BLOCK_2M, &pa);
+-		if (va && (!pa || (pa & (WS_BLOCK_2M - 1)) || pa + bytes > (1ull << 36))) {
+-			va = NULL;                      /* kept, never used: a wrong piece is not freed */
+-		}
++	/* Wired kernel memory, contiguous for the CPU only: the endpoint needs contiguous bus addresses, and the
++	 * table gives it those page by page (as the Nothing Phone's board file; one block of 64 MiB below 4 GiB,
++	 * which is what IOMallocContiguous would have to find, is not a safe bet minutes after boot). */
++	for (bytes = WS_ARENA_MAX; bytes >= WS_ARENA_MIN; bytes >>= 1) {
++		va = kalloc_data(bytes, Z_WAITOK | Z_ZERO);
+ 		if (va) {
+ 			break;
+ 		}
+ 	}
+-	if (!va) {
++	if (!va || ((uintptr_t)va & (PAGE_SIZE - 1))) {
+ 		return false;
+ 	}
+-	t = IOMallocContiguous(WS_TABLE_BYTES, WS_TABLE_BYTES, &tpa);
+-	if (!t || !tpa || (tpa & (WS_TABLE_BYTES - 1)) || tpa + WS_TABLE_BYTES > (1ull << 36)) {
++	t = IOMallocContiguous(WS_TABLE_BYTES, 0x4000, &tpa);
++	if (!t || !tpa || (tpa & 0xfffu) || tpa + WS_TABLE_BYTES > (1ull << 36)) {
+ 		return false;
+ 	}
+-	bzero(va, bytes);
+ 	bzero(t, WS_TABLE_BYTES);
+ 	t[(WS_IOVA >> 30) & 3u] = (tpa + 4096) | 3;
+-	for (uint32_t k = 0; k < bytes / WS_BLOCK_2M; k++) {
+-		t[512 + (((WS_IOVA >> 21) + k) & 511u)] = ((pa + (uint64_t)WS_BLOCK_2M * k) & 0x0000ffffffe00000ull) | WS_L2_BLOCK;
+-	}
+-	/* Both go to DRAM before anyone else looks: the table stays cached (written once), the window's pages
+-	 * become write-combining for every mapping the kernel has of them. */
+-	for (uintptr_t p = (uintptr_t)t; p < (uintptr_t)t + WS_TABLE_BYTES; p += 64) {
+-		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	for (uint32_t k = 0; k < bytes >> 21; k++) {
++		t[512 + (((WS_IOVA >> 21) + k) & 511u)] = (tpa + 8192 + 4096ull * k) | 3;
+ 	}
++	/* The zeroes go to DRAM first; then each kernel page gets its 4 KiB entries and becomes write-combining for
++	 * every mapping the kernel has of it. The table stays cached: it is written once and cleaned below. */
+ 	for (uintptr_t p = (uintptr_t)va; p < (uintptr_t)va + bytes; p += 64) {
+ 		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	for (uint64_t a = pa; a < pa + bytes; a += PAGE_SIZE) {
+-		const ppnum_t pn = (ppnum_t)atop_64(a);
++	for (uint32_t off = 0; off < bytes; off += (uint32_t)PAGE_SIZE) {
++		const uint64_t pa = kvtophys((vm_offset_t)(va + off));
++		const ppnum_t pn = (ppnum_t)atop_64(pa);
+ 
+-		if (!pmap_valid_page(pn)) {
++		if (!pa || (pa & (PAGE_SIZE - 1)) || pa + PAGE_SIZE > (1ull << 36) || !pmap_valid_page(pn)) {
+ 			return false;
+ 		}
++		for (uint32_t sub = 0; sub < (uint32_t)PAGE_SIZE; sub += 4096) {
++			t[1024 + (off + sub) / 4096] = ((pa + sub) & 0x0000fffffffff000ull) | WS_LEAF;
++		}
+ 		pmap_set_cache_attributes(pn, WS_WIMG_WCOMB);
++		if (off == 0) {
++			ws.arena_pa = pa;
++		}
++		ws.wimg = pmap_cache_attributes(pn) & WS_WIMG_MASK;   /* the last page's, after all were set */
++		if (ws.wimg != WS_WIMG_WCOMB) {
++			return false;
++		}
++	}
++	for (uintptr_t p = (uintptr_t)t; p < (uintptr_t)t + WS_TABLE_BYTES; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
+ 	}
+-	ws.wimg = pmap_cache_attributes((ppnum_t)atop_64(pa)) & WS_WIMG_MASK;
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	ws.arena = va;
+-	ws.arena_pa = pa;
+ 	ws.arena_bytes = bytes;
+ 	ws.table_pa = tpa;
+ 	ws.blocks[0] = (struct ws_block){ 0, bytes - WS_HEAD, 0 };
+ 	ws.nblocks = 1;
+-	return ws.wimg == WS_WIMG_WCOMB;
++	return true;
+ }
+ 
+ /* The endpoint's capability list: MSI (5) and PCI Express (0x10). */
