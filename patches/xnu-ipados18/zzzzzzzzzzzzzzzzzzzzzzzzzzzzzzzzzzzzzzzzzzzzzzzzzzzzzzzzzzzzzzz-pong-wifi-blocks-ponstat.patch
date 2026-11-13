@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/pong_buttons.c b/bsd/dev/pong_buttons.c
+index 15fbf6f..9fdd7c5 100644
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -21,6 +21,7 @@ extern void pong_ramoops_diagnostic_write(const char *, int);
+ 
+ static vm_offset_t core, cnfg, observer;
+ static uint64_t chnls_pa;                 /* the arbiter's write channels ("chnls"); only known for the SM8250 */
++static volatile uint32_t pon_pause;            /* the polling loop waits: another reader has the PON channel */
+ static volatile uint32_t power_down_started;   /* the polling loop stops: the PON channel is the power-down's */
+ static bool v7;
+ static uint32_t channels;
+@@ -274,6 +275,10 @@ static void keys_thread(__unused void *arg, __unused wait_result_t wait_res)
+         bool good = true;
+ 
+         if (power_down_started) break;
++        if (pon_pause) {                 /* `ponstat` reads the same observer channel */
++            delay_for_interval(10, NSEC_PER_MSEC);
++            continue;
++        }
+ 
+         if (keys[0].usable || keys[2].usable) {
+             if (read_registers(&pon, 0x10, &state, 1)) {
+@@ -377,10 +382,51 @@ static bool write_register(const struct peripheral *p, uint8_t reg, uint8_t valu
+  * Linux drivers/power/reset/qcom-pon.c with "qcom,pm8998-pon" and pm8150.dtsi (mode-recovery = 1, mode-bootloader = 2;
+  * no code taken). The stock kernel sets it next to the IMEM word; the IMEM word alone came back as a normal boot
+  * (11-10). The key polling stops for good: the caller restarts the board next. */
++/* The line of the USB `ponstat`: PON reasons 0x08..0x0f, PS_HOLD reset control 0x5a/0x5b, the spare 0x8f and the
++ * on/off/fault reasons 0xc0..0xc7 of the PM8150 (generation 2). Reads only; the key polling waits meanwhile. */
++int pong_pon_dump(char *out, size_t cap);
++int pong_pon_dump(char *out, size_t cap)
++{
++    uint8_t r[8] = {0}, c[8] = {0}, ctl[2] = {0}, spare = 0;
++    bool ok;
++
++    if (!out || cap < 96) return -1;
++    __atomic_store_n(&pon_pause, 1, __ATOMIC_RELEASE);
++    delay_for_interval(80, NSEC_PER_MSEC);          /* the polling loop's last read is over */
++    ok = read_registers(&pon, 0x08, r, 8) && read_registers(&pon, 0x5a, ctl, 2) &&
++        read_registers(&pon, 0x8f, &spare, 1) && read_registers(&pon, 0xc0, c, 8);
++    __atomic_store_n(&pon_pause, 0, __ATOMIC_RELEASE);
++    snprintf(out, cap, "ponstat: ok=%d pon=%d r08 %02x %02x %02x %02x %02x %02x %02x %02x pshold %02x/%02x spare %02x "
++        "c0 %02x %02x %02x %02x %02x %02x %02x %02x\n", ok, pon.found, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
++        ctl[0], ctl[1], spare, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
++    return ok ? 0 : -1;
++}
++
++/* What the last pong_pmic_restart_reason() did, for the reply of the USB command that asked for it:
++ * bits 7:0 spare before, 15:8 spare after, 16 ok, 17 PS_HOLD made a warm reset, 31:24 PS_HOLD type after. */
++extern uint32_t pong_pmic_restart_result;
++uint32_t pong_pmic_restart_result;
++
++/* PS_HOLD going low becomes a warm reset (type 1): the restart reason and the IMEM word survive it whatever the
++ * boot loader left in the register. Same register pair and order as the power-off above. */
++static bool pshold_warm(uint8_t *after)
++{
++    uint8_t ctl = 0, ctl2 = 0;
++
++    if (!read_registers(&pon, 0x5a, &ctl, 1) || !read_registers(&pon, 0x5b, &ctl2, 1) ||
++        !write_register(&pon, 0x5b, (uint8_t)(ctl2 & 0x7f))) return false;
++    delay_for_interval(1, NSEC_PER_MSEC);
++    return write_register(&pon, 0x5a, (uint8_t)((ctl & 0xf0) | 1)) && write_register(&pon, 0x5b, (uint8_t)(ctl2 | 0x80)) &&
++           read_registers(&pon, 0x5a, after, 1) && (*after & 0x0f) == 1;
++}
++
+ bool pong_pmic_restart_reason(unsigned reason);
+ bool pong_pmic_restart_reason(unsigned reason)
+ {
+-    uint8_t was = 0, now = 0;
++    uint8_t was = 0, now = 0, type = 0;
++    const bool warm = (reason & 0x100) != 0;   /* bit 8: also make PS_HOLD a warm reset */
++
++    reason &= 0xff;
+ 
+     if (reason > 0x7f) return false;
+     __atomic_store_n(&power_down_started, 1, __ATOMIC_RELEASE);
+@@ -389,7 +435,10 @@ bool pong_pmic_restart_reason(unsigned reason)
+     bool ok = read_registers(&pon, 0x8f, &was, 1) && write_register(&pon, 0x8f, (uint8_t)((was & 1) | want)) &&
+         read_registers(&pon, 0x8f, &now, 1) && (now & 0xfe) == want;
+ 
+-    pmsg_log("[PONG_PWR] restart reason %u: spare %02x>%02x ok=%d\n", reason, was, now, ok);
++    const bool warmed = warm && ok && pshold_warm(&type);
++
++    pong_pmic_restart_result = was | (uint32_t)now << 8 | (ok ? 1u << 16 : 0) | (warmed ? 1u << 17 : 0) | (uint32_t)type << 24;
++    pmsg_log("[PONG_PWR] restart reason %u: spare %02x>%02x ok=%d warm=%d type %02x\n", reason, was, now, ok, warmed, type);
+     return ok;
+ }
+ 
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 50ffe95..b17af6a 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -43,6 +43,9 @@ extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout, void *ar
+ extern const char *proc_best_name(proc_t p);
+ extern int reboot_kernel(int howto, char *bootstr);
+ extern bool pong_pmic_restart_reason(unsigned reason);   /* pong_buttons.c */
++extern uint32_t pong_pmic_restart_result;
++extern int pong_pon_dump(char *out, size_t cap);
++static bool reboot_recovery_warm;                         /* `reboot-recovery warm` */
+ extern task_t proc_task(proc_t);
+ extern int proc_pid(proc_t);
+ extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec);
+@@ -787,7 +790,7 @@ static void
+ cmd_handle_reboot(bool to_recovery)
+ {
+ 	if (to_recovery) {
+-		(void)pong_pmic_restart_reason(1);          /* PMIC restart reason: recovery */
++		(void)pong_pmic_restart_reason(reboot_recovery_warm ? 0x101 : 1);   /* PMIC restart reason: recovery */
+ 		if (!imem_base) {
+ 			imem_base = ml_io_map(IMEM_PHYS_BASE, IMEM_SIZE);
+ 		}
+@@ -795,7 +798,12 @@ cmd_handle_reboot(bool to_recovery)
+ 			*(volatile uint32_t *)(imem_base + IMEM_RECOVERY_OFFSET) = IMEM_MAGIC_RECOVERY;
+ 			__asm__ volatile("dsb sy" ::: "memory");
+ 			pmsg_log("[PONG_USB] recovery flag 0x%08x set\n", IMEM_MAGIC_RECOVERY);
+-			send_str("reboot-recovery: ok (rebooting to TWRP)\n");
++			{
++				char rr[96];
++
++				snprintf(rr, sizeof(rr), "reboot-recovery: ok (rebooting to TWRP) pmic %08x\n", pong_pmic_restart_result);
++				send_str(rr);
++			}
+ 		} else {
+ 			send_str("reboot-recovery: error mapping IMEM; falling back to normal reboot\n");
+ 		}
+@@ -1795,6 +1803,16 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_reboot(false);
+ 	} else if (strcmp(cmd, "reboot-recovery") == 0) {
+ 		cmd_handle_reboot(true);
++	} else if (strcmp(cmd, "reboot-recovery warm") == 0) {
++		reboot_recovery_warm = true;
++		cmd_handle_reboot(true);
++	} else if (strcmp(cmd, "ponstat") == 0) {
++		/* the PMIC power-on peripheral: reset reasons, PS_HOLD reset type, restart reason (pong_buttons.c) */
++		char pon_reply[200];
++
++		pon_reply[0] = '\0';
++		(void)pong_pon_dump(pon_reply, sizeof(pon_reply));
++		send_str(pon_reply[0] ? pon_reply : "ponstat: no reply\n");
+ 	} else if (strcmp(cmd, "screenshot") == 0) {
+ 		cmd_handle_screenshot();
+ 	} else if (strncmp(cmd, "tap ", 4) == 0) {
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 59a667d..5359670 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -112,7 +112,10 @@ extern volatile uint64_t nw_wifi_where[4];
+ #define WS_HEAD          4096u                   /* the window's first page: MSI target, never handed out */
+ #define WS_TABLE_BYTES   0x40000u                /* level 1 at +0, level 2 at +4096, 32 level-3 pages from +8192 */
+ #define WS_LEAF          0x0060000000000f43ull   /* S3B_LEAF of pong_wifi_link.c: a 4 KiB page */
+-#define WS_BLOCKS        4096u
++/* One block per live allocation. ath11k alone keeps 4096 receive buffers (and as many monitor buffers) alive:
++ * with 4096 blocks the list was full after the receive ring was filled, and the next allocation failed
++ * ("failed to configure rx_refill_buf_ring -12", 11-13). The Nothing Phone's board file has 16384. */
++#define WS_BLOCKS        32768u
+ #define WS_BAR_BYTES     0x100000u               /* QCA6390 BAR0 (wifimhi: mask fff00004) */
+ #define WS_DEVICE_ID     0x1101u
+ #define WS_IRQ_BASE      800                     /* any number: the vectors are polled */
