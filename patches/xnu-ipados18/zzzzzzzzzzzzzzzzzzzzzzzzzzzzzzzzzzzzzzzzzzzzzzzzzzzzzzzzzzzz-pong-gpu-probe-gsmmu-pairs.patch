@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index 74033ec..cecddfb 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -932,7 +932,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	 * Also lists the six SMR / S2CR pairs: the GMU context will want slots 2 and 3 (streams 5 and 0x405) and
+ 	 * the GPU's slots 0, 1, 4 and 5 (GpuProbe.cpp:249, 637-640).
+ 	 */
+-	char gsmmu_extra[320];
++	char gsmmu_extra[440];
+ 	gsmmu_extra[0] = '\0';
+ 	if (mode >= 10) {
+ 		uint32_t smr[6], s2cr[6];
+@@ -961,13 +961,33 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 			gpu_probe_wr32(g_smmu_gr0_page, off, 0x80000005u, 62);
+ 			const uint32_t got5 = gpu_probe_rd32(g_smmu_gr0_page, off);
+ 			gpu_probe_wr32(g_smmu_gr0_page, off, was, 63);
++			/* The stock device tree's pairs for this SMMU (kgsl-smmu@3da0000 qcom,actlr: id 5 and 7 with mask 0x400):
++			 * the apps SMMU took exactly the pair its device tree names for PCIe0 (0x1c00 / 0x7f). Then the same free
++			 * slot's S2CR (the canonical FAULT word) and one control bit of sCR0 (GFIE), each read back and restored:
++			 * no SMR is valid, so no stream is routed and no global fault can be pending meanwhile. */
++			gpu_probe_wr32(g_smmu_gr0_page, off, 0x84000005u, 64);
++			const uint32_t got_m5 = gpu_probe_rd32(g_smmu_gr0_page, off);
++			gpu_probe_wr32(g_smmu_gr0_page, off, 0x84000007u, 65);
++			const uint32_t got_m7 = gpu_probe_rd32(g_smmu_gr0_page, off);
++			gpu_probe_wr32(g_smmu_gr0_page, off, was, 66);
++			const unsigned int s2off = SMMU_GR0_S2CR_BASE_OFF + (smr_count - 1u) * 4u;
++			const uint32_t s2was = s2cr[smr_count - 1u];
++			gpu_probe_wr32(g_smmu_gr0_page, s2off, 0x00020000u, 67);
++			const uint32_t s2got = gpu_probe_rd32(g_smmu_gr0_page, s2off);
++			gpu_probe_wr32(g_smmu_gr0_page, s2off, s2was, 68);
++			gpu_probe_wr32(g_smmu_gr0_page, SMMU_GR0_SCR0_OFF, smmu_scr0 ^ 4u, 69);
++			const uint32_t scr0_got = gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SCR0_OFF);
++			gpu_probe_wr32(g_smmu_gr0_page, SMMU_GR0_SCR0_OFF, smmu_scr0, 70);
+ 			snprintf(gsmmu_extra, sizeof(gsmmu_extra),
+-			    " gsmmu[n=%u smr=%x/%x/%x/%x/%x/%x s2cr=%x/%x/%x/%x/%x/%x wr=%#x>%#x>%#x %s gfsr=%#x sid5=%#x>%#x scr0=%#x acr=%#x]",
++			    " gsmmu[n=%u smr=%x/%x/%x/%x/%x/%x s2cr=%x/%x/%x/%x/%x/%x wr=%#x>%#x>%#x %s gfsr=%#x sid5=%#x>%#x scr0=%#x acr=%#x m5=%#x m7=%#x s2=%#x>%#x>%#x scr0w=%#x>%#x dvm=%#x mem=%#x]",
+ 			    smr_count, smr[0], smr[1], smr[2], smr[3], smr[4], smr[5],
+ 			    s2cr[0], s2cr[1], s2cr[2], s2cr[3], s2cr[4], s2cr[5], was, got, back,
+ 			    got == 0x8000007fu ? "writable" : got == was ? "refused" : "partial",
+ 			    gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SGFSR_OFF), got5,
+-			    gpu_probe_rd32(g_smmu_gr0_page, off), smmu_scr0, smmu_sacr);
++			    gpu_probe_rd32(g_smmu_gr0_page, off), smmu_scr0, smmu_sacr, got_m5, got_m7, s2was, s2got,
++			    gpu_probe_rd32(g_smmu_gr0_page, s2off), scr0_got, gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SCR0_OFF),
++			    gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_SNOC_DVM_GFX_CBCR_OFF),
++			    gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_MEMNOC_GFX_CBCR_OFF));
+ 		}
+ 	}
+ 
+@@ -1182,7 +1202,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 		}
+ 	}
+ 
+-	char gmuclk_extra[640];
++	char gmuclk_extra[760];
+ 	size_t extra_len = 0;
+ 	gmuclk_extra[0] = '\0';
+ 	if (mode >= 6 && mode < 8) {      /* modes 8 and up leave these out: confirmed on the tablet, and the line was 885 of 896 bytes */
