@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index a6ebe8b..c04f8e5 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -128,7 +128,7 @@ extern volatile int nw_wifi_t970_eapol_eth;
+ #define WS_WIMG_MASK     0xffu                   /* VM_WIMG_MASK */
+ #define WS_WIMG_WCOMB    0x6u                    /* VM_WIMG_WCOMB on arm: not cacheable | coherent */
+ #define WS_LOG_LINES     128u                    /* `wifilog N` hands them out from line N on, so a reader loses none */
+-#define WS_LOG_CHARS     112u
++#define WS_LOG_CHARS     160u                    /* the network side writes lines of up to 160 bytes */
+ #define WS_FW_NAMES      10u
+ 
+ struct ws_block { uint32_t at, bytes; uint32_t used; };

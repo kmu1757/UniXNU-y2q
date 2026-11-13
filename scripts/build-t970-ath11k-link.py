@@ -87,9 +87,22 @@ def late_initialiser(obj, constructor, entry):
 NET_EDITS = (
     ('if (n >= 42 && shown[out]++ < 12) log(6, "wifi-net: arp %s op',
      'if (n >= 42 && shown[out]++ < 60) log(6, "wifi-net: arp %s op'),
+    # where each received frame was addressed: broadcast, multicast, this station, someone else
+    ('void on_rx(const uint8_t *eth, size_t length) {\n',
+     'unsigned gDst[4];\nvoid on_rx(const uint8_t *eth, size_t length) {\n'),
+    ('  note_frame(eth, length, false);\n',
+     '  note_frame(eth, length, false);\n'
+     '  gDst[(eth[0] & 1) ? ((eth[0] & eth[1] & eth[2] & eth[3] & eth[4] & eth[5]) == 0xff ? 0 : 1) : (memcmp(eth, gMac, 6) ? 3 : 2)]++;\n'),
 )
 NET_TAIL = ('\nextern "C" void pong_wifi_net_traffic(void);\n'
-            'extern "C" void pong_wifi_net_traffic(void) { log_traffic(); }\n')
+            'extern "C" void pong_wifi_net_traffic(void) {\n'
+            '  log_traffic();\n'
+            '  uint8_t a[6] = {}; if (gIf) ifnet_lladdr_copy_bytes(gIf, a, 6);\n'
+            '  log(6, "wifi-net: received for broadcast %u multicast %u this station %u others %u", gDst[0], gDst[1], gDst[2], gDst[3]);\n'
+            '  log(6, "wifi-net: en0 %02x:%02x:%02x:%02x:%02x:%02x radio %02x:%02x:%02x:%02x:%02x:%02x flags %x", a[0], a[1], a[2], a[3], a[4], a[5],\n'
+            '      gMac[0], gMac[1], gMac[2], gMac[3], gMac[4], gMac[5],\n'
+            '      gIf ? static_cast<unsigned>(ifnet_flags(gIf)) : 0);\n'
+            '}\n')
 
 
 def network_source(out):
