@@ -1,0 +1,114 @@
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 2f0ac71..59a667d 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -32,6 +32,7 @@
+ #include <mach/vm_param.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
++#include <stdarg.h>
+ #include <IOKit/IOLib.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -94,6 +95,12 @@ struct nw_wifi_status {
+ /* Defined by the archive. With CONFIG_XNU_T970_ATH11K_LINK off the kernel does not link: this file needs it. */
+ extern int nw_wifi_start(const struct lx_platform *p, const struct nw_board *b);
+ extern int nw_wifi_step(void);
++extern int nw_wifi_scan(const uint8_t *ssid, size_t len);
++/* drivers/T970Wifi/T970WifiNetGlue.cpp, in the same archive: the en0 interface of PongWifiNet.cpp */
++extern int t970_wifi_net_prepare(void);
++extern int t970_wifi_net_up(const uint8_t mac[6]);
++void pong_wifi_wake(void);
++void native_wifi_logf(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+ extern void nw_wifi_status_get(struct nw_wifi_status *st);
+ extern struct nw_wifi_stats nw_wifi_stats;
+ extern volatile uint64_t nw_wifi_where[4];
+@@ -123,6 +130,8 @@ static struct {
+ 	int rc;                           /* what the failing call returned; nw_wifi_start's result at stage 9 */
+ 	int step_rc;
+ 	uint32_t steps;
++	volatile uint32_t wake;           /* pong_wifi_wake(): a frame waits, step now */
++	int net, net_rc;                  /* the network side was started; what t970_wifi_net_up() returned */
+ 	uint8_t *arena;                   /* CPU address of WS_IOVA */
+ 	uint64_t arena_pa;
+ 	uint32_t arena_bytes;
+@@ -170,6 +179,25 @@ ws_log(int level, const char *line)
+ 	}
+ }
+ 
++/* The network side asks for the next step now (a frame to send), and logs through the same lines. */
++void
++pong_wifi_wake(void)
++{
++	__atomic_store_n(&ws.wake, 1, __ATOMIC_RELEASE);
++}
++
++void
++native_wifi_logf(int level, const char *fmt, ...)
++{
++	char line[200];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	ws_log(level, line);
++}
++
+ static void
+ ws_poll(void)
+ {
+@@ -562,6 +590,7 @@ ws_run(void)
+ 		.irq_base = WS_IRQ_BASE, .cfg_read = ws_cfg_read, .cfg_write = ws_cfg_write,
+ 		.msi_target = ws_msi_target, .map_phys = ws_map_phys,
+ 	};
++	WS_STAGE(11, t970_wifi_net_prepare());         /* the station events get their handlers before the start */
+ 	WS_STAGE(9, nw_wifi_start(&ws_platform, &ws_board));
+ 	ws.stage = 10;
+ 	for (;;) {
+@@ -569,7 +598,30 @@ ws_run(void)
+ 
+ 		ws.steps++;
+ 		ws.step_rc = busy;
+-		delay_for_interval(busy < 0 ? 100 : busy ? 1 : 10, 1000000u);
++		if (!ws.net && busy >= 0) {
++			/* The station is up and has a unicast hardware address: publish en0 once, then ask for a scan. */
++			struct nw_wifi_status st;
++
++			bzero(&st, sizeof(st));
++			nw_wifi_status_get(&st);
++			if (st.channels && st.state != 0 && nw_wifi_stats.stage >= 4 && !nw_wifi_stats.last_err && !(st.mac[0] & 1) &&
++			    (st.mac[0] | st.mac[1] | st.mac[2] | st.mac[3] | st.mac[4] | st.mac[5])) {
++				ws.net = 1;
++				ws.net_rc = t970_wifi_net_up(st.mac);
++				ws_log(6, ws.net_rc ? "the network side did not start" : "station ready: en0 published, first scan asked");
++				if (!ws.net_rc) {
++					(void)nw_wifi_scan(NULL, 0);
++				}
++			}
++		}
++		if (busy < 0) {
++			delay_for_interval(100, 1000000u);
++		} else {
++			/* 1 ms while frames move, else up to 10 ms unless the network side has something to send */
++			for (unsigned int ms = busy ? 9 : 0; ms < 10 && !__atomic_exchange_n(&ws.wake, 0, __ATOMIC_ACQ_REL); ms++) {
++				delay_for_interval(1, 1000000u);
++			}
++		}
+ 	}
+ }
+ 
+@@ -625,10 +677,11 @@ pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
+ 		nw_wifi_status_get(&st);
+ 	}
+ 	n = snprintf(reply, reply_cap,
+-	    "wifistat: st %d rc %d steps %u/%d win %uM pa %llx wimg %x used %u peak %u blk %u bar %llx cap %x/%x | "
++	    "wifistat: st %d rc %d net %d/%d steps %u/%d win %uM pa %llx wimg %x used %u peak %u blk %u bar %llx cap %x/%x | "
+ 	    "nw stage %u err %d scans %u frames %u beacons %u bss %u | sta %u ch %u mac %02x%02x%02x%02x%02x%02x | "
+ 	    "where %llx/%llx/%llx/%llx | fw",
+-	    ws.stage, ws.rc, ws.steps, ws.step_rc, ws.arena_bytes >> 20, (unsigned long long)ws.arena_pa, ws.wimg,
++	    ws.stage, ws.rc, ws.net, ws.net_rc, ws.steps, ws.step_rc, ws.arena_bytes >> 20, (unsigned long long)ws.arena_pa,
++	    ws.wimg,
+ 	    ws.used, ws.peak, ws.nblocks, (unsigned long long)ws.bar_pa, ws.msi_cap, ws.pcie_cap,
+ 	    nw_wifi_stats.stage, nw_wifi_stats.last_err, nw_wifi_stats.scans, nw_wifi_stats.frames,
+ 	    nw_wifi_stats.beacons, nw_wifi_stats.bss_seen, st.state, st.channels,

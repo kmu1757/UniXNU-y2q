@@ -323,7 +323,7 @@ if [ "${XNU_T970_ATH11K_LINK:-0}" = 1 ]; then
   export PONG_WIFI_SOURCE=${PONG_WIFI_SOURCE:-$T970_WIFI_INPUTS/linux-7.0.14}
   export PONG_WIFI_SHARED=${PONG_WIFI_SHARED:-$T970_WIFI_INPUTS/Ath12kWifi}
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/fetch-pong-native-sources.py" --only wifi_linux --only wifi_shared
-  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-t970-ath11k-link.py" --output-dir "$ROOT/build/t970-ath11k" --jobs "${JOBS:-4}"
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-t970-ath11k-link.py" --output-dir "$ROOT/build/t970-ath11k" --jobs "${JOBS:-4}" --tree "$ROOT"
 fi
 if [ "${XNU_PONG_POWER:-0}" = 1 ]; then
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-power-native.py" --tree "$ROOT"

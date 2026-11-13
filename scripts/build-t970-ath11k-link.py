@@ -15,9 +15,10 @@ for now; they matter only once the stack runs.
 """
 import argparse
 from pathlib import Path
+import struct
 import subprocess
 import sys
-from pong_native_inputs import build_env
+from pong_native_inputs import build_env, input_path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -35,10 +36,76 @@ void PongWifiRandom(void *out, unsigned long bytes)
 '''
 
 
+def late_initialiser(obj, constructor, entry):
+    """Rename the object's C++ initialiser section and make its file constructor a global function `entry`, so the
+    classes in it register when the board calls `entry` instead of at boot (the edit build-pong-wifi-native.py makes
+    to PongWifiNet.o: all code and relocations stay, only one section name and one symbol change)."""
+    raw = bytearray(obj.read_bytes())
+    offset, symcmd = 32, None
+    for _ in range(struct.unpack_from('<I', raw, 16)[0]):
+        kind, length = struct.unpack_from('<II', raw, offset)
+        if kind == 0x19:                                    # LC_SEGMENT_64
+            for i in range(struct.unpack_from('<I', raw, offset + 64)[0]):
+                section = offset + 72 + 80 * i
+                if raw[section:section + 16].rstrip(b'\0') == b'__mod_init_func':
+                    raw[section:section + 16] = b'__pong_init'.ljust(16, b'\0')
+                    flags = struct.unpack_from('<I', raw, section + 64)[0]
+                    struct.pack_into('<I', raw, section + 64, flags & ~255)
+        elif kind == 2:                                     # LC_SYMTAB
+            symcmd = offset
+        offset += length
+    if symcmd is None:
+        raise SystemExit(f'{obj.name}: no symbol table')
+    symoff, count, stroff, strsize = struct.unpack_from('<4I', raw, symcmd + 8)
+    if stroff + strsize != len(raw):
+        raise SystemExit(f'{obj.name}: the string table is not at the end')
+    for i in range(count):
+        at = symoff + 16 * i
+        n = stroff + struct.unpack_from('<I', raw, at)[0]
+        if raw[n:raw.index(0, n)] == constructor:
+            struct.pack_into('<I', raw, at, strsize)
+            raw[at + 4] |= 1                                # N_EXT
+            raw.extend(entry + b'\0')
+            struct.pack_into('<I', raw, symcmd + 20, strsize + len(entry) + 1)
+            break
+    else:
+        raise SystemExit(f'{obj.name}: constructor {constructor.decode()} not found')
+    late = obj.with_suffix('.late.o')
+    late.write_bytes(raw)
+    return late
+
+
+def network_objects(tree, out, env):
+    """PongWifi's network side (en0, registry entries, Apple80211 requests) and the SM-T970 glue that starts it."""
+    framework = tree / '.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A'
+    if not (framework / 'Headers').is_dir():
+        raise SystemExit(f'no Kernel.framework headers at {framework}')
+    sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], env=env, text=True).strip()
+    flags = ['-target', 'arm64-apple-ios18.0', '-isysroot', sdk, '-mkernel', '-ffreestanding', '-fno-builtin',
+             '-fno-exceptions', '-fno-rtti', '-fno-stack-protector', '-mgeneral-regs-only', '-std=gnu++17', '-fblocks',
+             '-O2', '-DKERNEL=1', '-DKERNEL_PRIVATE=1', '-DXNU_KERNEL_PRIVATE=1', '-DARM64_BOARD_CONFIG_PONG=1',
+             '-I' + str(framework / 'PrivateHeaders'), '-I' + str(framework / 'Headers'),
+             '-I' + str(input_path('wifi_shared') / 'include'), '-Wno-deprecated-declarations']
+    objects = []
+    for source in (ROOT / 'drivers/PongWifi/PongWifiNet.cpp', ROOT / 'drivers/T970Wifi/T970WifiNetGlue.cpp'):
+        obj = out / (source.stem + '.o')
+        r = subprocess.run(['xcrun', 'clang++', *flags, '-c', str(source), '-o', str(obj)], env=env,
+                           capture_output=True, text=True)
+        (out / (source.stem + '.log')).write_text(r.stdout + r.stderr)
+        if r.returncode:
+            raise SystemExit(r.stderr)
+        if source.stem == 'PongWifiNet':
+            obj = late_initialiser(obj, b'__GLOBAL__sub_I_PongWifiNet.cpp', b'_PongWifiNetStaticInit')
+        objects.append(obj)
+    return objects
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output-dir', type=Path, required=True)
     p.add_argument('--jobs', type=int, default=4)
+    p.add_argument('--tree', type=Path, help="the XNU build tree (its Kernel.framework headers): "
+                   "also builds the network side and its SM-T970 glue into the archive")
     a = p.parse_args()
     out = a.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -67,7 +134,8 @@ def main():
 
     archive = out / 'libT970Ath11k.a'
     archive.unlink(missing_ok=True)
-    subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(linked), str(obj)], env=env, check=True)
+    members = [linked, obj] + (network_objects(a.tree.resolve(), out, env) if a.tree else [])
+    subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), *map(str, members)], env=env, check=True)
     print('undefined symbols of the ath11k object (libc and PongWifiRandom only):', flush=True)
     print((out / 'undefined-symbols.txt').read_text(), flush=True)
     print(archive)
