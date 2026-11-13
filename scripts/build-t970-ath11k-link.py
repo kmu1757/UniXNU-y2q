@@ -81,6 +81,30 @@ def late_initialiser(obj, constructor, entry):
     return late
 
 
+# PongWifiNet.cpp as this board compiles it. Its log_traffic() (en0's address, packet counts, frames handed to the
+# stack and refused, kinds in and out) is defined and never called: it becomes callable from the board, which asks
+# for it every ten seconds while the station is up. The ARP lines stop after 12 per direction; 60 here.
+NET_EDITS = (
+    ('if (n >= 42 && shown[out]++ < 12) log(6, "wifi-net: arp %s op',
+     'if (n >= 42 && shown[out]++ < 60) log(6, "wifi-net: arp %s op'),
+)
+NET_TAIL = ('\nextern "C" void pong_wifi_net_traffic(void);\n'
+            'extern "C" void pong_wifi_net_traffic(void) { log_traffic(); }\n')
+
+
+def network_source(out):
+    text = (ROOT / 'drivers/PongWifi/PongWifiNet.cpp').read_text(encoding='utf-8')
+    for old, new in NET_EDITS:
+        if text.count(old) != 1:
+            raise SystemExit('PongWifiNet.cpp differs from the pinned revision at ' + repr(old[:40]))
+        text = text.replace(old, new)
+    if text.count('void log_traffic() {') != 1:
+        raise SystemExit('PongWifiNet.cpp: log_traffic() is not where the pinned revision has it')
+    source = out / 'PongWifiNet.cpp'              # the same file name: the constructor symbol is named after it
+    source.write_text(text + NET_TAIL, encoding='utf-8')
+    return source
+
+
 def network_objects(tree, out, env):
     """PongWifi's network side (en0, registry entries, Apple80211 requests) and the SM-T970 glue that starts it."""
     framework = tree / '.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A'
@@ -93,7 +117,7 @@ def network_objects(tree, out, env):
              '-I' + str(framework / 'PrivateHeaders'), '-I' + str(framework / 'Headers'),
              '-I' + str(input_path('wifi_shared') / 'include'), '-Wno-deprecated-declarations']
     objects = []
-    for source in (ROOT / 'drivers/PongWifi/PongWifiNet.cpp', ROOT / 'drivers/T970Wifi/T970WifiNetGlue.cpp'):
+    for source in (network_source(out), ROOT / 'drivers/T970Wifi/T970WifiNetGlue.cpp'):
         obj = out / (source.stem + '.o')
         r = subprocess.run(['xcrun', 'clang++', *flags, '-c', str(source), '-o', str(obj)], env=env,
                            capture_output=True, text=True)

@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 2d58f99..a6ebe8b 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -99,6 +99,7 @@ extern int nw_wifi_scan(const uint8_t *ssid, size_t len);
+ /* drivers/T970Wifi/T970WifiNetGlue.cpp, in the same archive: the en0 interface of PongWifiNet.cpp */
+ extern int t970_wifi_net_prepare(void);
+ extern int t970_wifi_net_up(const uint8_t mac[6]);
++extern void pong_wifi_net_traffic(void);                        /* PongWifiNet.cpp's counters, into the log */
+ void pong_wifi_wake(void);
+ void native_wifi_logf(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+ extern void nw_wifi_status_get(struct nw_wifi_status *st);
+@@ -139,6 +140,7 @@ static struct {
+ 	int step_rc;
+ 	uint32_t steps;
+ 	volatile uint32_t wake;           /* pong_wifi_wake(): a frame waits, step now */
++	uint64_t traffic_at;              /* when the traffic counters were last logged, ms */
+ 	int net, net_rc;                  /* the network side was started; what t970_wifi_net_up() returned */
+ 	uint8_t *arena;                   /* CPU address of WS_IOVA */
+ 	uint64_t arena_pa;
+@@ -630,6 +632,11 @@ ws_run(void)
+ 				}
+ 			}
+ 		}
++		if (ws.net && !ws.net_rc && ws_now_ms() - ws.traffic_at >= 10000) {
++			/* every ten seconds: en0's address, packets in and out, what the stack took and refused */
++			ws.traffic_at = ws_now_ms();
++			pong_wifi_net_traffic();
++		}
+ 		if (busy < 0) {
+ 			delay_for_interval(100, 1000000u);
+ 		} else {
