@@ -52,7 +52,7 @@ def main():
         print('PongAth11k.c: PCI device 0x1101 (QCA6390), BAR of at least 1 MiB', flush=True)
 
     subprocess.run([sys.executable, str(HERE / 'build-pong-ath11k.py'), '--output-dir', str(out),
-                    '--jobs', str(a.jobs)], check=True)
+                    '--jobs', str(a.jobs), '--t970'], check=True)
     linked = out / 'PongAth11k-linked.o'
     if not linked.is_file():
         raise SystemExit('build-pong-ath11k.py left no ' + str(linked))

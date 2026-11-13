@@ -21,12 +21,87 @@ sys.path.insert(0,str(ROOT/'scripts'))
 import pong_paths
 
 
+def t970_edits(gen, mhi, shared, out):
+    """SM-T970 (QCA6390 hw2.0). Returns the nw_qrtr.c to compile. Every anchor must match exactly once.
+
+    1. debug.c: XNU's vsnprintf has no %pV, so every ath11k_info/warn/err line printed as "0x...V". The message is
+       formatted first. Boot and QMI debug lines (ATH11K_DBG_BOOT | ATH11K_DBG_QMI = 0x60) print as well.
+    2. pci.c: the WLAON power control write also clears SHUTDOWN_EN (bit 0), as Qualcomm's cnss2 does for this chip.
+    3. nw_qrtr.c: the firmware announces its servers (WLFW) only to a node whose HELLO reached its name service after
+       its own. The module answers no remote HELLO once it has sent one; on the same tablet that left QMI silent in
+       two runs of three (UniXNU-gts7xlwifi docs/wifi-sources.md, combo5). The first remote HELLO is answered once.
+    4. MHI main.c: a transfer event the host does not know (the same tablet stopped on 0x11, BAD_TRE, in the board
+       file download) is logged with its channel, its words, the ring offsets, the TRE it names and the channel
+       context as the device left it.
+    """
+    def edit(target, pairs, source=None):
+        text = (source or target).read_text()
+        for old, new in pairs:
+            if text.count(old) != 1:
+                raise RuntimeError('T970: %s differs at %r (%d)' % (target.name, old[:50], text.count(old)))
+            text = text.replace(old, new)
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        target.write_text(text)
+
+    fmt = ('\t{ va_list t970c; char t970b[224]; va_copy(t970c, args); vsnprintf(t970b, sizeof t970b, fmt, t970c); '
+           'va_end(t970c);\n\t  %s }\n')
+    edit(gen / 'debug.c', [
+        ('\tdev_info(ab->dev, "%pV", &vaf);\n', fmt % 'dev_info(ab->dev, "%s", t970b);'),
+        ('\tdev_err(ab->dev, "%pV", &vaf);\n', fmt % 'dev_err(ab->dev, "%s", t970b);'),
+        ('\tdev_warn_ratelimited(ab->dev, "%pV", &vaf);\n', fmt % 'dev_warn(ab->dev, "%s", t970b);'),
+        ('\tif (ath11k_debug_mask & mask)\n\t\tdev_printk(KERN_DEBUG, ab->dev, "%s %pV", ath11k_dbg_str(mask), &vaf);\n',
+         '\tif ((ath11k_debug_mask | 0x60) & mask)\n'
+         + fmt % 'dev_info(ab->dev, "%s %s", ath11k_dbg_str(mask), t970b);'),
+    ])
+    edit(gen / 'pci.c', [
+        ('\tval &= ~QFPROM_PWR_CTRL_VDD4BLOW_MASK;\n', '\tval &= ~(QFPROM_PWR_CTRL_VDD4BLOW_MASK | 0x1);\n'),
+    ])
+    qrtr = out / 'nw_qrtr_t970.c'
+    edit(qrtr, [
+        ('static int g_hello_sent;\n',
+         'static int g_hello_sent;\nstatic int g_hello_answered;   /* SM-T970: a remote HELLO has been answered */\n'),
+        ('    if (src_node != LOCAL_NODE && !g_hello_sent) { g_hello_sent = 1; send_remote(',
+         '    if (src_node != LOCAL_NODE && (!g_hello_sent || !g_hello_answered)) { g_hello_sent = 1; g_hello_answered = 1;\n'
+         '      lx_log(6, "qrtr: HELLO from node %u answered", src_node); send_remote('),
+        ('  g_xmit = 0; g_hello_sent = 0;\n', '  g_xmit = 0; g_hello_sent = 0; g_hello_answered = 0;\n'),
+        ('  g_xmit = xmit; g_ctx = ctx; g_hello_sent = xmit != 0;\n',
+         '  g_xmit = xmit; g_ctx = ctx; g_hello_sent = xmit != 0; g_hello_answered = 0;\n'),
+        ('  if (len < sizeof *p) return;\n  switch (le32_to_cpu(p->cmd)) {\n',
+         '  if (len < sizeof *p) return;\n'
+         '  if (src_node != LOCAL_NODE) lx_log(6, "qrtr: ctrl %u from %u:%u svc %x", le32_to_cpu(p->cmd), src_node, src_port,\n'
+         '                                     le32_to_cpu(p->server.service));\n'
+         '  switch (le32_to_cpu(p->cmd)) {\n'),
+    ], source=shared / 'src/nw_qrtr.c')
+    edit(mhi / 'main.c', [
+        ('\tdefault:\n\t\tdev_err(dev, "Unknown event 0x%x\\n", ev_code);\n\t\tbreak;\n',
+         '\tdefault:\n\t{\n'
+         '\t\tdma_addr_t t970p = MHI_TRE_GET_EV_PTR(event);\n'
+         '\t\tstruct mhi_ring_element *t970t = is_valid_ring_ptr(tre_ring, t970p) ? mhi_to_virtual(tre_ring, t970p) : NULL;\n'
+         '\t\tconst __le32 *t970w = (const __le32 *)&mhi_cntrl->mhi_ctxt->chan_ctxt[mhi_chan->chan];\n'
+         '\t\tdev_err(dev, "Unknown event 0x%x ch %u ev %llx %08x %08x ring %llx+%x rp %x wp %x\\n", ev_code, mhi_chan->chan,\n'
+         '\t\t\t(unsigned long long)le64_to_cpu(event->ptr), le32_to_cpu(event->dword[0]), le32_to_cpu(event->dword[1]),\n'
+         '\t\t\t(unsigned long long)tre_ring->iommu_base, (unsigned)tre_ring->len,\n'
+         '\t\t\t(unsigned)((u8 *)tre_ring->rp - (u8 *)tre_ring->base), (unsigned)((u8 *)tre_ring->wp - (u8 *)tre_ring->base));\n'
+         '\t\tif (t970t)\n'
+         '\t\t\tdev_err(dev, "t970: TRE %llx %08x %08x\\n", (unsigned long long)le64_to_cpu(t970t->ptr),\n'
+         '\t\t\t\tle32_to_cpu(t970t->dword[0]), le32_to_cpu(t970t->dword[1]));\n'
+         '\t\tdev_err(dev, "t970: ctxt %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\\n", le32_to_cpu(t970w[0]),\n'
+         '\t\t\tle32_to_cpu(t970w[1]), le32_to_cpu(t970w[2]), le32_to_cpu(t970w[3]), le32_to_cpu(t970w[4]),\n'
+         '\t\t\tle32_to_cpu(t970w[5]), le32_to_cpu(t970w[6]), le32_to_cpu(t970w[7]), le32_to_cpu(t970w[8]),\n'
+         '\t\t\tle32_to_cpu(t970w[9]), le32_to_cpu(t970w[10]));\n'
+         '\t\tbreak;\n\t}\n'),
+    ])
+    return qrtr
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--linux', type=Path, default=input_path('wifi_linux'))
     p.add_argument('--shared', type=Path, default=input_path('wifi_shared'))
     p.add_argument('--output-dir', type=Path, required=True)
     p.add_argument('--jobs', type=int, default=4)
+    p.add_argument('--t970', action='store_true', help='SM-T970 (QCA6390): the four edits of t970_edits()')
     a = p.parse_args(); linux = a.linux.resolve(); shared = a.shared.resolve(); out = a.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if not (linux / 'drivers/net/wireless/ath/ath11k/pci.c').is_file(): raise RuntimeError('Linux ath11k PCI sources required')
@@ -200,6 +275,7 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
     replacements = {'src/nw_sta.c': out / 'nw_sta_pong.c',
                     'src/nw_mac80211.c': out / 'nw_mac80211_pong.c',
                     'shim/src/lx_rt.c': out / 'lx_rt_pong.c'}
+    if a.t970: replacements['src/nw_qrtr.c'] = t970_edits(gen, mhi, shared, out)
     jobs += [(replacements.get(n, shared / n), out / ('shared_' + Path(n).stem + '.o'), []) for n in common_sources]
     jobs += [(linux / ('drivers/soc/qcom/' + n + '.c'), out / (n + '.o'), []) for n in ('qmi_interface', 'qmi_encdec')]
     jobs += [(ROOT / 'drivers/PongWifi/ath11k/PongAth11k.c', out / 'PongAth11k.o', [])]
