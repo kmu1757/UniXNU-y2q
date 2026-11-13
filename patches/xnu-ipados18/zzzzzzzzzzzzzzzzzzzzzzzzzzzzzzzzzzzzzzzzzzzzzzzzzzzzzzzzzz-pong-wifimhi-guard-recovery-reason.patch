@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/pong_buttons.c b/bsd/dev/pong_buttons.c
+index 06abe1b..15fbf6f 100644
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -373,6 +373,26 @@ static bool write_register(const struct peripheral *p, uint8_t reg, uint8_t valu
+     return (status & 0xf) == 1;
+ }
+ 
++/* The boot loader's restart reason: PM8150 PON_SOFT_RB_SPARE (0x8f), bits 7:1 on this PON generation, values as
++ * Linux drivers/power/reset/qcom-pon.c with "qcom,pm8998-pon" and pm8150.dtsi (mode-recovery = 1, mode-bootloader = 2;
++ * no code taken). The stock kernel sets it next to the IMEM word; the IMEM word alone came back as a normal boot
++ * (11-10). The key polling stops for good: the caller restarts the board next. */
++bool pong_pmic_restart_reason(unsigned reason);
++bool pong_pmic_restart_reason(unsigned reason)
++{
++    uint8_t was = 0, now = 0;
++
++    if (reason > 0x7f) return false;
++    __atomic_store_n(&power_down_started, 1, __ATOMIC_RELEASE);
++    delay_for_interval(80, NSEC_PER_MSEC);          /* the polling loop's last read is over */
++    const uint8_t want = (uint8_t)((reason << 1) & 0xfe);
++    bool ok = read_registers(&pon, 0x8f, &was, 1) && write_register(&pon, 0x8f, (uint8_t)((was & 1) | want)) &&
++        read_registers(&pon, 0x8f, &now, 1) && (now & 0xfe) == want;
++
++    pmsg_log("[PONG_PWR] restart reason %u: spare %02x>%02x ok=%d\n", reason, was, now, ok);
++    return ok;
++}
++
+ /* howto: reboot(2) flags. Returns only when the board stayed up. */
+ void pong_power_down(int howto)
+ {
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index 57fb90d..74033ec 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -932,7 +932,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	 * Also lists the six SMR / S2CR pairs: the GMU context will want slots 2 and 3 (streams 5 and 0x405) and
+ 	 * the GPU's slots 0, 1, 4 and 5 (GpuProbe.cpp:249, 637-640).
+ 	 */
+-	char gsmmu_extra[240];
++	char gsmmu_extra[320];
+ 	gsmmu_extra[0] = '\0';
+ 	if (mode >= 10) {
+ 		uint32_t smr[6], s2cr[6];
+@@ -955,12 +955,19 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 			got = gpu_probe_rd32(g_smmu_gr0_page, off);
+ 			gpu_probe_wr32(g_smmu_gr0_page, off, was, 61);
+ 			back = gpu_probe_rd32(g_smmu_gr0_page, off);
++			/* 11-13: 0x8000007f read back 0. The camera SMMU of the same tablet took only the stock kernel's exact
++			 * stream ids (rui camera-notes.md), so the same slot gets the GMU's stream 5 with no mask, and its old
++			 * value back. The slot's S2CR is type FAULT and the GMU is in reset: nothing can match meanwhile. */
++			gpu_probe_wr32(g_smmu_gr0_page, off, 0x80000005u, 62);
++			const uint32_t got5 = gpu_probe_rd32(g_smmu_gr0_page, off);
++			gpu_probe_wr32(g_smmu_gr0_page, off, was, 63);
+ 			snprintf(gsmmu_extra, sizeof(gsmmu_extra),
+-			    " gsmmu[n=%u smr=%x/%x/%x/%x/%x/%x s2cr=%x/%x/%x/%x/%x/%x wr=%#x>%#x>%#x %s gfsr=%#x]",
++			    " gsmmu[n=%u smr=%x/%x/%x/%x/%x/%x s2cr=%x/%x/%x/%x/%x/%x wr=%#x>%#x>%#x %s gfsr=%#x sid5=%#x>%#x scr0=%#x acr=%#x]",
+ 			    smr_count, smr[0], smr[1], smr[2], smr[3], smr[4], smr[5],
+ 			    s2cr[0], s2cr[1], s2cr[2], s2cr[3], s2cr[4], s2cr[5], was, got, back,
+ 			    got == 0x8000007fu ? "writable" : got == was ? "refused" : "partial",
+-			    gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SGFSR_OFF));
++			    gpu_probe_rd32(g_smmu_gr0_page, SMMU_GR0_SGFSR_OFF), got5,
++			    gpu_probe_rd32(g_smmu_gr0_page, off), smmu_scr0, smmu_sacr);
+ 		}
+ 	}
+ 
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 8c54408..bf62be1 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -42,6 +42,7 @@ typedef int (*proc_iterate_fn_t)(proc_t, void *);
+ extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout, void *arg, proc_iterate_fn_t filterfn, void *filterarg);
+ extern const char *proc_best_name(proc_t p);
+ extern int reboot_kernel(int howto, char *bootstr);
++extern bool pong_pmic_restart_reason(unsigned reason);   /* pong_buttons.c */
+ extern task_t proc_task(proc_t);
+ extern int proc_pid(proc_t);
+ extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid, uint32_t snap_sec);
+@@ -785,6 +786,7 @@ static void
+ cmd_handle_reboot(bool to_recovery)
+ {
+ 	if (to_recovery) {
++		(void)pong_pmic_restart_reason(1);          /* PMIC restart reason: recovery */
+ 		if (!imem_base) {
+ 			imem_base = ml_io_map(IMEM_PHYS_BASE, IMEM_SIZE);
+ 		}
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index 5308e98..bd5ec07 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -868,6 +868,23 @@ wm_run(struct wm *w)
+ 	}
+ 	w->step = 17;
+ 
++	/* A second call once the endpoint's bus mastering is on (stage 3c and later): the firmware is running, and
++	 * steps 18-20 would turn memory decoding and bus mastering off, re-size BAR0 and leave bus mastering off.
++	 * 11-13: after exactly that the firmware stayed in SBL past a complete BHIe transfer and went to SYS_ERR.
++	 * From here the call only reads. */
++	cmd = rd(EP_COMMAND);
++	if (cmd & 0x4u) {
++		w->rpcmd = rd(DBI_COMMAND);
++		w->memwin = rd(DBI_MEM_WINDOW);
++		w->mask = 0;
++		w->bar = rd(EP_BAR0);
++		w->cmd = cmd;
++		w->cls1 = w->cls0;
++		address = w->bar & ~0xfu;
++		w->why = "OK read-only";
++		goto mapped;
++	}
++
+ 	/* 18: outbound iATU region 1 = memory, identity, the whole DTS window; root port window and
+ 	 * Memory Space. Prerequisite: DBI/iATU reachable (step 17). Nothing goes on the wire here. */
+ 	wm_mark(18);
+@@ -941,6 +958,7 @@ wm_run(struct wm *w)
+ 	w->cls1 = rd(EP_CLASS);
+ 	w->step = 20;
+ 
++mapped:
+ 	/* 21: the first memory request to the chip: one 16K page at BAR0, MHI registers, reads only.
+ 	 * Prerequisite: link up and data link active right now, window + BAR + decoding in place. */
+ 	wm_mark(21);
