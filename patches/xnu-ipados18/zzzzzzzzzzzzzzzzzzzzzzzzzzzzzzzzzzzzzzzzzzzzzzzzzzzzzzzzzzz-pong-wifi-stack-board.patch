@@ -1,0 +1,750 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ae31bb4..0285ece 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -409,6 +409,7 @@ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
++bsd/dev/pong_wifi_stack.c		standard
+ bsd/dev/pong_gpu_probe.c		standard
+ bsd/dev/pong_backlight_t970.c		standard
+ bsd/dev/pong_adsp.c			standard
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index bf62be1..50ffe95 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -85,6 +85,7 @@ extern uint8_t pong_charger_cnfg[14];      /* CHG_CNFG_00..12 as the battery thr
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_adsp_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_bt_usb(char *reply, size_t reply_cap, int mode);
++extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_stack.c */
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1542,7 +1543,7 @@ cmd_handle_threads(void)
+ /* ---- fwput: firmware upload over the USB control channel ---- */
+ 
+ #define FWPUT_MAX_NAME   31
+-#define FWPUT_MAX_SLOTS  4
++#define FWPUT_MAX_SLOTS  8      /* the GPU's one and the Wi-Fi stack's four (amss20, m3, board file, regdb) */
+ #define FWPUT_MAX_SIZE   (8u * 1024u * 1024u)
+ #define FWPUT_TIMEOUT_MS 10000u
+ 
+@@ -1914,6 +1915,13 @@ dispatch_command(const char *cmd)
+ 		bt_reply[0] = '\0';
+ 		(void)pong_bt_usb(bt_reply, sizeof(bt_reply), 0);
+ 		send_str(bt_reply[0] ? bt_reply : "btup: no reply\n");
++	} else if (strcmp(cmd, "wifistack") == 0 || strcmp(cmd, "wifistat") == 0 || strcmp(cmd, "wifilog") == 0) {
++		/* the ath11k stack's worker: start it once per boot, or say where it is (bsd/dev/pong_wifi_stack.c) */
++		static char ws_reply[1000];
++
++		ws_reply[0] = '\0';
++		(void)pong_wifi_stack_usb(ws_reply, sizeof(ws_reply), strcmp(cmd, "wifistack") == 0 ? 1 : strcmp(cmd, "wifilog") == 0 ? 2 : 0);
++		send_str(ws_reply[0] ? ws_reply : "wifistack: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index bd5ec07..a490e75 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -1486,6 +1486,8 @@ static struct {
+ 	uint32_t chunks;                              /* chunks allocated so far (a failed run keeps them) */
+ } s3b;
+ 
++static uint64_t s3b_stack_tpa;                     /* pong_wifi_stack_table(): 0 = the test arena's tables */
++
+ struct s3b_run {
+ 	int step;                                     /* last step completed, or -(step that failed) */
+ 	const char *why;
+@@ -1815,6 +1817,7 @@ s3b_memory(struct s3b_run *w)
+ static bool
+ s3b_bank(struct s3b_run *w)
+ {
++	const uint64_t tpa = s3b_stack_tpa ? s3b_stack_tpa : s3b.tpa;   /* the ath11k stack's window, or the test arena */
+ 	uint32_t cbi = (uint32_t)w->bank, asid_hi = S3B_ASID << 16;
+ 	uint64_t cb = s3b_cb(w, cbi), a2r = SMMU + w->gr1 + 0x800 + SMMU_CBAR(cbi), cbar = SMMU + w->gr1 + SMMU_CBAR(cbi);
+ 	uint32_t tcr2;
+@@ -1852,9 +1855,9 @@ s3b_bank(struct s3b_run *w)
+ 		WL_FAIL(63, "rb-tcr");
+ 	}
+ 	/* 64-bit registers as two 32-bit writes, low word first (rui:497-498) */
+-	w->ttbr0_lo = s3b_put(63, 5, cb + S3B_CB_TTBR0, (uint32_t)s3b.tpa);        /* rui:585 TTBR0 */
+-	w->ttbr0_hi = s3b_put(63, 6, cb + S3B_CB_TTBR0 + 4, (uint32_t)(s3b.tpa >> 32) | asid_hi);
+-	if (w->ttbr0_lo != (uint32_t)s3b.tpa || w->ttbr0_hi != ((uint32_t)(s3b.tpa >> 32) | asid_hi)) {
++	w->ttbr0_lo = s3b_put(63, 5, cb + S3B_CB_TTBR0, (uint32_t)tpa);            /* rui:585 TTBR0 */
++	w->ttbr0_hi = s3b_put(63, 6, cb + S3B_CB_TTBR0 + 4, (uint32_t)(tpa >> 32) | asid_hi);
++	if (w->ttbr0_lo != (uint32_t)tpa || w->ttbr0_hi != ((uint32_t)(tpa >> 32) | asid_hi)) {
+ 		WL_FAIL(63, "rb-ttbr0");
+ 	}
+ 	w->n[5] = s3b_put(63, 7, cb + S3B_CB_TTBR1, 0);                            /* rui:586 TTBR1 */
+@@ -3882,4 +3885,22 @@ pong_wifi_stage4(char *reply, size_t reply_len, int what)
+ 	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/* ---- for the ath11k stack's board file (pong_wifi_stack.c) ------------------------------------ */
++volatile void *pong_wifi_ep_cfg(unsigned int off);
++void pong_wifi_stack_table(uint64_t table_pa);
++
++/* The endpoint's configuration space, one of the windows `wifiup` mapped. */
++volatile void *
++pong_wifi_ep_cfg(unsigned int off)
++{
++	return off < 4096u ? (volatile void *)wl_ptr(CFGSPACE + off) : NULL;
++}
++
++/* The table `wifis3b bank` loads into TTBR0 instead of the test arena's; set before the bank is programmed. */
++void
++pong_wifi_stack_table(uint64_t table_pa)
++{
++	s3b_stack_tpa = table_pa;
++}
+ #endif
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+new file mode 100644
+index 0000000..7adb7d4
+--- /dev/null
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -0,0 +1,640 @@
++/*
++ * SM-T970 (QCA6390 on PCIe0): the board side of the ath11k / MHI / QMI stack that is linked into this kernel
++ * (CONFIG_XNU_T970_ATH11K_LINK, libT970Ath11k.a). Nothing here runs at boot: the USB command `wifistack` starts one
++ * worker thread, `wifistat` reports where it is.
++ *
++ * The worker
++ *   1. brings the chip up with the stages the tablet has passed (pong_wifi_link.c): rails, WLAN_EN, PCIe0 link,
++ *      BAR0, the apps SMMU bank for streams 0x1c00/0x7f. Only the bank's translation table is another one: the
++ *      stack's own DMA window, WS_IOVA .. + 64 MiB, one physically contiguous block mapped with 2 MiB entries;
++ *   2. hands the module its two tables of callbacks (struct lx_platform, struct nw_board: the layout of
++ *      include/nw_abi.h in UniXNU/Ath12kWifi f6bf561) and calls nw_wifi_start();
++ *   3. calls nw_wifi_step() for ever. The module raises its interrupt handlers itself once per millisecond
++ *      (shim/src/lx_rt.c), so no MSI receiver is needed: the endpoint's MSI writes land in the window's first page.
++ *
++ * `wifistack` and the hand-driven stages `wifis3c` .. `wifis4` exclude each other within one boot: Linux MHI
++ * starts from the PBL and cannot take over a chip that already runs the SBL or the firmware.
++ * The firmware files come from the USB `fwput` slots (amss20.bin, m3.bin, the board file, regdb.bin): put them
++ * before `wifistack`. Every name the module asks for is recorded and shown by `wifistat`.
++ *
++ * The window's pages are made write-combining for the CPU (pmap_set_cache_attributes, as the Nothing Phone's board
++ * file does for the same module), so what the CPU writes is in DRAM when the endpoint reads it and the other way
++ * round; the hand-driven stages needed `dc civac` around every access because their memory was cached.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <IOKit/IOLib.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern uint64_t mach_absolute_time(void);
++extern boolean_t pmap_valid_page(ppnum_t pn);
++extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
++extern unsigned int pmap_cache_attributes(ppnum_t pn);
++extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
++
++/* pong_wifi_link.c */
++extern int pong_wifi_link_up(char *reply, size_t reply_len);
++extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
++extern int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
++extern volatile void *pong_wifi_ep_cfg(unsigned int off);
++extern void pong_wifi_stack_table(uint64_t table_pa);
++
++int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);
++
++/* ---- the module's board interface (layout of include/nw_abi.h) ------------------------------------------- */
++struct lx_platform {
++	uint64_t (*now_ms)(void);
++	void (*sleep_ms)(unsigned int ms);
++	void (*poll)(void);
++	void (*log)(int level, const char *line);
++	void (*halt)(void);
++	void *(*alloc)(size_t n);
++	void (*free)(void *p);
++	void *(*dma_alloc)(size_t n, uint64_t *bus);
++	void (*dma_free)(size_t n, void *p, uint64_t bus);
++	uint64_t (*dma_map)(void *p, size_t n, int dir);
++	void (*dma_sync)(uint64_t bus, size_t n, int dir);
++	int (*fw_get)(const char *name, const uint8_t **data, size_t *size);
++};
++struct nw_board {
++	void *bar;
++	size_t bar_len;
++	uint16_t device_id, msi_cap;
++	int irq_base;
++	int (*cfg_read)(int off, int size, uint32_t *v);
++	int (*cfg_write)(int off, int size, uint32_t v);
++	int (*msi_target)(uint32_t *lo, uint32_t *hi, uint32_t *data);
++	void *(*map_phys)(uint64_t pa, size_t n);
++};
++struct nw_wifi_stats { uint32_t stage, scans, frames, beacons, bss_seen; int last_err; };
++struct nw_wifi_status {
++	uint32_t state;
++	int32_t result;
++	uint8_t bssid[6];
++	uint8_t ssid_len;
++	uint8_t ssid[32];
++	uint32_t freq_mhz;
++	int8_t signal_dbm;
++	uint8_t mac[6];
++	uint32_t channels;
++};
++/* Defined by the archive. With CONFIG_XNU_T970_ATH11K_LINK off the kernel does not link: this file needs it. */
++extern int nw_wifi_start(const struct lx_platform *p, const struct nw_board *b);
++extern int nw_wifi_step(void);
++extern void nw_wifi_status_get(struct nw_wifi_status *st);
++extern struct nw_wifi_stats nw_wifi_stats;
++extern volatile uint64_t nw_wifi_where[4];
++
++/* ---- constants ------------------------------------------------------------------------------------------- */
++#define WS_IOVA          0xa0000000ull           /* as the hand-driven stages and both reference ports */
++#define WS_ARENA_MAX     (64u << 20)             /* the Nothing Phone's and rui's size */
++#define WS_ARENA_MIN     (16u << 20)
++#define WS_BLOCK_2M      0x200000u
++#define WS_HEAD          4096u                   /* the window's first page: MSI target, never handed out */
++#define WS_TABLE_BYTES   0x4000u                 /* level 1 at +0, level 2 at +4096 */
++#define WS_L2_BLOCK      0x0060000000000f41ull   /* S3B_LEAF of pong_wifi_link.c as a level-2 block */
++#define WS_BLOCKS        4096u
++#define WS_BAR_BYTES     0x100000u               /* QCA6390 BAR0 (wifimhi: mask fff00004) */
++#define WS_DEVICE_ID     0x1101u
++#define WS_IRQ_BASE      800                     /* any number: the vectors are polled */
++#define WS_WIMG_MASK     0xffu                   /* VM_WIMG_MASK */
++#define WS_WIMG_WCOMB    0x6u                    /* VM_WIMG_WCOMB on arm: not cacheable | coherent */
++#define WS_LOG_LINES     8u
++#define WS_LOG_CHARS     112u
++#define WS_FW_NAMES      10u
++
++struct ws_block { uint32_t at, bytes; uint32_t used; };
++
++static struct {
++	volatile uint32_t started;
++	volatile int stage;               /* 1 link, 2 bar, 3..6 smmu, 7 arena, 8 cfg, 9 start called, 10 running, <0 failed there */
++	int rc;                           /* what the failing call returned; nw_wifi_start's result at stage 9 */
++	int step_rc;
++	uint32_t steps;
++	uint8_t *arena;                   /* CPU address of WS_IOVA */
++	uint64_t arena_pa;
++	uint32_t arena_bytes;
++	uint64_t table_pa;
++	uint32_t wimg;                    /* cache attribute of the window's first page as read back */
++	uint8_t *bar;
++	uint64_t bar_pa;
++	uint32_t pcie_cap, msi_cap;
++	uint32_t used, peak;
++	struct ws_block blocks[WS_BLOCKS];
++	uint32_t nblocks;
++	char fw[WS_FW_NAMES][28];
++	int8_t fw_rc[WS_FW_NAMES];
++	uint32_t fw_n;
++	char log[WS_LOG_LINES][WS_LOG_CHARS];
++	uint32_t log_n;
++	char stage_line[200];             /* the failing stage's own report */
++	char mac_line[40];
++} ws;
++
++/* ---- lx_platform ----------------------------------------------------------------------------------------- */
++static uint64_t
++ws_now_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++static void
++ws_log(int level, const char *line)
++{
++	char out[200];
++	int n;
++
++	if (level >= 7 || !line) {
++		return;
++	}
++	strlcpy(ws.log[ws.log_n % WS_LOG_LINES], line, WS_LOG_CHARS);
++	ws.log_n++;
++	n = snprintf(out, sizeof(out), "[PONG_WS] %d %s\n", level, line);
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(out, n < (int)sizeof(out) ? n : (int)sizeof(out) - 1);
++	}
++}
++
++static void
++ws_poll(void)
++{
++}
++
++static void
++ws_sleep_ms(unsigned int ms)
++{
++	delay_for_interval(ms ? ms : 1, 1000000u);
++}
++
++/* The module calls this when it cannot go on. The thread parks; iPadOS keeps running, the window stays mapped. */
++static void
++ws_halt(void)
++{
++	ws_log(3, "halt: the module stopped the worker");
++	ws.stage = -10;
++	for (;;) {
++		delay_for_interval(1000, 1000000u);
++	}
++}
++
++static void *
++ws_alloc(size_t n)
++{
++	uint8_t *p;
++
++	if (!n || n > (64u << 20)) {
++		return NULL;
++	}
++	p = kalloc_data(n + 16, Z_WAITOK | Z_ZERO);
++	if (!p) {
++		return NULL;
++	}
++	*(uint64_t *)(void *)p = (uint64_t)n + 16;
++	return p + 16;
++}
++
++static void
++ws_free(void *p)
++{
++	if (p) {
++		uint8_t *b = (uint8_t *)p - 16;
++
++		kfree_data(b, (vm_size_t)*(uint64_t *)(void *)b);
++	}
++}
++
++/* First fit over a sorted list of blocks; 64-byte alignment, a power of two from 4 KiB up (the module's rings and
++ * the BHI image want naturally aligned bus addresses). Offsets count from WS_HEAD. Only the worker calls these. */
++static void *
++ws_dma_alloc(size_t n, uint64_t *bus)
++{
++	uint32_t align = 64;
++
++	if (!bus || !n || !ws.arena || n > ws.arena_bytes - WS_HEAD) {
++		return NULL;
++	}
++	n = (n + 63) & ~(size_t)63;
++	if (n >= 4096) {
++		n = (n + 4095) & ~(size_t)4095;
++		for (align = 4096; align < n; align <<= 1) {
++		}
++	}
++	for (uint32_t i = 0; i < ws.nblocks; i++) {
++		const struct ws_block b = ws.blocks[i];
++		const uint64_t addr = WS_IOVA + WS_HEAD + b.at;
++		const uint32_t pad = (uint32_t)((0 - addr) & (align - 1));
++		uint32_t extra, at = i;
++		uint8_t *p;
++
++		if (b.used || n > b.bytes || pad > b.bytes - (uint32_t)n) {
++			continue;
++		}
++		extra = (pad ? 1u : 0u) + (b.bytes > pad + (uint32_t)n ? 1u : 0u);
++		if (ws.nblocks + extra > WS_BLOCKS) {
++			return NULL;
++		}
++		if (extra) {
++			memmove(&ws.blocks[i + extra], &ws.blocks[i], (ws.nblocks - i) * sizeof(struct ws_block));
++			ws.nblocks += extra;
++		}
++		if (pad) {
++			ws.blocks[at++] = (struct ws_block){ b.at, pad, 0 };
++		}
++		ws.blocks[at] = (struct ws_block){ b.at + pad, (uint32_t)n, 1 };
++		if (b.bytes > pad + (uint32_t)n) {
++			ws.blocks[at + 1] = (struct ws_block){ b.at + pad + (uint32_t)n, b.bytes - pad - (uint32_t)n, 0 };
++		}
++		*bus = addr + pad;
++		p = ws.arena + WS_HEAD + b.at + pad;
++		bzero(p, n);
++		ws.used += (uint32_t)n;
++		if (ws.used > ws.peak) {
++			ws.peak = ws.used;
++		}
++		return p;
++	}
++	return NULL;
++}
++
++static void
++ws_dma_free(__unused size_t n, void *p, __unused uint64_t bus)
++{
++	const uintptr_t off = (uintptr_t)p - (uintptr_t)(ws.arena + WS_HEAD);
++
++	for (uint32_t i = 0; i < ws.nblocks; i++) {
++		if (ws.blocks[i].at != off || !ws.blocks[i].used) {
++			continue;
++		}
++		ws.blocks[i].used = 0;
++		ws.used -= ws.blocks[i].bytes;
++		if (i + 1 < ws.nblocks && !ws.blocks[i + 1].used) {
++			ws.blocks[i].bytes += ws.blocks[i + 1].bytes;
++			memmove(&ws.blocks[i + 1], &ws.blocks[i + 2], (ws.nblocks - i - 2) * sizeof(struct ws_block));
++			ws.nblocks--;
++		}
++		if (i && !ws.blocks[i - 1].used) {
++			ws.blocks[i - 1].bytes += ws.blocks[i].bytes;
++			memmove(&ws.blocks[i], &ws.blocks[i + 1], (ws.nblocks - i - 1) * sizeof(struct ws_block));
++			ws.nblocks--;
++		}
++		return;
++	}
++}
++
++/* Bus address of memory that lies in the window; 0 for anything else (the module then fails that request). */
++static uint64_t
++ws_dma_map(void *p, size_t n, __unused int dir)
++{
++	const uintptr_t off = (uintptr_t)p - (uintptr_t)ws.arena;
++
++	return ws.arena && off >= WS_HEAD && off < ws.arena_bytes && n <= ws.arena_bytes - off ? WS_IOVA + off : 0;
++}
++
++static void
++ws_dma_sync(__unused uint64_t bus, __unused size_t n, __unused int dir)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");       /* write-combining pages: nothing is cached */
++}
++
++/* Firmware by the last path component, from the USB `fwput` slots. ath11k asks for amss.bin; this tablet's file is
++ * amss20.bin (QCA6390 hw2.0 as Samsung ships it). wlan_mac.bin is made here: one line with a locally administered
++ * address (ponytail: the same address on every tablet; derive it from the serial number once two of them meet). */
++static int
++ws_fw_get(const char *path, const uint8_t **data, size_t *size)
++{
++	static const char mac[] = "Intf0MacAddress=02A1970C6390\n";
++	const char *name = path;
++	uint32_t len = 0;
++	int rc;
++
++	if (!path || !data || !size) {
++		return -1;
++	}
++	for (const char *p = path; *p; p++) {
++		if (*p == '/') {
++			name = p + 1;
++		}
++	}
++	if (strcmp(name, "wlan_mac.bin") == 0) {
++		*data = (const uint8_t *)mac;
++		*size = sizeof(mac) - 1;
++		rc = 0;
++	} else {
++		rc = pong_fw_lookup(strcmp(name, "amss.bin") == 0 ? "amss20.bin" : name, data, &len);
++		if (rc == 0 && *data && len) {
++			*size = len;
++		} else {
++			rc = rc ? rc : -1;
++		}
++	}
++	if (ws.fw_n < WS_FW_NAMES) {
++		strlcpy(ws.fw[ws.fw_n], name, sizeof(ws.fw[0]));
++		ws.fw_rc[ws.fw_n] = (int8_t)(rc ? -1 : 0);
++		ws.fw_n++;
++	}
++	return rc;
++}
++
++/* ---- nw_board -------------------------------------------------------------------------------------------- */
++/* Offsets with bit 31 set are inside the PCI Express capability. */
++static int
++ws_cfg_read(int o, int n, uint32_t *v)
++{
++	unsigned int off = (unsigned int)o;
++	volatile void *p;
++
++	if (off & 0x80000000u) {
++		off = (off & 0x7fffffffu) + ws.pcie_cap;
++	}
++	if (!v || (n != 1 && n != 2 && n != 4) || off > 4096u - (unsigned int)n || (off & ((unsigned int)n - 1u))) {
++		return -1;
++	}
++	p = pong_wifi_ep_cfg(off);
++	if (!p) {
++		return -1;
++	}
++	*v = n == 1 ? *(volatile uint8_t *)p : n == 2 ? *(volatile uint16_t *)p : *(volatile uint32_t *)p;
++	return 0;
++}
++
++static int
++ws_cfg_write(int o, int n, uint32_t v)
++{
++	unsigned int off = (unsigned int)o;
++	volatile void *p;
++
++	if (off & 0x80000000u) {
++		off = (off & 0x7fffffffu) + ws.pcie_cap;
++	}
++	if ((n != 1 && n != 2 && n != 4) || off > 4096u - (unsigned int)n || (off & ((unsigned int)n - 1u))) {
++		return -1;
++	}
++	p = pong_wifi_ep_cfg(off);
++	if (!p) {
++		return -1;
++	}
++	if (n == 1) {
++		*(volatile uint8_t *)p = (uint8_t)v;
++	} else if (n == 2) {
++		*(volatile uint16_t *)p = (uint16_t)v;
++	} else {
++		*(volatile uint32_t *)p = v;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
++
++static int
++ws_msi_target(uint32_t *lo, uint32_t *hi, uint32_t *data)
++{
++	if (!ws.arena || !lo || !hi || !data) {
++		return -1;
++	}
++	*lo = (uint32_t)(WS_IOVA + 0x40);               /* inside the page that is never handed out */
++	*hi = 0;
++	*data = 0;
++	return 0;
++}
++
++static void *
++ws_map_phys(uint64_t pa, size_t n)
++{
++	return ws.bar && pa >= ws.bar_pa && pa < ws.bar_pa + WS_BAR_BYTES && n <= ws.bar_pa + WS_BAR_BYTES - pa ?
++	       ws.bar + (pa - ws.bar_pa) : NULL;
++}
++
++/* ---- the DMA window -------------------------------------------------------------------------------------- */
++static bool
++ws_window(void)
++{
++	IOPhysicalAddress pa = 0, tpa = 0;
++	uint64_t *t;
++	uint8_t *va = NULL;
++	uint32_t bytes;
++
++	for (bytes = WS_ARENA_MAX; bytes >= WS_ARENA_MIN && !va; bytes >>= 1) {
++		va = IOMallocContiguous(bytes, WS_BLOCK_2M, &pa);
++		if (va && (!pa || (pa & (WS_BLOCK_2M - 1)) || pa + bytes > (1ull << 36))) {
++			va = NULL;                      /* kept, never used: a wrong piece is not freed */
++		}
++		if (va) {
++			break;
++		}
++	}
++	if (!va) {
++		return false;
++	}
++	t = IOMallocContiguous(WS_TABLE_BYTES, WS_TABLE_BYTES, &tpa);
++	if (!t || !tpa || (tpa & (WS_TABLE_BYTES - 1)) || tpa + WS_TABLE_BYTES > (1ull << 36)) {
++		return false;
++	}
++	bzero(va, bytes);
++	bzero(t, WS_TABLE_BYTES);
++	t[(WS_IOVA >> 30) & 3u] = (tpa + 4096) | 3;
++	for (uint32_t k = 0; k < bytes / WS_BLOCK_2M; k++) {
++		t[512 + (((WS_IOVA >> 21) + k) & 511u)] = ((pa + (uint64_t)WS_BLOCK_2M * k) & 0x0000ffffffe00000ull) | WS_L2_BLOCK;
++	}
++	/* Both go to DRAM before anyone else looks: the table stays cached (written once), the window's pages
++	 * become write-combining for every mapping the kernel has of them. */
++	for (uintptr_t p = (uintptr_t)t; p < (uintptr_t)t + WS_TABLE_BYTES; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	for (uintptr_t p = (uintptr_t)va; p < (uintptr_t)va + bytes; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint64_t a = pa; a < pa + bytes; a += PAGE_SIZE) {
++		const ppnum_t pn = (ppnum_t)atop_64(a);
++
++		if (!pmap_valid_page(pn)) {
++			return false;
++		}
++		pmap_set_cache_attributes(pn, WS_WIMG_WCOMB);
++	}
++	ws.wimg = pmap_cache_attributes((ppnum_t)atop_64(pa)) & WS_WIMG_MASK;
++	ws.arena = va;
++	ws.arena_pa = pa;
++	ws.arena_bytes = bytes;
++	ws.table_pa = tpa;
++	ws.blocks[0] = (struct ws_block){ 0, bytes - WS_HEAD, 0 };
++	ws.nblocks = 1;
++	return ws.wimg == WS_WIMG_WCOMB;
++}
++
++/* The endpoint's capability list: MSI (5) and PCI Express (0x10). */
++static bool
++ws_caps(void)
++{
++	uint32_t v = 0, ptr = 0;
++
++	if (ws_cfg_read(0x04, 4, &v) || !(v & (1u << 20)) || ws_cfg_read(0x34, 1, &ptr)) {
++		return false;
++	}
++	for (unsigned int guard = 0; guard < 48 && ptr >= 0x40 && ptr < 0x100; guard++) {
++		ptr &= ~3u;
++		if (ws_cfg_read((int)ptr, 2, &v)) {
++			return false;
++		}
++		if ((v & 0xffu) == 0x05u) {
++			ws.msi_cap = ptr;
++		} else if ((v & 0xffu) == 0x10u) {
++			ws.pcie_cap = ptr;
++		}
++		ptr = (v >> 8) & 0xffu;
++	}
++	return ws.msi_cap && ws.pcie_cap;
++}
++
++/* ---- the worker ------------------------------------------------------------------------------------------ */
++#define WS_STAGE(n, call)                                         \
++	do {                                                      \
++		ws.stage = (n);                                   \
++		ws.rc = (call);                                   \
++		if (ws.rc) {                                      \
++			ws.stage = -(n);                          \
++			return;                                   \
++		}                                                 \
++	} while (0)
++
++static const struct lx_platform ws_platform = {
++	ws_now_ms, ws_sleep_ms, ws_poll, ws_log, ws_halt, ws_alloc, ws_free,
++	ws_dma_alloc, ws_dma_free, ws_dma_map, ws_dma_sync, ws_fw_get,
++};
++static struct nw_board ws_board;
++
++static void
++ws_run(void)
++{
++	uint32_t v = 0;
++
++	WS_STAGE(1, pong_wifi_link_up(ws.stage_line, sizeof(ws.stage_line)));
++	delay_for_interval(3000, 1000000u);             /* as the hand-driven runs: `wifimhi` 3 s after `wifiup` */
++	WS_STAGE(2, pong_wifi_mhi_read(ws.stage_line, sizeof(ws.stage_line)));
++	WS_STAGE(3, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 0));
++	WS_STAGE(4, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 1));
++	WS_STAGE(7, ws_window() ? 0 : -1);
++	pong_wifi_stack_table(ws.table_pa);             /* `wifis3b bank` loads this table instead of its own */
++	WS_STAGE(5, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 2));
++	WS_STAGE(6, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 3));
++	ws.stage_line[0] = '\0';
++
++	ws.stage = 8;
++	if (ws_cfg_read(0x10, 4, &v) || !(v & ~0xfu) || !ws_caps()) {
++		ws.stage = -8;
++		return;
++	}
++	ws.bar_pa = v & ~0xfu;
++	{
++		const vm_offset_t bar = ml_io_map((vm_offset_t)ws.bar_pa, WS_BAR_BYTES);
++
++		ws.bar = (uint8_t *)bar;
++	}
++	if (!ws.bar || ws_cfg_write(0x04, 2, 0x6)) {    /* memory decoding and bus mastering, from here on untouched */
++		ws.stage = -8;
++		return;
++	}
++	ws_board = (struct nw_board){
++		.bar = ws.bar, .bar_len = WS_BAR_BYTES, .device_id = WS_DEVICE_ID, .msi_cap = (uint16_t)ws.msi_cap,
++		.irq_base = WS_IRQ_BASE, .cfg_read = ws_cfg_read, .cfg_write = ws_cfg_write,
++		.msi_target = ws_msi_target, .map_phys = ws_map_phys,
++	};
++	WS_STAGE(9, nw_wifi_start(&ws_platform, &ws_board));
++	ws.stage = 10;
++	for (;;) {
++		const int busy = nw_wifi_step();
++
++		ws.steps++;
++		ws.step_rc = busy;
++		delay_for_interval(busy < 0 ? 100 : busy ? 1 : 10, 1000000u);
++	}
++}
++
++static void
++ws_thread(__unused void *arg, __unused wait_result_t wait_result)
++{
++	ws_run();
++	ws_log(3, "worker stopped before the module ran");
++	for (;;) {
++		delay_for_interval(1000, 1000000u);
++	}
++}
++
++/* what 1: `wifistack` (start once per boot), what 0: `wifistat`, what 2: `wifilog` (the module's last lines). */
++int
++pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
++{
++	struct nw_wifi_status st;
++	int n;
++
++	if (!reply || reply_cap < 64) {
++		return -1;
++	}
++	if (what == 1) {
++		thread_t th = THREAD_NULL;
++
++		if (__atomic_exchange_n(&ws.started, 1, __ATOMIC_ACQ_REL)) {
++			strlcpy(reply, "wifistack: already started in this boot\n", reply_cap);
++			return 0;
++		}
++		if (kernel_thread_start((thread_continue_t)ws_thread, NULL, &th) != KERN_SUCCESS) {
++			strlcpy(reply, "wifistack: no thread\n", reply_cap);
++			return -1;
++		}
++		thread_deallocate(th);
++		strlcpy(reply, "wifistack: started\n", reply_cap);
++		return 0;
++	}
++	if (what == 2) {
++		n = snprintf(reply, reply_cap, "wifilog: %u lines", ws.log_n);
++		for (uint32_t i = ws.log_n > WS_LOG_LINES ? ws.log_n - WS_LOG_LINES : 0; i < ws.log_n && n > 0 &&
++		    (size_t)n < reply_cap; i++) {
++			n += snprintf(reply + n, reply_cap - (size_t)n, " | %s", ws.log[i % WS_LOG_LINES]);
++		}
++		if (n > 0 && (size_t)n < reply_cap - 1) {
++			reply[n] = '\n';
++			reply[n + 1] = '\0';
++		}
++		return 0;
++	}
++	bzero(&st, sizeof(st));
++	if (ws.stage >= 10) {
++		nw_wifi_status_get(&st);
++	}
++	n = snprintf(reply, reply_cap,
++	    "wifistat: st %d rc %d steps %u/%d win %uM pa %llx wimg %x used %u peak %u blk %u bar %llx cap %x/%x | "
++	    "nw stage %u err %d scans %u frames %u beacons %u bss %u | sta %u ch %u mac %02x%02x%02x%02x%02x%02x | "
++	    "where %llx/%llx/%llx/%llx | fw",
++	    ws.stage, ws.rc, ws.steps, ws.step_rc, ws.arena_bytes >> 20, (unsigned long long)ws.arena_pa, ws.wimg,
++	    ws.used, ws.peak, ws.nblocks, (unsigned long long)ws.bar_pa, ws.msi_cap, ws.pcie_cap,
++	    nw_wifi_stats.stage, nw_wifi_stats.last_err, nw_wifi_stats.scans, nw_wifi_stats.frames,
++	    nw_wifi_stats.beacons, nw_wifi_stats.bss_seen, st.state, st.channels,
++	    st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5],
++	    (unsigned long long)nw_wifi_where[0], (unsigned long long)nw_wifi_where[1],
++	    (unsigned long long)nw_wifi_where[2], (unsigned long long)nw_wifi_where[3]);
++	for (uint32_t i = 0; i < ws.fw_n && n > 0 && (size_t)n < reply_cap; i++) {
++		n += snprintf(reply + n, reply_cap - (size_t)n, " %s:%d", ws.fw[i], ws.fw_rc[i]);
++	}
++	if (ws.stage_line[0] && n > 0 && (size_t)n < reply_cap) {
++		n += snprintf(reply + n, reply_cap - (size_t)n, " | %s", ws.stage_line);
++	}
++	if (n > 0 && (size_t)n < reply_cap - 1 && reply[n - 1] != '\n') {
++		reply[n] = '\n';
++		reply[n + 1] = '\0';
++	}
++	return 0;
++}
++#endif /* PONG */
