@@ -25,6 +25,12 @@ ROOT = HERE.parent
 
 CHIP_OLD = 'b->device_id != 0x1103 || !b->bar || b->bar_len < 0x200000'
 CHIP_NEW = 'b->device_id != 0x1101 || !b->bar || b->bar_len < 0x100000'
+# wifistat's transmit line: the handshake frames' completions and the data path's own failure counters.
+TX_OLD = 'void nw_wifi_tx_reasons(char *out, int n) { if (n > 0) snprintf(out, n, "ath11k tx reason snapshot unavailable"); }'
+TX_NEW = ('extern unsigned nw_eapol_tx[3];\n'
+          'void nw_wifi_tx_reasons(char *out, int n) { struct ieee80211_hw *hw = nw_wifi_hw(); struct ath11k *ar = hw ? hw->priv : 0;\n'
+          '  if (n > 0) snprintf(out, n, "handshake acked %u nack %u dropped %u, desc_na %u misc %d", nw_eapol_tx[0], nw_eapol_tx[1],\n'
+          '    nw_eapol_tx[2], ar ? ar->ab->soc_stats.tx_err.desc_na[0] : 0, ar ? atomic_read(&ar->ab->soc_stats.tx_err.misc_fail) : 0); }')
 
 RANDOM_C = '''/* The station's nonces come from the kernel's entropy source. */
 extern void read_random(void *buffer, unsigned int bytes);
@@ -112,6 +118,11 @@ def main():
 
     glue = ROOT / 'drivers/PongWifi/ath11k/PongAth11k.c'
     text = glue.read_text(encoding='utf-8')
+    if TX_NEW not in text:
+        if text.count(TX_OLD) != 1:
+            raise SystemExit('PongAth11k.c: the transmit reasons line differs from the pinned revision')
+        text = text.replace(TX_OLD, TX_NEW)
+        glue.write_text(text, encoding='utf-8')
     if CHIP_NEW not in text:
         if text.count(CHIP_OLD) != 1:
             raise SystemExit('PongAth11k.c: the chip check differs from the pinned revision')

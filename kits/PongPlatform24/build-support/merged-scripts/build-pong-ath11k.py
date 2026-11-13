@@ -92,6 +92,19 @@ def t970_edits(gen, mhi, shared, out):
          '\t\t\tle32_to_cpu(t970w[9]), le32_to_cpu(t970w[10]));\n'
          '\t\tbreak;\n\t}\n'),
     ])
+    # 5. nw_sta.c (the copy with the kernel's entropy source): the station sends the key handshake as 802.11 data
+    #    frames while every other frame goes out as an Ethernet frame the firmware converts. On this tablet the
+    #    association succeeded and the access point then never accepted handshake message 2 (four retries, reason
+    #    2). With nw_wifi_t970_eapol_eth (default 1, the board can clear it before the start) the handshake frames
+    #    take the Ethernet path too, as the stock Android driver sends them to this firmware.
+    edit(out / 'nw_sta_pong.c', [
+        ('static void send_eapol(const struct eapol_key *k, unsigned total) {\n',
+         'volatile int nw_wifi_t970_eapol_eth = 1;\n'
+         'static void send_eapol(const struct eapol_key *k, unsigned total) {\n'
+         '  if (nw_wifi_t970_eapol_eth) { u8 e[14 + 512]; if (total > 512) return;\n'
+         '    memcpy(e, C.ap.bssid, 6); memcpy(e + 6, g_vif->addr, 6); e[12] = 0x88; e[13] = 0x8e; memcpy(e + 14, k, total);\n'
+         '    tx_eth(e, 14 + total); return; }\n'),
+    ])
     return qrtr
 
 

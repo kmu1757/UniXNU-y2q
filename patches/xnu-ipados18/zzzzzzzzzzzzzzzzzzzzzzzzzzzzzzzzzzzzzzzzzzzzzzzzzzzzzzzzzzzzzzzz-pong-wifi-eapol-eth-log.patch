@@ -1,0 +1,147 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index b17af6a..eaba086 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1933,12 +1933,24 @@ dispatch_command(const char *cmd)
+ 		bt_reply[0] = '\0';
+ 		(void)pong_bt_usb(bt_reply, sizeof(bt_reply), 0);
+ 		send_str(bt_reply[0] ? bt_reply : "btup: no reply\n");
+-	} else if (strcmp(cmd, "wifistack") == 0 || strcmp(cmd, "wifistat") == 0 || strcmp(cmd, "wifilog") == 0) {
++	} else if (strcmp(cmd, "wifistack") == 0 || strcmp(cmd, "wifistack nwifi") == 0 || strcmp(cmd, "wifistat") == 0 ||
++	    strncmp(cmd, "wifilog", 7) == 0) {
+ 		/* the ath11k stack's worker: start it once per boot, or say where it is (bsd/dev/pong_wifi_stack.c) */
+ 		static char ws_reply[1000];
+ 
+ 		ws_reply[0] = '\0';
+-		(void)pong_wifi_stack_usb(ws_reply, sizeof(ws_reply), strcmp(cmd, "wifistack") == 0 ? 1 : strcmp(cmd, "wifilog") == 0 ? 2 : 0);
++		int ws_what = strcmp(cmd, "wifistack") == 0 ? 1 : strcmp(cmd, "wifistack nwifi") == 0 ? 3 : strcmp(cmd, "wifistat") == 0 ? 0 : 2;
++
++		if (ws_what == 2 && cmd[7] == ' ') {
++			/* `wifilog N`: from line N on */
++			int from = 0;
++
++			for (const char *d = cmd + 8; *d >= '0' && *d <= '9' && from < 100000000; d++) {
++				from = from * 10 + (*d - '0');
++			}
++			ws_what = 1000 + from;
++		}
++		(void)pong_wifi_stack_usb(ws_reply, sizeof(ws_reply), ws_what);
+ 		send_str(ws_reply[0] ? ws_reply : "wifistack: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 5359670..2d58f99 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -104,6 +104,11 @@ void native_wifi_logf(int level, const char *fmt, ...) __attribute__((format(pri
+ extern void nw_wifi_status_get(struct nw_wifi_status *st);
+ extern struct nw_wifi_stats nw_wifi_stats;
+ extern volatile uint64_t nw_wifi_where[4];
++extern void nw_wifi_tx_reasons(char *text, int size);          /* handshake frames acknowledged / not / dropped */
++/* The key handshake frames go out as Ethernet frames (1, the default: the firmware builds the 802.11 frame, as it
++ * does for every other frame of this station) or as 802.11 frames (0, what the module does on the Nothing Phone).
++ * With 0 this tablet's firmware took the association and then never accepted handshake message 2 (11-14). */
++extern volatile int nw_wifi_t970_eapol_eth;
+ 
+ /* ---- constants ------------------------------------------------------------------------------------------- */
+ #define WS_IOVA          0xa0000000ull           /* as the hand-driven stages and both reference ports */
+@@ -121,7 +126,7 @@ extern volatile uint64_t nw_wifi_where[4];
+ #define WS_IRQ_BASE      800                     /* any number: the vectors are polled */
+ #define WS_WIMG_MASK     0xffu                   /* VM_WIMG_MASK */
+ #define WS_WIMG_WCOMB    0x6u                    /* VM_WIMG_WCOMB on arm: not cacheable | coherent */
+-#define WS_LOG_LINES     8u
++#define WS_LOG_LINES     128u                    /* `wifilog N` hands them out from line N on, so a reader loses none */
+ #define WS_LOG_CHARS     112u
+ #define WS_FW_NAMES      10u
+ 
+@@ -174,7 +179,15 @@ ws_log(int level, const char *line)
+ 	if (level >= 7 || !line) {
+ 		return;
+ 	}
+-	strlcpy(ws.log[ws.log_n % WS_LOG_LINES], line, WS_LOG_CHARS);
++	{
++		char *s = ws.log[ws.log_n % WS_LOG_LINES];
++		size_t k;
++
++		strlcpy(s, line, WS_LOG_CHARS);
++		for (k = strlen(s); k && (s[k - 1] == '\n' || s[k - 1] == '\r'); ) {
++			s[--k] = '\0';              /* the USB reply stays one line */
++		}
++	}
+ 	ws.log_n++;
+ 	n = snprintf(out, sizeof(out), "[PONG_WS] %d %s\n", level, line);
+ 	if (n > 0) {
+@@ -638,7 +651,8 @@ ws_thread(__unused void *arg, __unused wait_result_t wait_result)
+ 	}
+ }
+ 
+-/* what 1: `wifistack` (start once per boot), what 0: `wifistat`, what 2: `wifilog` (the module's last lines). */
++/* what 1: `wifistack` (start once per boot; 3: `wifistack nwifi`, handshake frames as 802.11 frames), what 0: `wifistat`,
++ * what 2: `wifilog` (the last lines), what 1000 + N: `wifilog N` (from line N on). */
+ int
+ pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
+ {
+@@ -648,9 +662,12 @@ pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
+ 	if (!reply || reply_cap < 64) {
+ 		return -1;
+ 	}
+-	if (what == 1) {
++	if (what == 1 || what == 3) {
+ 		thread_t th = THREAD_NULL;
+ 
++		if (what == 3 && !ws.started) {
++			nw_wifi_t970_eapol_eth = 0;     /* `wifistack nwifi` */
++		}
+ 		if (__atomic_exchange_n(&ws.started, 1, __ATOMIC_ACQ_REL)) {
+ 			strlcpy(reply, "wifistack: already started in this boot\n", reply_cap);
+ 			return 0;
+@@ -663,10 +680,20 @@ pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
+ 		strlcpy(reply, "wifistack: started\n", reply_cap);
+ 		return 0;
+ 	}
+-	if (what == 2) {
+-		n = snprintf(reply, reply_cap, "wifilog: %u lines", ws.log_n);
+-		for (uint32_t i = ws.log_n > WS_LOG_LINES ? ws.log_n - WS_LOG_LINES : 0; i < ws.log_n && n > 0 &&
+-		    (size_t)n < reply_cap; i++) {
++	if (what == 2 || what >= 1000) {
++		/* `wifilog` = the last eight lines; `wifilog N` = from line N on, as many as fit. The head says how many
++		 * lines there are and where this answer starts, so a reader asks next for start + what it got. */
++		const uint32_t total = ws.log_n;
++		uint32_t from = what >= 1000 ? (uint32_t)(what - 1000) : total > 8 ? total - 8 : 0;
++
++		if (total > WS_LOG_LINES && from < total - WS_LOG_LINES) {
++			from = total - WS_LOG_LINES;    /* older lines are gone */
++		}
++		if (from > total) {
++			from = total;
++		}
++		n = snprintf(reply, reply_cap, "wifilog: %u lines from %u", total, from);
++		for (uint32_t i = from; i < total && n > 0 && (size_t)n + WS_LOG_CHARS + 4 < reply_cap; i++) {
+ 			n += snprintf(reply + n, reply_cap - (size_t)n, " | %s", ws.log[i % WS_LOG_LINES]);
+ 		}
+ 		if (n > 0 && (size_t)n < reply_cap - 1) {
+@@ -682,7 +709,7 @@ pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
+ 	n = snprintf(reply, reply_cap,
+ 	    "wifistat: st %d rc %d net %d/%d steps %u/%d win %uM pa %llx wimg %x used %u peak %u blk %u bar %llx cap %x/%x | "
+ 	    "nw stage %u err %d scans %u frames %u beacons %u bss %u | sta %u ch %u mac %02x%02x%02x%02x%02x%02x | "
+-	    "where %llx/%llx/%llx/%llx | fw",
++	    "where %llx/%llx/%llx/%llx",
+ 	    ws.stage, ws.rc, ws.net, ws.net_rc, ws.steps, ws.step_rc, ws.arena_bytes >> 20, (unsigned long long)ws.arena_pa,
+ 	    ws.wimg,
+ 	    ws.used, ws.peak, ws.nblocks, (unsigned long long)ws.bar_pa, ws.msi_cap, ws.pcie_cap,
+@@ -691,6 +718,15 @@ pong_wifi_stack_usb(char *reply, size_t reply_cap, int what)
+ 	    st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5],
+ 	    (unsigned long long)nw_wifi_where[0], (unsigned long long)nw_wifi_where[1],
+ 	    (unsigned long long)nw_wifi_where[2], (unsigned long long)nw_wifi_where[3]);
++	if (n > 0 && (size_t)n < reply_cap) {
++		char tx[120];
++
++		tx[0] = '\0';
++		if (ws.stage >= 10) {
++			nw_wifi_tx_reasons(tx, (int)sizeof(tx));
++		}
++		n += snprintf(reply + n, reply_cap - (size_t)n, " | eapol %s tx %s | fw", nw_wifi_t970_eapol_eth ? "eth" : "nwifi", tx);
++	}
+ 	for (uint32_t i = 0; i < ws.fw_n && n > 0 && (size_t)n < reply_cap; i++) {
+ 		n += snprintf(reply + n, reply_cap - (size_t)n, " %s:%d", ws.fw[i], ws.fw_rc[i]);
+ 	}
