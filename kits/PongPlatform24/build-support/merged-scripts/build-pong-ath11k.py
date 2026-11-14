@@ -108,6 +108,47 @@ def t970_edits(gen, mhi, shared, out):
     return qrtr
 
 
+def patch_lx_rt(text):
+    """Make lx_rt.c safe across re-entrant lx_pump() waits inside timer callbacks."""
+    edits = [
+        ('int lx_queue_delayed(struct delayed_work *d, unsigned long ms) {\n'
+         '  if (!ms) { d->armed = 0; return lx_queue_work(&d->work); }\n'
+         '  int was = d->armed; if (!was) list_add_tail(&d->work.entry, &g_timers);\n'
+         '  d->armed = 1; d->due = lx_now_ms() + ms; return !was; }\n',
+         'int lx_queue_delayed(struct delayed_work *d, unsigned long ms) {\n'
+         '  if (!ms) { if (d->armed) { d->armed = 0; list_del_init(&d->work.entry); } return lx_queue_work(&d->work); }\n'
+         '  if (d->work.queued) lx_cancel_work(&d->work);\n'
+         '  int was = d->armed; if (!was) list_add_tail(&d->work.entry, &g_timers);\n'
+         '  d->armed = 1; d->due = lx_now_ms() + ms; return !was; }\n'),
+        ('  u64 now = lx_now_ms();\n'
+         '  struct list_head *p, *n;\n'
+         '  for (p = g_timers.next; p != &g_timers; p = n) {\n'
+         '    n = p->next; struct delayed_work *d = container_of(p, struct delayed_work, work.entry);\n'
+         '    if (d->armed && now >= d->due && !is_running(&d->work)) {\n'
+         '      d->armed = 0; list_del_init(p); ran = 1; where(2, (const void *)d->work.func);\n'
+         '      g_running[g_nrunning++] = &d->work; d->work.func(&d->work); g_nrunning--; }\n'
+         '  }\n',
+         '  /* one due timer at a time off the shared list: waits inside a callback call lx_pump() recursively,\n'
+         '   * which can fire or cancel a timer a prefetched next pointer would have stepped onto after list_del_init */\n'
+         '  u64 now = lx_now_ms();\n'
+         '  for (int budget = 256; budget > 0; budget--) {\n'
+         '    struct delayed_work *d = 0; struct list_head *e;\n'
+         '    for (e = g_timers.next; e != &g_timers; e = e->next) {\n'
+         '      struct delayed_work *c = container_of(e, struct delayed_work, work.entry);\n'
+         '      if (c->armed && now >= c->due && !is_running(&c->work)) { d = c; break; }\n'
+         '    }\n'
+         '    if (!d) break;\n'
+         '    d->armed = 0; list_del_init(&d->work.entry); ran = 1; where(2, (const void *)d->work.func);\n'
+         '    g_running[g_nrunning++] = &d->work; if (d->work.func) d->work.func(&d->work); g_nrunning--;\n'
+         '  }\n'),
+    ]
+    for old, new in edits:
+        if text.count(old) != 1:
+            raise RuntimeError('lx_rt.c differs at %r (%d)' % (old[:50], text.count(old)))
+        text = text.replace(old, new)
+    return text
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--linux', type=Path, default=input_path('wifi_linux'))
@@ -281,7 +322,7 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
     runtime = (shared / 'shim/src/lx_rt.c').read_text()
     begin = runtime.index('  static int settled;\n', runtime.index('int lx_request_firmware('))
     end = runtime.index('  *fw = f;', begin)
-    runtime = runtime[:begin] + runtime[end:]
+    runtime = patch_lx_rt(runtime[:begin] + runtime[end:])
     (out / 'lx_rt_pong.c').write_text(runtime)
     common_sources = ['src/nw_crypto.c', 'src/nw_mac80211.c', 'src/nw_net.c', 'src/nw_pci.c',
         'src/nw_qrtr.c', 'src/nw_qrtr_mhi.c', 'src/nw_sta.c', 'shim/src/lx_rt.c', 'shim/src/mhi_hook.c']
