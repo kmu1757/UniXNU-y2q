@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 415cbb9..ee970cb 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -110,6 +110,7 @@ extern void nw_wifi_tx_reasons(char *text, int size);          /* handshake fram
+  * does for every other frame of this station) or as 802.11 frames (0, what the module does on the Nothing Phone).
+  * With 0 this tablet's firmware took the association and then never accepted handshake message 2 (11-14). */
+ extern volatile int nw_wifi_t970_eapol_eth;
++extern void nw_wifi_t970_rx_stats(char *text, int size, int which);   /* 0: receive drops, 1: transmit results */
+ 
+ /* ---- constants ------------------------------------------------------------------------------------------- */
+ #define WS_IOVA          0xa0000000ull           /* as the hand-driven stages and both reference ports */
+@@ -241,6 +242,16 @@ ws_net_counters(void)
+ 	    tcpstat[26], tcpstat[28], tcpstat[32]);
+ 	native_wifi_logf(6, "net udp in %u hdr %u badsum %u noport %u noport-bcast %u fullsock %u out %u",
+ 	    udpstat[0], udpstat[1], udpstat[2], udpstat[4], udpstat[5], udpstat[6], udpstat[9]);
++	/* the station's own receive drops by reason and transmit results by length (build-pong-ath11k.py edit 7) */
++	{
++		static char line[160];
++
++		for (int which = 0; which < 2; which++) {
++			line[0] = '\0';
++			nw_wifi_t970_rx_stats(line, (int)sizeof(line), which);
++			ws_log(6, line);
++		}
++	}
+ }
+ 
+ static void

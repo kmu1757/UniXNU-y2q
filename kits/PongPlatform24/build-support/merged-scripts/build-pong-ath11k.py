@@ -105,6 +105,66 @@ def t970_edits(gen, mhi, shared, out):
          '    memcpy(e, C.ap.bssid, 6); memcpy(e + 6, g_vif->addr, 6); e[12] = 0x88; e[13] = 0x8e; memcpy(e + 14, k, total);\n'
          '    tx_eth(e, 14 + total); return; }\n'),
     ])
+    # 7. On this tablet 15-20 % of the non-beacon frames vanished inside nw_sta_rx() without a count, TCP retransmitted
+    #    ~9 % of its segments on timeouts, and the data frames' transmit results were thrown away (only EAPOL is
+    #    counted). Count the receive drops by reason (action frames, Block Ack, ADDBA requests, data not from the
+    #    access point, to_eth() short / not LLC (keep the first such frame's 8 bytes, frame control and flags),
+    #    Ethernet-form frames dropped (EAPOL among them), other non-data) and the transmit results by length
+    #    (acknowledged / not / freed without status). The station never answered the access point's ADDBA request;
+    #    it now declines it (status 37), so the access point stops negotiating and sends unaggregated frames.
+    #    nw_wifi_t970_rx_stats(b, n, 0|1) gives the board the two lines.
+    edit(out / 'nw_mac80211_pong.c', [
+        ('unsigned nw_eapol_tx[3];\n',
+         'unsigned nw_eapol_tx[3];\n'
+         'unsigned nw_wifi_t970_tx[3][3];   /* [< 128, < 600, larger][acknowledged, not, freed without status] */\n'
+         'static int t970_len(const struct sk_buff *s) { return s->len < 128 ? 0 : s->len < 600 ? 1 : 2; }\n'),
+        ('void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; ',
+         'void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; if (skb) nw_wifi_t970_tx[t970_len(skb)][2]++; '),
+        ('void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; ',
+         'void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; if (skb) nw_wifi_t970_tx[t970_len(skb)][2]++; '),
+        ('  (void)hw; if (!st || !st->skb) return;\n',
+         '  (void)hw; if (!st || !st->skb) return;\n'
+         '  nw_wifi_t970_tx[t970_len(st->skb)][!(IEEE80211_SKB_CB(st->skb)->flags & IEEE80211_TX_STAT_ACK)]++;\n'),
+    ])
+    edit(out / 'nw_sta_pong.c', [
+        ('static void to_eth(struct sk_buff *skb) {\n',
+         'unsigned nw_wifi_t970_rxd[12]; static u8 nw_t970_nollc[8];\n'
+         'static void to_eth(struct sk_buff *skb) {\n'),
+        ('  if (skb->len < hl + 8) return;\n  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) return;\n',
+         '  if (skb->len < hl + 8) { nw_wifi_t970_rxd[5]++; return; }\n'
+         '  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) {\n'
+         '    if (!nw_wifi_t970_rxd[6]++) { memcpy(nw_t970_nollc, llc, 8); nw_wifi_t970_rxd[10] = le16_to_cpu(h->frame_control); nw_wifi_t970_rxd[11] = (unsigned)st->flag; }\n'
+         '    return; }\n'),
+        ('      if (skb->len >= 14 && !(skb->data[12] == 0x88 && skb->data[13] == 0x8e) && C.state >= NW_STA_KEYS && g_ev.rx) g_ev.rx(skb->data, skb->len);\n',
+         '      if (skb->len >= 14 && !(skb->data[12] == 0x88 && skb->data[13] == 0x8e) && C.state >= NW_STA_KEYS && g_ev.rx) g_ev.rx(skb->data, skb->len);\n'
+         '      else { nw_wifi_t970_rxd[7]++; if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) nw_wifi_t970_rxd[8]++; }\n'),
+        ('void nw_sta_rx(struct sk_buff *skb) {\n',
+         '/* ADDBA Response declining the access point\'s request: category 3 (Block Ack), action 1, its dialog token,\n'
+         ' * status 37 (request declined), its parameter set, timeout 0. */\n'
+         'static void t970_addba_decline(const u8 *req) {\n'
+         '  struct sk_buff *skb = new_frame(9); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ACTION);\n'
+         '  u8 *b = skb_put_zero(skb, 9); b[0] = 3; b[1] = 1; b[2] = req[2]; b[3] = 37; b[4] = 0; b[5] = req[3]; b[6] = req[4];\n'
+         '  tx_frame(skb); }\n'
+         'extern unsigned nw_wifi_t970_tx[3][3];\n'
+         'void nw_wifi_t970_rx_stats(char *b, int n, int which) {\n'
+         '  const unsigned *r = nw_wifi_t970_rxd; if (n <= 0) return;\n'
+         '  if (!which) snprintf(b, n, "rx drop: action %u back %u addba %u declined %u, not-ap %u, short %u, no-llc %u, 8023 %u (eapol %u), other %u",\n'
+         '    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]);\n'
+         '  else snprintf(b, n, "tx ack/nack/free small %u/%u/%u mid %u/%u/%u large %u/%u/%u; no-llc first %02x%02x%02x%02x%02x%02x%02x%02x fc %x flag %x",\n'
+         '    nw_wifi_t970_tx[0][0], nw_wifi_t970_tx[0][1], nw_wifi_t970_tx[0][2], nw_wifi_t970_tx[1][0], nw_wifi_t970_tx[1][1], nw_wifi_t970_tx[1][2],\n'
+         '    nw_wifi_t970_tx[2][0], nw_wifi_t970_tx[2][1], nw_wifi_t970_tx[2][2], nw_t970_nollc[0], nw_t970_nollc[1], nw_t970_nollc[2], nw_t970_nollc[3],\n'
+         '    nw_t970_nollc[4], nw_t970_nollc[5], nw_t970_nollc[6], nw_t970_nollc[7], r[10], r[11]); }\n'
+         'void nw_sta_rx(struct sk_buff *skb) {\n'),
+        ('  if (ieee80211_is_mgmt(h->frame_control)) { on_mgmt(skb); return; }\n',
+         '  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'
+         '    const u8 *a = skb->data + 24; nw_wifi_t970_rxd[0]++;\n'
+         '    if (a[0] == 3) { nw_wifi_t970_rxd[1]++;\n'
+         '      if (a[1] == 0 && skb->len >= 33) { nw_wifi_t970_rxd[2]++; if (C.state >= NW_STA_KEYS) { t970_addba_decline(a); nw_wifi_t970_rxd[3]++; } } } }\n'
+         '  if (ieee80211_is_mgmt(h->frame_control)) { on_mgmt(skb); return; }\n'
+         '  if (!ieee80211_is_data(h->frame_control)) nw_wifi_t970_rxd[9]++;\n'
+         '  else if (memcmp(h->addr2, C.ap.bssid, 6)) nw_wifi_t970_rxd[4]++;\n'),
+    ])
     return qrtr
 
 
