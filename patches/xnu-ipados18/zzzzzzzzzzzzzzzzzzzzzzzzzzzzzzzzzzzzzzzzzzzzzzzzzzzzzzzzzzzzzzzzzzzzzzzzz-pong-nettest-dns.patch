@@ -1,0 +1,275 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index c42bce3..5db3b9d 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -91,6 +91,7 @@ extern int pong_adsp_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_bt_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_stack.c */
+ extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_tools.c */
++extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);   /* `nettest [dns]` */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ /* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
+ extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
+@@ -1987,13 +1988,17 @@ dispatch_command(const char *cmd)
+ 		}
+ 		(void)pong_wifi_stack_usb(ws_reply, sizeof(ws_reply), ws_what);
+ 		send_str(ws_reply[0] ? ws_reply : "wifistack: no reply\n");
+-	} else if (strcmp(cmd, "fwsave") == 0 || strcmp(cmd, "fwstat") == 0 || strcmp(cmd, "nettest") == 0) {
++	} else if (strcmp(cmd, "fwsave") == 0 || strcmp(cmd, "fwstat") == 0 || strncmp(cmd, "nettest", 7) == 0) {
+ 		/* save the uploaded Wi-Fi firmware to the Data volume, say whether it was loaded at boot, or test the
+ 		 * connection from the kernel (bsd/dev/pong_wifi_tools.c) */
+ 		static char wt_reply[400];
+ 
+ 		wt_reply[0] = '\0';
+-		(void)pong_wifi_tools_usb(wt_reply, sizeof(wt_reply), strcmp(cmd, "fwstat") == 0 ? 0 : strcmp(cmd, "fwsave") == 0 ? 1 : 2);
++		if (strncmp(cmd, "nettest", 7) == 0) {
++			(void)pong_wifi_tools_nettest(wt_reply, sizeof(wt_reply), cmd + 7);
++		} else {
++			(void)pong_wifi_tools_usb(wt_reply, sizeof(wt_reply), strcmp(cmd, "fwstat") == 0 ? 0 : 1);
++		}
+ 		send_str(wt_reply[0] ? wt_reply : "fwsave: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 2bd71b5..1d68ffc 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -35,6 +35,7 @@ extern void native_wifi_logf(int level, const char *fmt, ...) __attribute__((for
+ 
+ int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);
++int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ void pong_wifi_tools_init(void);
+ 
+ #define FW_DIR       "/private/var/mobile/Library/Pong/qca6390-"
+@@ -334,73 +335,97 @@ nt_addr(struct sockaddr_in *sin, uint32_t ip, uint16_t port)
+ 	sin->sin_addr.s_addr = htonl(ip);
+ }
+ 
+-/* DNS A query for example.com to 1.1.1.1; returns the first address (host order) or 0. */
++static uint32_t nt_dns_server = 0xa87e3f01u;   /* 168.126.63.1 (what the access point hands out) unless named */
++
++/* DNS A query for name to server; returns the first address (host order) or 0. */
+ static uint32_t
+-nt_dns(void)
++nt_dns(uint32_t server, const char *name)
+ {
+-	static const uint8_t q[] = {
+-		0x51, 0x97, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-		7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01,
+-	};
++	uint8_t q[300];
+ 	uint8_t a[512];
+ 	struct sockaddr_in sin;
+ 	socket_t so = NULL;
+-	size_t done = 0;
++	size_t qn = 12, done = 0;
+ 	uint64_t t0 = nt_ms();
+ 	uint32_t ip = 0;
+ 	int e;
+ 
++	bzero(q, sizeof(q));
++	q[0] = 0x51;
++	q[1] = 0x97;
++	q[2] = 0x01;                        /* recursion desired */
++	q[5] = 0x01;                        /* one question */
++	for (const char *s = name; *s && qn + 70 < sizeof(q); ) {
++		size_t len = 0;
++
++		while (s[len] && s[len] != '.' && len < 63) {
++			len++;
++		}
++		q[qn++] = (uint8_t)len;
++		memcpy(q + qn, s, len);
++		qn += len;
++		s += len;
++		if (*s == '.') {
++			s++;
++		}
++	}
++	q[qn++] = 0;
++	q[qn++] = 0;
++	q[qn++] = 1;                        /* type A */
++	q[qn++] = 0;
++	q[qn++] = 1;                        /* class IN */
+ 	e = sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so);
+ 	if (e == 0) {
+ 		nt_timeouts(so, 3);
+-		nt_addr(&sin, 0x01010101u, 53);
++		nt_addr(&sin, server, 53);
+ 		e = sock_connect(so, (struct sockaddr *)&sin, 0);
+ 	}
+ 	if (e == 0) {
+-		e = nt_xfer(so, (void *)(uintptr_t)q, sizeof(q), 1, &done);
++		e = nt_xfer(so, q, qn, 1, &done);
+ 	}
+ 	if (e == 0) {
+ 		e = nt_xfer(so, a, sizeof(a), 0, &done);
+ 	}
+-	if (e == 0 && done >= sizeof(q) + 16 && a[0] == q[0] && a[1] == q[1] && (a[3] & 0x0f) == 0 && (a[6] | a[7])) {
+-		/* the answer follows the echoed question; take the first A record (type 1, length 4) */
+-		for (size_t p = sizeof(q); p + 16 <= done; ) {
+-			size_t rd = p + ((a[p] & 0xc0) == 0xc0 ? 2 : 0);
++	if (e == 0 && done >= qn + 16 && a[0] == q[0] && a[1] == q[1] && (a[3] & 0x0f) == 0 && (a[6] | a[7])) {
++		/* the answers follow the echoed question; take the first A record (type 1, length 4) */
++		for (size_t at = qn; at + 16 <= done; ) {
++			size_t rd = at + 2;
+ 
+-			if ((a[p] & 0xc0) != 0xc0) {
++			if ((a[at] & 0xc0) != 0xc0) {
+ 				break;
+ 			}
+ 			if (a[rd] == 0 && a[rd + 1] == 1 && a[rd + 8] == 0 && a[rd + 9] == 4) {
+ 				ip = (uint32_t)a[rd + 10] << 24 | (uint32_t)a[rd + 11] << 16 | (uint32_t)a[rd + 12] << 8 | a[rd + 13];
+ 				break;
+ 			}
+-			p = rd + 10 + ((size_t)a[rd + 8] << 8 | a[rd + 9]);
++			at = rd + 10 + ((size_t)a[rd + 8] << 8 | a[rd + 9]);
+ 		}
+ 	}
+-	native_wifi_logf(6, "nettest: dns 1.1.1.1 example.com -> %s%u.%u.%u.%u (rc %d, %lu bytes, %llu ms)",
+-	    ip ? "" : "none ", ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, e, (unsigned long)done,
+-	    (unsigned long long)(nt_ms() - t0));
++	native_wifi_logf(6, "nettest: dns %u.%u.%u.%u %s -> %s%u.%u.%u.%u (rc %d, %lu bytes, %llu ms)",
++	    server >> 24, (server >> 16) & 0xff, (server >> 8) & 0xff, server & 0xff, name, ip ? "" : "none ",
++	    ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, e, (unsigned long)done, (unsigned long long)(nt_ms() - t0));
+ 	if (so) {
+ 		sock_close(so);
+ 	}
+ 	return ip;
+ }
+ 
+-/* HTTP/1.0 GET / to ip:80; logs the status line, bytes received and times. */
++/* HTTP/1.0 GET path from ip:80; logs the status line, the first bytes of the body, bytes received and times. */
+ static void
+-nt_http(uint32_t ip, const char *host)
++nt_http(uint32_t ip, const char *host, const char *path)
+ {
+-	char req[160];
++	char req[200];
+ 	static uint8_t buf[4096];
+-	char status[48];
++	static uint8_t head[1024];
++	char status[48], body[48];
+ 	struct sockaddr_in sin;
+ 	socket_t so = NULL;
+-	size_t done = 0, total = 0;
++	size_t done = 0, total = 0, kept = 0;
+ 	uint64_t t0 = nt_ms(), t_conn = 0;
+ 	int e, len;
+ 
+-	status[0] = '\0';
+-	len = snprintf(req, sizeof(req), "GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: pong-nettest\r\n\r\n", host);
++	status[0] = body[0] = '\0';
++	len = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: pong-nettest\r\n\r\n", path, host);
+ 	e = sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &so);
+ 	if (e == 0) {
+ 		nt_timeouts(so, 5);
+@@ -416,23 +441,35 @@ nt_http(uint32_t ip, const char *host)
+ 		if (e != 0 || done == 0) {
+ 			break;
+ 		}
+-		if (total == 0) {
+-			size_t k = 0;
++		if (kept < sizeof(head)) {
++			size_t take = done < sizeof(head) - kept ? done : sizeof(head) - kept;
+ 
+-			while (k < done && k + 1 < sizeof(status) && buf[k] != '\r' && buf[k] != '\n') {
+-				status[k] = (char)(buf[k] >= 32 && buf[k] < 127 ? buf[k] : '.');
+-				k++;
+-			}
+-			status[k] = '\0';
++			memcpy(head + kept, buf, take);
++			kept += take;
+ 		}
+ 		total += done;
+ 		if (total > (4u << 20)) {
+ 			break;
+ 		}
+ 	}
+-	native_wifi_logf(6, "nettest: http %u.%u.%u.%u (%s) connect %llu ms, %lu bytes in %llu ms, rc %d, \"%s\"",
+-	    ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, host, (unsigned long long)t_conn, (unsigned long)total,
+-	    (unsigned long long)(nt_ms() - t0), e, status);
++	for (size_t k = 0; k < kept && k + 1 < sizeof(status) && head[k] != '\r' && head[k] != '\n'; k++) {
++		status[k] = (char)(head[k] >= 32 && head[k] < 127 ? head[k] : '.');
++		status[k + 1] = '\0';
++	}
++	for (size_t k = 0; k + 4 <= kept; k++) {
++		if (head[k] == '\r' && head[k + 1] == '\n' && head[k + 2] == '\r' && head[k + 3] == '\n') {
++			size_t o = 0;
++
++			for (size_t b = k + 4; b < kept && o + 1 < sizeof(body); b++) {
++				body[o++] = (char)(head[b] >= 32 && head[b] < 127 ? head[b] : '.');
++			}
++			body[o] = '\0';
++			break;
++		}
++	}
++	native_wifi_logf(6, "nettest: http %s%s (%u.%u.%u.%u) connect %llu ms, %lu bytes in %llu ms, rc %d, \"%s\" body \"%s\"",
++	    host, path, ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, (unsigned long long)t_conn, (unsigned long)total,
++	    (unsigned long long)(nt_ms() - t0), e, status, body);
+ 	if (so) {
+ 		sock_close(so);
+ 	}
+@@ -441,17 +478,58 @@ nt_http(uint32_t ip, const char *host)
+ static void
+ nt_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint32_t ip = nt_dns();
++	uint32_t ip = nt_dns(nt_dns_server, "captive.apple.com");
+ 
+-	nt_http(0x01010101u, "one.one.one.one");
+ 	if (ip) {
+-		nt_http(ip, "example.com");
++		nt_http(ip, "captive.apple.com", "/hotspot-detect.html");
++	}
++	ip = nt_dns(nt_dns_server, "example.com");
++	if (ip) {
++		nt_http(ip, "example.com", "/");
+ 	}
++	nt_http(0x01010101u, "one.one.one.one", "/");
+ 	native_wifi_logf(6, "nettest: done");
+ 	__atomic_store_n(&wt.nettest_busy, 0, __ATOMIC_RELEASE);
+ 	wt_idle_forever();
+ }
+ 
++/* `nettest` or `nettest a.b.c.d` (the DNS server to ask) */
++int
++pong_wifi_tools_nettest(char *reply, size_t cap, const char *args)
++{
++	uint32_t ip = 0, part = 0;
++	int dots = 0, digits = 0;
++
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (args && *args) {
++		for (const char *s = args; ; s++) {
++			if (*s >= '0' && *s <= '9' && digits < 3) {
++				part = part * 10 + (uint32_t)(*s - '0');
++				digits++;
++			} else if ((*s == '.' || *s == '\0') && digits && part < 256) {
++				ip = ip << 8 | part;
++				part = 0;
++				digits = 0;
++				if (*s == '\0') {
++					break;
++				}
++				dots++;
++			} else {
++				dots = -1;
++				break;
++			}
++		}
++		if (dots != 3) {
++			strlcpy(reply, "nettest: give the DNS server as a.b.c.d\n", cap);
++			return -1;
++		}
++		nt_dns_server = ip;
++	}
++	return pong_wifi_tools_usb(reply, cap, 2);
++}
++
+ /* what 0: `fwstat`, 1: `fwsave`, 2: `nettest` (results in `wifilog`) */
+ int
+ pong_wifi_tools_usb(char *reply, size_t reply_cap, int what)
