@@ -1,0 +1,175 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 5db3b9d..fbfb7bf 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -92,6 +92,7 @@ extern int pong_bt_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_stack.c */
+ extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_tools.c */
+ extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);   /* `nettest [dns]` */
++extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);   /* `fileget <path> <offset>` */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ /* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
+ extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
+@@ -2000,6 +2001,13 @@ dispatch_command(const char *cmd)
+ 			(void)pong_wifi_tools_usb(wt_reply, sizeof(wt_reply), strcmp(cmd, "fwstat") == 0 ? 0 : 1);
+ 		}
+ 		send_str(wt_reply[0] ? wt_reply : "fwsave: no reply\n");
++	} else if (strncmp(cmd, "fileget ", 8) == 0) {
++		/* a file from the Photos folder in base64 pieces (bsd/dev/pong_wifi_tools.c) */
++		static char fg_reply[1500];
++
++		fg_reply[0] = '\0';
++		(void)pong_wifi_tools_fileget(fg_reply, sizeof(fg_reply), cmd + 8);
++		send_str(fg_reply[0] ? fg_reply : "fileget: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index b891c92..7c7bfdd 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -110,7 +110,7 @@ extern void nw_wifi_tx_reasons(char *text, int size);          /* handshake fram
+  * does for every other frame of this station) or as 802.11 frames (0, what the module does on the Nothing Phone).
+  * With 0 this tablet's firmware took the association and then never accepted handshake message 2 (11-14). */
+ extern volatile int nw_wifi_t970_eapol_eth;
+-extern void nw_wifi_t970_rx_stats(char *text, int size, int which);   /* 0: receive drops, 1: transmit results */
++extern void nw_wifi_t970_rx_stats(char *text, int size, int which);   /* 0: receive drops, 1: transmit results, 2: by reason */
+ extern int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);   /* pong_wifi_tools.c */
+ 
+ /* ---- constants ------------------------------------------------------------------------------------------- */
+@@ -247,7 +247,7 @@ ws_net_counters(void)
+ 	{
+ 		static char line[160];
+ 
+-		for (int which = 0; which < 2; which++) {
++		for (int which = 0; which < 3; which++) {
+ 			line[0] = '\0';
+ 			nw_wifi_t970_rx_stats(line, (int)sizeof(line), which);
+ 			ws_log(6, line);
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 1d68ffc..4e26d65 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -36,6 +36,7 @@ extern void native_wifi_logf(int level, const char *fmt, ...) __attribute__((for
+ int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);
+ int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
++int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
+ void pong_wifi_tools_init(void);
+ 
+ #define FW_DIR       "/private/var/mobile/Library/Pong/qca6390-"
+@@ -467,9 +468,14 @@ nt_http(uint32_t ip, const char *host, const char *path)
+ 			break;
+ 		}
+ 	}
+-	native_wifi_logf(6, "nettest: http %s%s (%u.%u.%u.%u) connect %llu ms, %lu bytes in %llu ms, rc %d, \"%s\" body \"%s\"",
+-	    host, path, ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, (unsigned long long)t_conn, (unsigned long)total,
+-	    (unsigned long long)(nt_ms() - t0), e, status, body);
++	{
++		uint64_t ms = nt_ms() - t0;
++		uint64_t kbps = ms ? (uint64_t)total * 1000u / 1024u / ms : 0;
++
++		native_wifi_logf(6, "nettest: http %s%s (%u.%u.%u.%u) connect %llu ms, %lu bytes in %llu ms = %llu KB/s, rc %d, \"%s\" body \"%s\"",
++		    host, path, ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, (unsigned long long)t_conn, (unsigned long)total,
++		    (unsigned long long)ms, (unsigned long long)kbps, e, status, body);
++	}
+ 	if (so) {
+ 		sock_close(so);
+ 	}
+@@ -487,6 +493,10 @@ nt_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (ip) {
+ 		nt_http(ip, "example.com", "/");
+ 	}
++	ip = nt_dns(nt_dns_server, "mirror.kakao.com");
++	if (ip) {
++		nt_http(ip, "mirror.kakao.com", "/ubuntu/ls-lR.gz");      /* about 4 MiB of it: the download speed */
++	}
+ 	nt_http(0x01010101u, "one.one.one.one", "/");
+ 	native_wifi_logf(6, "nettest: done");
+ 	__atomic_store_n(&wt.nettest_busy, 0, __ATOMIC_RELEASE);
+@@ -560,3 +570,85 @@ pong_wifi_tools_usb(char *reply, size_t reply_cap, int what)
+ 	    wt.last_rc, wt.loaded, wt.len[0], wt.len[1], wt.len[2], wt.len[3]);
+ 	return 0;
+ }
++
++/* ---- fileget: a file from the Photos folder (a screenshot taken on the tablet), in base64 pieces ---- */
++#define FG_PREFIX "/private/var/mobile/Media/DCIM/"
++#define FG_PIECE  1024u
++
++/* `fileget <path> <offset>` -> "fileget: <size> <offset> <n> <base64 of n bytes>"; read-only, nothing outside FG_PREFIX */
++int
++pong_wifi_tools_fileget(char *reply, size_t cap, const char *args)
++{
++	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++	static uint8_t piece[FG_PIECE];
++	char path[160];
++	size_t pl = 0;
++	uint64_t offset = 0;
++	vfs_context_t ctx;
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int e, n = 0, resid = 0;
++	size_t o;
++	uint64_t size = 0;
++
++	while (args && *args == ' ') {
++		args++;
++	}
++	while (args && *args && *args != ' ' && pl + 1 < sizeof(path)) {
++		path[pl++] = *args++;
++	}
++	path[pl] = '\0';
++	while (args && *args == ' ') {
++		args++;
++	}
++	while (args && *args >= '0' && *args <= '9' && offset < (1ull << 40)) {
++		offset = offset * 10u + (uint64_t)(*args++ - '0');
++	}
++	if (cap < 4 * FG_PIECE / 3 + 96 || pl <= sizeof(FG_PREFIX) - 1 || strncmp(path, FG_PREFIX, sizeof(FG_PREFIX) - 1) != 0) {
++		strlcpy(reply, "fileget: only files under " FG_PREFIX "\n", cap);
++		return -1;
++	}
++	for (size_t i = 0; i + 1 < pl; i++) {
++		if (path[i] == '.' && path[i + 1] == '.') {
++			strlcpy(reply, "fileget: no .. in the path\n", cap);
++			return -1;
++		}
++	}
++	ctx = vfs_context_create(NULL);
++	e = vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (e == 0) {
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		e = vnode_getattr(vp, &va, ctx);
++		if (e == 0 && VATTR_IS_SUPPORTED(&va, va_data_size)) {
++			size = va.va_data_size;
++		}
++		if (e == 0 && offset < size) {
++			n = (int)(size - offset < FG_PIECE ? size - offset : FG_PIECE);
++			e = vn_rdwr(UIO_READ, vp, (caddr_t)piece, n, (off_t)offset, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, current_proc());
++			n -= resid;
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	vfs_context_rele(ctx);
++	if (e != 0) {
++		(void)snprintf(reply, cap, "fileget: error %d\n", e);
++		return -1;
++	}
++	o = (size_t)snprintf(reply, cap, "fileget: %llu %llu %d ", (unsigned long long)size, (unsigned long long)offset, n);
++	for (int i = 0; i < n && o + 5 < cap; i += 3) {
++		uint32_t v = (uint32_t)piece[i] << 16 | (i + 1 < n ? (uint32_t)piece[i + 1] << 8 : 0) | (i + 2 < n ? piece[i + 2] : 0);
++
++		reply[o++] = b64[v >> 18 & 63];
++		reply[o++] = b64[v >> 12 & 63];
++		reply[o++] = i + 1 < n ? b64[v >> 6 & 63] : '=';
++		reply[o++] = i + 2 < n ? b64[v & 63] : '=';
++	}
++	if (o + 2 > cap) {
++		o = cap - 2;
++	}
++	reply[o++] = '\n';
++	reply[o] = '\0';
++	return 0;
++}
