@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index c04f8e5..415cbb9 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -216,6 +216,33 @@ native_wifi_logf(int level, const char *fmt, ...)
+ 	ws_log(level, line);
+ }
+ 
++/*
++ * The network stack's own counters, every ten seconds while en0 is up (11-14: the tablet re-asks the router's ARP
++ * every second although a reply comes back each time, and Safari loads forever). The structures are globals of
++ * in_arp.c, ip_input.c, tcp_input.c and udp_usrreq.c; read here as 32-bit words at the field positions of this XNU's
++ * if_arp.h, ip_var.h, tcp_var.h and udp_var.h (all fields before those used are 32-bit, none conditional), so this
++ * file needs none of the netinet headers. A function of its own, not inlined, so the worker's frame stays as it was.
++ */
++extern const volatile uint32_t arpstat[16];
++extern const volatile uint32_t ipstat[49];
++extern const volatile uint32_t tcpstat[40];
++extern const volatile uint32_t udpstat[22];
++
++static void __attribute__((noinline))
++ws_net_counters(void)
++{
++	native_wifi_logf(6, "net arp req-out %u rep-in %u req-in %u rep-out %u in %u drop %u held %u purge %u tmo %u dup %u inuse %u ureq %u",
++	    arpstat[0], arpstat[4], arpstat[3], arpstat[1], arpstat[5], arpstat[9], arpstat[15], arpstat[10], arpstat[11],
++	    arpstat[12], arpstat[13], arpstat[14]);
++	native_wifi_logf(6, "net ip in %u badsum %u short %u badlen %u deliv %u noproto %u out %u odrop %u noroute %u badaddr %u",
++	    ipstat[0], ipstat[1], ipstat[2], ipstat[5], ipstat[14], ipstat[13], ipstat[15], ipstat[16], ipstat[22], ipstat[28]);
++	native_wifi_logf(6, "net tcp try %u conn %u drop %u cdrop %u tmodrop %u rexmto %u snd %u resnd %u rcv %u inseq %u badsum %u dup %u",
++	    tcpstat[0], tcpstat[2], tcpstat[3], tcpstat[4], tcpstat[9], tcpstat[10], tcpstat[15], tcpstat[18], tcpstat[25],
++	    tcpstat[26], tcpstat[28], tcpstat[32]);
++	native_wifi_logf(6, "net udp in %u hdr %u badsum %u noport %u noport-bcast %u fullsock %u out %u",
++	    udpstat[0], udpstat[1], udpstat[2], udpstat[4], udpstat[5], udpstat[6], udpstat[9]);
++}
++
+ static void
+ ws_poll(void)
+ {
+@@ -636,6 +663,7 @@ ws_run(void)
+ 			/* every ten seconds: en0's address, packets in and out, what the stack took and refused */
+ 			ws.traffic_at = ws_now_ms();
+ 			pong_wifi_net_traffic();
++			ws_net_counters();
+ 		}
+ 		if (busy < 0) {
+ 			delay_for_interval(100, 1000000u);
