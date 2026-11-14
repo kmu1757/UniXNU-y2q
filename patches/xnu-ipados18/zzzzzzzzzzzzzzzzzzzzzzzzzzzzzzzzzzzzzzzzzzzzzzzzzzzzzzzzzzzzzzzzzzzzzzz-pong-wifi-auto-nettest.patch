@@ -1,0 +1,566 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0285ece..374bd4c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -410,6 +410,7 @@ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
++bsd/dev/pong_wifi_tools.c		standard
+ bsd/dev/pong_gpu_probe.c		standard
+ bsd/dev/pong_backlight_t970.c		standard
+ bsd/dev/pong_adsp.c			standard
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index f4b9337..2d78632 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -90,6 +90,8 @@ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_adsp_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_bt_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_stack.c */
++extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_tools.c */
++extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1969,6 +1971,14 @@ dispatch_command(const char *cmd)
+ 		}
+ 		(void)pong_wifi_stack_usb(ws_reply, sizeof(ws_reply), ws_what);
+ 		send_str(ws_reply[0] ? ws_reply : "wifistack: no reply\n");
++	} else if (strcmp(cmd, "fwsave") == 0 || strcmp(cmd, "fwstat") == 0 || strcmp(cmd, "nettest") == 0) {
++		/* save the uploaded Wi-Fi firmware to the Data volume, say whether it was loaded at boot, or test the
++		 * connection from the kernel (bsd/dev/pong_wifi_tools.c) */
++		static char wt_reply[400];
++
++		wt_reply[0] = '\0';
++		(void)pong_wifi_tools_usb(wt_reply, sizeof(wt_reply), strcmp(cmd, "fwstat") == 0 ? 0 : strcmp(cmd, "fwsave") == 0 ? 1 : 2);
++		send_str(wt_reply[0] ? wt_reply : "fwsave: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+@@ -2541,6 +2551,8 @@ void
+ pong_usb_ctl_init(void)
+ {
+ 	uint32_t enabled = 0;
++
++	pong_wifi_tools_init();         /* independent of the USB channel: off only with pong_wifi_auto=0 */
+ 	if (!PE_parse_boot_argn("pong_usb_ctl", &enabled, sizeof(enabled)) || enabled != 1) {
+ 		return;
+ 	}
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index ee970cb..b891c92 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -111,6 +111,7 @@ extern void nw_wifi_tx_reasons(char *text, int size);          /* handshake fram
+  * With 0 this tablet's firmware took the association and then never accepted handshake message 2 (11-14). */
+ extern volatile int nw_wifi_t970_eapol_eth;
+ extern void nw_wifi_t970_rx_stats(char *text, int size, int which);   /* 0: receive drops, 1: transmit results */
++extern int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);   /* pong_wifi_tools.c */
+ 
+ /* ---- constants ------------------------------------------------------------------------------------------- */
+ #define WS_IOVA          0xa0000000ull           /* as the hand-driven stages and both reference ports */
+@@ -419,7 +420,13 @@ ws_fw_get(const char *path, const uint8_t **data, size_t *size)
+ 		*size = sizeof(mac) - 1;
+ 		rc = 0;
+ 	} else {
+-		rc = pong_fw_lookup(strcmp(name, "amss.bin") == 0 ? "amss20.bin" : name, data, &len);
++		const char *want = strcmp(name, "amss.bin") == 0 ? "amss20.bin" : name;
++
++		/* an image uploaded in this boot (fwput) first, else the copy saved on the Data volume (pong_wifi_tools.c) */
++		rc = pong_fw_lookup(want, data, &len);
++		if (rc != 0 || !*data || !len) {
++			rc = pong_fw_store_lookup(want, data, &len);
++		}
+ 		if (rc == 0 && *data && len) {
+ 			*size = len;
+ 		} else {
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+new file mode 100644
+index 0000000..2bd71b5
+--- /dev/null
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -0,0 +1,484 @@
++/*
++ * SM-T970: Wi-Fi without hands on the tablet.
++ *
++ *  1. `fwsave`: the firmware images uploaded with `fwput` (amss20.bin, m3.bin, bdwlan.elf, bdwlan.e05) are written to
++ *     the writable Data volume, /private/var/mobile/Library/Pong/qca6390-<name>, read back and compared.
++ *  2. At boot a thread waits for those files (the Data volume is mounted by Pong init, some tens of seconds in), loads
++ *     them, and starts the Wi-Fi stack (pong_wifi_stack.c) by itself, so iOS can join a known network unattended.
++ *     Boot argument pong_wifi_auto=0 turns this off. pong_fw_store_lookup() serves the loaded images to ws_fw_get().
++ *  3. `nettest`: from a kernel thread, a DNS query (UDP, 1.1.1.1) and an HTTP request (TCP, port 80) with their times,
++ *     into the Wi-Fi log (`wifilog`), so the connection can be judged without opening Safari.
++ * The images are never shown: only names, lengths and results go to the log.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <sys/socket.h>
++#include <sys/kpi_socket.h>
++#include <netinet/in.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);     /* pong_usb_ctl.c: fwput slots */
++extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);              /* pong_wifi_stack.c */
++extern void native_wifi_logf(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
++
++int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
++int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);
++void pong_wifi_tools_init(void);
++
++#define FW_DIR       "/private/var/mobile/Library/Pong/qca6390-"
++#define FW_MAX       (8u << 20)
++#define FW_COUNT     4u
++
++static const char *const fw_names[FW_COUNT] = { "amss20.bin", "m3.bin", "bdwlan.elf", "bdwlan.e05" };
++
++static struct {
++	uint8_t *data[FW_COUNT];
++	uint32_t len[FW_COUNT];
++	volatile int loaded;            /* all FW_COUNT images are in data[] */
++	volatile int nettest_busy;
++	int auto_state;                 /* 0 off, 1 waiting for the files, 2 started the stack, 3 gave up */
++	int auto_tries;
++	int last_rc;
++} wt;
++
++static void
++fw_path(char *out, size_t cap, const char *name)
++{
++	(void)snprintf(out, cap, "%s%s", FW_DIR, name);
++}
++
++static int
++fw_write(const char *name, const uint8_t *data, uint32_t len)
++{
++	char path[128];
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int e;
++
++	fw_path(path, sizeof(path), name);
++	e = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (e == 0) {
++		int resid = 0;
++		int e2;
++
++		e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC,
++		    vfs_context_ucred(ctx), &resid, current_proc());
++		if (e == 0 && resid != 0) {
++			e = EIO;
++		}
++		e2 = vnode_close(vp, FWRITE, ctx);
++		if (e == 0) {
++			e = e2;
++		}
++	}
++	vfs_context_rele(ctx);
++	return e;
++}
++
++/* Reads one image into a new buffer; *out is the caller's (kfree_data with *outlen). */
++static int
++fw_read(const char *name, uint8_t **out, uint32_t *outlen)
++{
++	char path[128];
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	uint8_t *buf = NULL;
++	uint32_t len = 0;
++	int e;
++
++	*out = NULL;
++	*outlen = 0;
++	fw_path(path, sizeof(path), name);
++	e = vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (e == 0) {
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		e = vnode_getattr(vp, &va, ctx);
++		if (e == 0 && (!VATTR_IS_SUPPORTED(&va, va_data_size) || va.va_data_size == 0 || va.va_data_size > FW_MAX)) {
++			e = EFBIG;
++		}
++		if (e == 0) {
++			len = (uint32_t)va.va_data_size;
++			buf = kalloc_data(len, Z_WAITOK);
++			if (!buf) {
++				e = ENOMEM;
++			}
++		}
++		if (e == 0) {
++			int resid = 0;
++
++			e = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, current_proc());
++			if (e == 0 && resid != 0) {
++				e = EIO;
++			}
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	vfs_context_rele(ctx);
++	if (e != 0) {
++		if (buf) {
++			kfree_data(buf, len);
++		}
++		return e;
++	}
++	*out = buf;
++	*outlen = len;
++	return 0;
++}
++
++/* All images from the Data volume into wt.data[]; on any failure nothing is kept. */
++static int
++fw_load_all(void)
++{
++	uint8_t *data[FW_COUNT] = { NULL };
++	uint32_t len[FW_COUNT] = { 0 };
++	int e = 0;
++
++	for (uint32_t i = 0; i < FW_COUNT && e == 0; i++) {
++		e = fw_read(fw_names[i], &data[i], &len[i]);
++	}
++	if (e != 0) {
++		for (uint32_t i = 0; i < FW_COUNT; i++) {
++			if (data[i]) {
++				kfree_data(data[i], len[i]);
++			}
++		}
++		return e;
++	}
++	for (uint32_t i = 0; i < FW_COUNT; i++) {
++		wt.data[i] = data[i];
++		wt.len[i] = len[i];
++	}
++	__atomic_store_n(&wt.loaded, 1, __ATOMIC_RELEASE);
++	return 0;
++}
++
++int
++pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len)
++{
++	if (!name || !__atomic_load_n(&wt.loaded, __ATOMIC_ACQUIRE)) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < FW_COUNT; i++) {
++		if (strcmp(name, fw_names[i]) == 0) {
++			if (data) {
++				*data = wt.data[i];
++			}
++			if (len) {
++				*len = wt.len[i];
++			}
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* `fwsave`: every uploaded image to the Data volume, then read back and compared byte for byte. */
++/* appends to reply without ever running past cap */
++static size_t
++fw_add(size_t cap, size_t n, int wrote)
++{
++	if (wrote < 0) {
++		return n;
++	}
++	n += (size_t)wrote;
++	return n < cap ? n : cap - 1;
++}
++
++static int
++fw_save(char *reply, size_t cap)
++{
++	size_t n = 0;
++	int bad = 0;
++
++	n = fw_add(cap, n, snprintf(reply + n, cap - n, "fwsave:"));
++	for (uint32_t i = 0; i < FW_COUNT; i++) {
++		const uint8_t *data = NULL;
++		uint32_t len = 0;
++		uint8_t *back = NULL;
++		uint32_t back_len = 0;
++		int e;
++
++		if (pong_fw_lookup(fw_names[i], &data, &len) != 0 || !data || !len) {
++			n = fw_add(cap, n, snprintf(reply + n, cap - n, " %s missing", fw_names[i]));
++			bad++;
++			continue;
++		}
++		e = fw_write(fw_names[i], data, len);
++		if (e == 0) {
++			e = fw_read(fw_names[i], &back, &back_len);
++			if (e == 0 && (back_len != len || memcmp(back, data, len) != 0)) {
++				e = EIO;
++			}
++			if (back) {
++				kfree_data(back, back_len);
++			}
++		}
++		n = fw_add(cap, n, snprintf(reply + n, cap - n, " %s %u %s", fw_names[i], len, e ? "FAIL" : "ok"));
++		if (e) {
++			n = fw_add(cap, n, snprintf(reply + n, cap - n, "(%d)", e));
++			bad++;
++		}
++	}
++	(void)snprintf(reply + n, cap - n, "%s\n", bad ? " -> not saved" : " -> saved");
++	return bad ? -1 : 0;
++}
++
++static void
++wt_idle_forever(void)
++{
++	for (;;) {
++		delay_for_interval(60000, 1000000u);
++	}
++}
++
++static void
++fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	char reply[96];
++
++	wt.auto_state = 1;
++	/* not earlier than the hand-started stack ever ran (about two minutes after boot, never tried sooner) */
++	delay_for_interval(90000, 1000000u);
++	/* the Data volume appears some tens of seconds after boot; try every 2 s for up to 5 minutes */
++	for (wt.auto_tries = 0; wt.auto_tries < 150; wt.auto_tries++) {
++		delay_for_interval(2000, 1000000u);
++		wt.last_rc = fw_load_all();
++		if (wt.last_rc == 0) {
++			break;
++		}
++	}
++	if (wt.last_rc != 0) {
++		wt.auto_state = 3;
++		native_wifi_logf(4, "wifi-auto: firmware files not readable (%d) after %d tries; start with fwput + wifistack",
++		    wt.last_rc, wt.auto_tries);
++		wt_idle_forever();
++	}
++	reply[0] = '\0';
++	(void)pong_wifi_stack_usb(reply, sizeof(reply), 1);
++	wt.auto_state = 2;
++	native_wifi_logf(6, "wifi-auto: firmware loaded from the Data volume after %d tries (%u+%u+%u+%u bytes); %s",
++	    wt.auto_tries + 1, wt.len[0], wt.len[1], wt.len[2], wt.len[3], reply);
++	wt_idle_forever();
++}
++
++void
++pong_wifi_tools_init(void)
++{
++	uint32_t on = 1;
++	thread_t th = THREAD_NULL;
++
++	(void)PE_parse_boot_argn("pong_wifi_auto", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (kernel_thread_start(fw_auto_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++
++/* ---- nettest ---- */
++
++static uint64_t
++nt_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++static void
++nt_timeouts(socket_t so, int seconds)
++{
++	struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
++
++	(void)sock_setsockopt(so, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	(void)sock_setsockopt(so, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++}
++
++static int
++nt_xfer(socket_t so, void *buf, size_t len, int out, size_t *done)
++{
++	struct iovec iov = { .iov_base = buf, .iov_len = len };
++	struct msghdr msg;
++
++	bzero(&msg, sizeof(msg));
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	*done = 0;
++	return out ? sock_send(so, &msg, 0, done) : sock_receive(so, &msg, 0, done);
++}
++
++static void
++nt_addr(struct sockaddr_in *sin, uint32_t ip, uint16_t port)
++{
++	bzero(sin, sizeof(*sin));
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_port = htons(port);
++	sin->sin_addr.s_addr = htonl(ip);
++}
++
++/* DNS A query for example.com to 1.1.1.1; returns the first address (host order) or 0. */
++static uint32_t
++nt_dns(void)
++{
++	static const uint8_t q[] = {
++		0x51, 0x97, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01,
++	};
++	uint8_t a[512];
++	struct sockaddr_in sin;
++	socket_t so = NULL;
++	size_t done = 0;
++	uint64_t t0 = nt_ms();
++	uint32_t ip = 0;
++	int e;
++
++	e = sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so);
++	if (e == 0) {
++		nt_timeouts(so, 3);
++		nt_addr(&sin, 0x01010101u, 53);
++		e = sock_connect(so, (struct sockaddr *)&sin, 0);
++	}
++	if (e == 0) {
++		e = nt_xfer(so, (void *)(uintptr_t)q, sizeof(q), 1, &done);
++	}
++	if (e == 0) {
++		e = nt_xfer(so, a, sizeof(a), 0, &done);
++	}
++	if (e == 0 && done >= sizeof(q) + 16 && a[0] == q[0] && a[1] == q[1] && (a[3] & 0x0f) == 0 && (a[6] | a[7])) {
++		/* the answer follows the echoed question; take the first A record (type 1, length 4) */
++		for (size_t p = sizeof(q); p + 16 <= done; ) {
++			size_t rd = p + ((a[p] & 0xc0) == 0xc0 ? 2 : 0);
++
++			if ((a[p] & 0xc0) != 0xc0) {
++				break;
++			}
++			if (a[rd] == 0 && a[rd + 1] == 1 && a[rd + 8] == 0 && a[rd + 9] == 4) {
++				ip = (uint32_t)a[rd + 10] << 24 | (uint32_t)a[rd + 11] << 16 | (uint32_t)a[rd + 12] << 8 | a[rd + 13];
++				break;
++			}
++			p = rd + 10 + ((size_t)a[rd + 8] << 8 | a[rd + 9]);
++		}
++	}
++	native_wifi_logf(6, "nettest: dns 1.1.1.1 example.com -> %s%u.%u.%u.%u (rc %d, %lu bytes, %llu ms)",
++	    ip ? "" : "none ", ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, e, (unsigned long)done,
++	    (unsigned long long)(nt_ms() - t0));
++	if (so) {
++		sock_close(so);
++	}
++	return ip;
++}
++
++/* HTTP/1.0 GET / to ip:80; logs the status line, bytes received and times. */
++static void
++nt_http(uint32_t ip, const char *host)
++{
++	char req[160];
++	static uint8_t buf[4096];
++	char status[48];
++	struct sockaddr_in sin;
++	socket_t so = NULL;
++	size_t done = 0, total = 0;
++	uint64_t t0 = nt_ms(), t_conn = 0;
++	int e, len;
++
++	status[0] = '\0';
++	len = snprintf(req, sizeof(req), "GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: pong-nettest\r\n\r\n", host);
++	e = sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &so);
++	if (e == 0) {
++		nt_timeouts(so, 5);
++		nt_addr(&sin, ip, 80);
++		e = sock_connect(so, (struct sockaddr *)&sin, 0);
++		t_conn = nt_ms() - t0;
++	}
++	if (e == 0) {
++		e = nt_xfer(so, req, (size_t)len, 1, &done);
++	}
++	while (e == 0) {
++		e = nt_xfer(so, buf, sizeof(buf), 0, &done);
++		if (e != 0 || done == 0) {
++			break;
++		}
++		if (total == 0) {
++			size_t k = 0;
++
++			while (k < done && k + 1 < sizeof(status) && buf[k] != '\r' && buf[k] != '\n') {
++				status[k] = (char)(buf[k] >= 32 && buf[k] < 127 ? buf[k] : '.');
++				k++;
++			}
++			status[k] = '\0';
++		}
++		total += done;
++		if (total > (4u << 20)) {
++			break;
++		}
++	}
++	native_wifi_logf(6, "nettest: http %u.%u.%u.%u (%s) connect %llu ms, %lu bytes in %llu ms, rc %d, \"%s\"",
++	    ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, host, (unsigned long long)t_conn, (unsigned long)total,
++	    (unsigned long long)(nt_ms() - t0), e, status);
++	if (so) {
++		sock_close(so);
++	}
++}
++
++static void
++nt_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t ip = nt_dns();
++
++	nt_http(0x01010101u, "one.one.one.one");
++	if (ip) {
++		nt_http(ip, "example.com");
++	}
++	native_wifi_logf(6, "nettest: done");
++	__atomic_store_n(&wt.nettest_busy, 0, __ATOMIC_RELEASE);
++	wt_idle_forever();
++}
++
++/* what 0: `fwstat`, 1: `fwsave`, 2: `nettest` (results in `wifilog`) */
++int
++pong_wifi_tools_usb(char *reply, size_t reply_cap, int what)
++{
++	thread_t th = THREAD_NULL;
++
++	if (!reply || reply_cap < 64) {
++		return -1;
++	}
++	if (what == 1) {
++		return fw_save(reply, reply_cap);
++	}
++	if (what == 2) {
++		if (__atomic_exchange_n(&wt.nettest_busy, 1, __ATOMIC_ACQ_REL)) {
++			strlcpy(reply, "nettest: already running\n", reply_cap);
++			return 0;
++		}
++		if (kernel_thread_start(nt_thread, NULL, &th) != KERN_SUCCESS) {
++			__atomic_store_n(&wt.nettest_busy, 0, __ATOMIC_RELEASE);
++			strlcpy(reply, "nettest: no thread\n", reply_cap);
++			return -1;
++		}
++		thread_deallocate(th);
++		strlcpy(reply, "nettest: started (results in wifilog)\n", reply_cap);
++		return 0;
++	}
++	(void)snprintf(reply, reply_cap, "fwstat: auto %d tries %d rc %d loaded %d (%u %u %u %u)\n", wt.auto_state, wt.auto_tries,
++	    wt.last_rc, wt.loaded, wt.len[0], wt.len[1], wt.len[2], wt.len[3]);
++	return 0;
++}
