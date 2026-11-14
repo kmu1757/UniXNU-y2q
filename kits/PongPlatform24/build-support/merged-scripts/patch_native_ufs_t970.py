@@ -3,6 +3,147 @@
 from pathlib import Path
 import sys
 
+BOOT_BRIDGE = r"""
+// ---- SM-T970: the Android boot partition (patch_native_ufs_t970.py step 7, used by bsd/dev/pong_boot_write.c) ----
+static uint8_t gBootGpt[16384];
+static uint64_t gBootFirst, gBootLast;           // set only after a complete pong_ufs_boot_locate()
+static const uint64_t kBootFirst4k = 104723, kBootLast4k = 122130;
+
+static bool bootGptHeader (uint64_t lba, uint64_t *entriesLba, uint32_t *count, uint32_t *entriesCrc, uint64_t *alt,
+                           uint64_t *usableFirst, uint64_t *usableLast)
+{
+  if (hostRead4k (0, lba, 1, gBootGpt) != kIOReturnSuccess) return false;
+  const uint8_t *h = gBootGpt;
+  uint32_t headerBytes = le32 (h + 12);
+  if (le32 (h) != 0x20494645U || le32 (h + 4) != 0x54524150U || le32 (h + 8) != 0x00010000 || headerBytes < 92 ||
+      headerBytes > 4096 || le64 (h + 24) != lba || le32 (h + 84) != 128 ||
+      rootCrc32 (h, headerBytes, true) != le32 (h + 16)) {
+    return false;
+  }
+  *alt = le64 (h + 32);
+  *usableFirst = le64 (h + 40);
+  *usableLast = le64 (h + 48);
+  *entriesLba = le64 (h + 72);
+  *count = le32 (h + 80);
+  *entriesCrc = le32 (h + 88);
+  return *count && *count <= 128;
+}
+
+static bool bootNameIs (const uint8_t *entry, const char *name)
+{
+  unsigned c = 0;
+  for (; name[c]; ++c) {
+    if (entry[56 + 2 * c] != static_cast<uint8_t> (name[c]) || entry[57 + 2 * c]) return false;
+  }
+  return !entry[56 + 2 * c] && !entry[57 + 2 * c];
+}
+
+// nullptr when the partition is found; else why not
+static const char *bootFind (uint64_t *firstOut, uint64_t *lastOut)
+{
+  static const uint8_t kAndroidBoot[16] = { 0x86, 0x7f, 0x11, 0x20, 0x85, 0xe9, 0x57, 0x43,
+                                            0xb9, 0xee, 0x37, 0x4b, 0xc1, 0xd8, 0x48, 0x7d };
+  uint64_t entriesLba = 0, alt = 0, usableFirst = 0, usableLast = 0;
+  uint64_t entriesLba2 = 0, alt2 = 0, usableFirst2 = 0, usableLast2 = 0;
+  uint32_t count = 0, crc = 0, count2 = 0, crc2 = 0;
+  if (!bootGptHeader (1, &entriesLba, &count, &crc, &alt, &usableFirst, &usableLast)) return "primary GPT header";
+  if (alt != gHost.blocks - 1) return "backup GPT location";
+  if (!bootGptHeader (alt, &entriesLba2, &count2, &crc2, &alt2, &usableFirst2, &usableLast2) || alt2 != 1 ||
+      count2 != count || crc2 != crc || usableFirst2 != usableFirst || usableLast2 != usableLast) {
+    return "backup GPT header disagrees";
+  }
+  if (entriesLba < 2 || entriesLba > 64) return "GPT entries LBA";
+  uint32_t entryBlocks = (count * 128 + 4095) / 4096;
+  if (hostRead4k (0, entriesLba, entryBlocks, gBootGpt) != kIOReturnSuccess) return "GPT entries read";
+  if (rootCrc32 (gBootGpt, count * 128) != crc) return "GPT entries CRC";
+  int boot = -1;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint8_t *entry = gBootGpt + i * 128;
+    if (!rootEntryUsed (entry)) continue;
+    uint64_t f = le64 (entry + 32), l = le64 (entry + 40);
+    if (f < usableFirst || l < f || l > usableLast) return "GPT partition bounds";
+    if (bootNameIs (entry, "boot")) {
+      if (boot >= 0) return "two boot entries";
+      boot = static_cast<int> (i);
+    }
+  }
+  if (boot < 0) return "no boot entry";
+  const uint8_t *b = gBootGpt + static_cast<uint32_t> (boot) * 128;
+  uint64_t first = le64 (b + 32), last = le64 (b + 40);
+  if (memcmp (b, kAndroidBoot, sizeof (kAndroidBoot)) != 0) return "boot type GUID";
+  if (first != kBootFirst4k || last != kBootLast4k) return "boot is not where TWRP measured it";
+  if (last >= gHost.blocks) return "boot beyond the LUN";
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint8_t *entry = gBootGpt + i * 128;
+    if (static_cast<int> (i) != boot && rootEntryUsed (entry) && le64 (entry + 32) <= last && first <= le64 (entry + 40)) {
+      return "boot overlaps another partition";
+    }
+  }
+  *firstOut = first;
+  *lastOut = last;
+  return nullptr;
+}
+
+extern "C" int pong_ufs_boot_locate (uint64_t *first, uint64_t *last, char *why, size_t whyCap)
+{
+  uint64_t f = 0, l = 0;
+  const char *bad = nullptr;
+  gBootFirst = gBootLast = 0;
+  if (!gHost.lock || !gHost.ready || gHost.poisoned) {
+    bad = "UFS not ready";
+  } else {
+    bad = bootFind (&f, &l);
+  }
+  if (why && whyCap) snprintf (why, whyCap, "%s", bad ? bad : "ok");
+  if (bad) return 6;                               // ENXIO
+  gBootFirst = f;
+  gBootLast = l;
+  if (first) *first = f;
+  if (last) *last = l;
+  IOLog ("PONG_UFS: boot partition lba %llu..%llu, writes %s\n", static_cast<unsigned long long> (f),
+         static_cast<unsigned long long> (l), gHost.writable ? "enabled" : "disabled");
+  return 0;
+}
+
+// rel/blocks are 4 KiB blocks inside the partition; at most 32 per call. 0, or EINVAL 22, ENXIO 6, EROFS 30,
+// EBUSY 16, EAGAIN 35 (failed, controller still usable), EIO 5 (controller not ready or poisoned).
+extern "C" int pong_ufs_boot_io (int write, uint32_t rel, uint32_t blocks, void *buf)
+{
+  if (!buf || !blocks || blocks > kDataMax / 4096) return 22;
+  if (!gBootFirst || !gBootLast || !gHost.lock) return 6;
+  uint64_t total = gBootLast - gBootFirst + 1;
+  if (rel >= total || blocks > total - rel) return 22;
+  if (write && !gHost.writable) return 30;
+  int rc = 0;
+  IOLockLock (gHost.lock);
+  if (!gHost.ready || gHost.poisoned) {
+    rc = 5;
+  } else if (write) {
+    if (!hostIdle ()) {
+      rc = 16;
+    } else {
+      memcpy (gHost.virt + kDataOffset, buf, blocks * 4096U);
+      if (hostWrite4kLocked (0, gBootFirst + rel, blocks) != kIOReturnSuccess) rc = 35;
+    }
+  } else if (hostRead4kLocked (0, gBootFirst + rel, blocks) == kIOReturnSuccess) {
+    memcpy (buf, gHost.virt + kDataOffset, blocks * 4096U);
+  } else {
+    rc = 35;
+  }
+  if (rc && (!gHost.ready || gHost.poisoned)) rc = 5;
+  IOLockUnlock (gHost.lock);
+  return rc;
+}
+
+extern "C" int pong_ufs_boot_sync (void)
+{
+  if (!gBootFirst) return 6;
+  if (hostSyncCache () == kIOReturnSuccess) return 0;
+  return (!gHost.ready || gHost.poisoned) ? 5 : 35;
+}
+"""
+
+
 def patch_native_ufs(ufs_source: Path):
     ufs_source = ufs_source.resolve()
 
@@ -579,6 +720,20 @@ extern "C" int cpu_number (void);
             txt = txt.replace(old_poll, new_poll)
             t_poll.write_text(txt, encoding='utf-8')
             print(f'Applied poll progress recording to {t_poll}', flush=True)
+
+    # 7. PongUfsTransport.cpp: the Android 'boot' partition for bsd/dev/pong_boot_write.c (a new boot image written
+    #    from iOS). Appended after everything else, outside the anonymous namespace but in the same translation unit,
+    #    so it reuses gHost, hostRead4k(Locked), hostWrite4kLocked, hostIdle, hostSyncCache, le32/le64, rootCrc32 and
+    #    rootEntryUsed. Only blocks inside the partition are reachable: it must be the one GPT entry named "boot"
+    #    with the Android boot type GUID, at exactly 4 KiB blocks 104723..122130 (TWRP: sda22 start 837784, size
+    #    139264 sectors of 512 bytes), inside the usable range, overlapping nothing; primary and backup GPT agree.
+    t_cpp = ufs_source / 'PongUfsTransport.cpp'
+    if t_cpp.is_file():
+        txt = t_cpp.read_text(encoding='utf-8')
+        if 'pong_ufs_boot_io' not in txt:
+            txt = txt.rstrip('\n') + '\n' + BOOT_BRIDGE
+            t_cpp.write_text(txt, encoding='utf-8')
+            print(f'Applied boot partition access to {t_cpp}', flush=True)
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:

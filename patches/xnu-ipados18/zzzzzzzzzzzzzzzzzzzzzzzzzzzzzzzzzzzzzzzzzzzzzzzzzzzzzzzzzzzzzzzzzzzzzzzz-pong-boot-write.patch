@@ -1,0 +1,599 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 374bd4c..c3d1fdd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -411,6 +411,7 @@ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
+ bsd/dev/pong_wifi_tools.c		standard
++bsd/dev/pong_boot_write.c		standard
+ bsd/dev/pong_gpu_probe.c		standard
+ bsd/dev/pong_backlight_t970.c		standard
+ bsd/dev/pong_adsp.c			standard
+diff --git a/bsd/dev/pong_boot_write.c b/bsd/dev/pong_boot_write.c
+new file mode 100644
+index 0000000..70d9a14
+--- /dev/null
++++ b/bsd/dev/pong_boot_write.c
+@@ -0,0 +1,480 @@
++/*
++ * SM-T970: write a new boot image to the Android 'boot' partition from iOS, so a test round needs no TWRP.
++ *
++ * USB commands (pong_usb_ctl.c hands them here):
++ *   bootput <size> 0x<crc32>   receive <size> bytes (a multiple of 4096, at most the partition) into a zeroed buffer
++ *                              the size of the partition; CRC32 (zlib) checked as the bytes arrive; "ANDROID!" magic
++ *   bootput commit <sha256>    SHA-256 of the whole partition content (image + zero padding to 71,303,168 bytes) must
++ *                              match; the battery must be at 30 % or more; then a kernel thread writes it
++ *   bootput free               drop the buffer
++ *   bootloc                    read-only: find the partition and hash its content (status shows the SHA-256)
++ *   bootwrite status           state, progress, chunks skipped / written, the reason of a failure
++ * The partition is found and bounded by the UFS driver (pong_ufs_boot_*, patch_native_ufs_t970.py step 7): GPT name
++ * "boot", Android boot type GUID, exactly 4 KiB blocks 104723..122130 as TWRP measured, no overlap. Each 128 KiB
++ * chunk is read first and skipped when equal, else written (FUA) and read back; block 0 (the header) is zeroed before
++ * the first differing chunk and written last, so an interrupted write leaves a partition the boot loader rejects
++ * instead of half an image. Then SYNCHRONIZE CACHE and a full read-back hash. A USB reboot is refused while chunks are
++ * being written ("reboot force" overrides). A failure that poisons the UFS controller ends the write: TWRP then.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/crc.h>
++#include <libkern/crypto/sha2.h>
++#include <mach/mach_time.h>
++
++extern int pong_ufs_boot_locate(uint64_t *first, uint64_t *last, char *why, size_t why_cap) __attribute__((weak_import));
++extern int pong_ufs_boot_io(int write, uint32_t rel, uint32_t blocks, void *buf) __attribute__((weak_import));
++extern int pong_ufs_boot_sync(void) __attribute__((weak_import));
++extern int pong_battery_last_permille;      /* IOPMPowerSource.cpp: state of charge in permille, -1 until read */
++
++int pong_boot_usb(char *reply, size_t cap, const char *cmd);
++int pong_boot_rx_active(void);
++int pong_boot_feed(const uint8_t *data, unsigned len, char *reply, size_t cap);
++int pong_boot_check_timeout(char *reply, size_t cap);
++int pong_boot_busy(void);
++
++#define BOOT_PART_BYTES 71303168u           /* 17408 blocks of 4 KiB: TWRP's sda22 */
++#define BOOT_BLOCKS     17408u
++#define CHUNK_BLOCKS    32u                 /* 128 KiB, the UFS driver's largest command */
++#define CHUNK_BYTES     (CHUNK_BLOCKS * 4096u)
++#define RX_TIMEOUT_MS   10000u
++
++enum { BW_IDLE, BW_RECV, BW_LOADED, BW_HASH, BW_LOCATE, BW_WRITE, BW_VERIFY, BW_DONE, BW_FAIL, BW_READ };
++static const char *const bw_names[] = { "idle", "recv", "loaded", "hash", "locate", "write", "verify", "done", "fail", "read" };
++
++static struct {
++	uint8_t *buf;                       /* BOOT_PART_BYTES, zero beyond the image */
++	uint32_t len, got, crc_want, crc_run;
++	uint64_t deadline;
++	volatile uint32_t state;
++	volatile uint32_t done;             /* blocks handled in the current phase */
++	uint32_t skipped, written, retries;
++	int read_only;                      /* the thread only hashes the partition (bootloc) */
++	uint8_t sha_want[32], sha_part[32];
++	int sha_part_valid;
++	uint64_t first, last;
++	char why[96];
++} bw;
++
++static uint64_t
++bw_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++static void
++bw_set(uint32_t state)
++{
++	__atomic_store_n(&bw.state, state, __ATOMIC_RELEASE);
++}
++
++static uint32_t
++bw_get(void)
++{
++	return __atomic_load_n(&bw.state, __ATOMIC_ACQUIRE);
++}
++
++int
++pong_boot_busy(void)
++{
++	uint32_t s = bw_get();
++
++	return s == BW_HASH || s == BW_LOCATE || s == BW_WRITE;
++}
++
++int
++pong_boot_rx_active(void)
++{
++	return bw_get() == BW_RECV;
++}
++
++static void
++bw_fail(const char *fmt, int a, uint32_t b)
++{
++	(void)snprintf(bw.why, sizeof(bw.why), fmt, a, b);
++	bw_set(BW_FAIL);
++}
++
++static int
++hexval(char c)
++{
++	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
++}
++
++static void
++hex32(char *out, const uint8_t *d)
++{
++	static const char x[] = "0123456789abcdef";
++
++	for (int i = 0; i < 32; i++) {
++		out[2 * i] = x[d[i] >> 4];
++		out[2 * i + 1] = x[d[i] & 15];
++	}
++	out[64] = '\0';
++}
++
++static uint32_t
++parse_u32(const char **pp)
++{
++	const char *p = *pp;
++	uint32_t v = 0;
++	int base = 10;
++
++	while (*p == ' ') {
++		p++;
++	}
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		base = 16;
++		p += 2;
++	}
++	for (;;) {
++		int d = hexval(*p);
++
++		if (d < 0 || d >= base) {
++			break;
++		}
++		v = v * (uint32_t)base + (uint32_t)d;
++		p++;
++	}
++	*pp = p;
++	return v;
++}
++
++/* One chunk through the driver, retrying a failure that left the controller usable; EIO means it is not. */
++static int
++bw_io(int write, uint32_t rel, uint32_t blocks, void *buf)
++{
++	int rc = EAGAIN;
++
++	for (int attempt = 0; attempt < 4 && rc == EAGAIN; attempt++) {
++		if (attempt) {
++			bw.retries++;
++			delay_for_interval(50, 1000000u);
++		}
++		rc = pong_ufs_boot_io(write, rel, blocks, buf);
++	}
++	return rc;
++}
++
++/* SHA-256 of the partition as it is on the disk, into bw.sha_part */
++static int
++bw_hash_partition(uint8_t *scratch)
++{
++	SHA256_CTX ctx;
++
++	SHA256_Init(&ctx);
++	for (uint32_t rel = 0; rel < BOOT_BLOCKS; rel += CHUNK_BLOCKS) {
++		uint32_t n = BOOT_BLOCKS - rel < CHUNK_BLOCKS ? BOOT_BLOCKS - rel : CHUNK_BLOCKS;
++		int rc = bw_io(0, rel, n, scratch);
++
++		if (rc) {
++			bw_fail("read failed (%d) at block %u", rc, rel);
++			return -1;
++		}
++		SHA256_Update(&ctx, scratch, (size_t)n * 4096u);
++		bw.done = rel + n;
++	}
++	SHA256_Final(bw.sha_part, &ctx);
++	bw.sha_part_valid = 1;
++	return 0;
++}
++
++/* Write chunk [rel, rel+n) unless the disk already holds it; zero the header block first if needed. */
++static int
++bw_chunk(uint32_t rel, uint32_t n, uint8_t *scratch, int *header_zeroed)
++{
++	const uint8_t *want = bw.buf + (size_t)rel * 4096u;
++	int rc = bw_io(0, rel, n, scratch);
++
++	if (rc) {
++		bw_fail("read failed (%d) at block %u", rc, rel);
++		return -1;
++	}
++	if (memcmp(scratch, want, (size_t)n * 4096u) == 0) {
++		bw.skipped++;
++		return 0;
++	}
++	if (!*header_zeroed && rel != 0) {
++		/* from here on the partition is mixed: make it unbootable until the header goes in last */
++		bzero(scratch, 4096u);
++		rc = bw_io(1, 0, 1, scratch);
++		if (rc) {
++			bw_fail("header zeroing failed (%d) %u", rc, 0);
++			return -1;
++		}
++		*header_zeroed = 1;
++	}
++	rc = bw_io(1, rel, n, (void *)(uintptr_t)want);
++	if (rc == 0) {
++		rc = bw_io(0, rel, n, scratch);
++	}
++	if (rc) {
++		bw_fail(rc == EIO ? "UFS controller lost (%d) at block %u: restore boot from TWRP" : "write failed (%d) at block %u",
++		    rc, rel);
++		return -1;
++	}
++	if (memcmp(scratch, want, (size_t)n * 4096u) != 0) {
++		bw_fail("read-back differs (%d) at block %u", 0, rel);
++		return -1;
++	}
++	bw.written++;
++	return 0;
++}
++
++static void
++bw_idle_forever(void)
++{
++	for (;;) {
++		delay_for_interval(60000, 1000000u);
++	}
++}
++
++static void
++bw_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t *scratch = kalloc_data(CHUNK_BYTES, Z_WAITOK | Z_NOPAGEWAIT);
++	uint64_t t0 = bw_ms();
++	int header_zeroed = 0;
++
++	if (!scratch) {
++		bw_fail("no memory for the chunk buffer (%d) %u", 0, 0);
++		bw_idle_forever();
++	}
++	if (!bw.read_only) {
++		SHA256_CTX ctx;
++		uint8_t sha[32];
++
++		bw_set(BW_HASH);
++		SHA256_Init(&ctx);
++		SHA256_Update(&ctx, bw.buf, BOOT_PART_BYTES);
++		SHA256_Final(sha, &ctx);
++		if (memcmp(sha, bw.sha_want, 32) != 0) {
++			bw_fail("SHA-256 of the received image differs (%d) %u", 0, 0);
++			goto out;
++		}
++	}
++	bw_set(BW_LOCATE);
++	bw.first = bw.last = 0;
++	if (pong_ufs_boot_locate(&bw.first, &bw.last, bw.why, sizeof(bw.why)) != 0 || bw.last - bw.first + 1 != BOOT_BLOCKS) {
++		bw_set(BW_FAIL);    /* bw.why holds the driver's reason */
++		goto out;
++	}
++	if (bw.read_only) {
++		bw_set(BW_READ);
++		bw.done = 0;
++		if (bw_hash_partition(scratch) == 0) {
++			(void)snprintf(bw.why, sizeof(bw.why), "read in %llu ms", (unsigned long long)(bw_ms() - t0));
++			bw_set(BW_DONE);
++		}
++		goto out;
++	}
++	bw_set(BW_WRITE);
++	bw.done = 0;
++	bw.skipped = bw.written = bw.retries = 0;
++	for (uint32_t rel = CHUNK_BLOCKS; rel < BOOT_BLOCKS; rel += CHUNK_BLOCKS) {
++		uint32_t n = BOOT_BLOCKS - rel < CHUNK_BLOCKS ? BOOT_BLOCKS - rel : CHUNK_BLOCKS;
++
++		if (bw_chunk(rel, n, scratch, &header_zeroed)) {
++			goto out;
++		}
++		bw.done = rel + n;
++	}
++	if (bw_chunk(0, CHUNK_BLOCKS, scratch, &header_zeroed)) {      /* the header last */
++		goto out;
++	}
++	if (bw.written && pong_ufs_boot_sync() != 0) {
++		bw_fail("SYNCHRONIZE CACHE failed (%d) %u", 0, 0);
++		goto out;
++	}
++	bw_set(BW_VERIFY);
++	bw.done = 0;
++	if (bw_hash_partition(scratch) != 0) {
++		goto out;
++	}
++	if (memcmp(bw.sha_part, bw.sha_want, 32) != 0) {
++		bw_fail("the partition's SHA-256 differs after writing (%d) %u", 0, 0);
++		goto out;
++	}
++	(void)snprintf(bw.why, sizeof(bw.why), "%u chunks written, %u equal, %u retries, %llu ms", bw.written, bw.skipped,
++	    bw.retries, (unsigned long long)(bw_ms() - t0));
++	bw_set(BW_DONE);
++out:
++	kfree_data(scratch, CHUNK_BYTES);
++	bw_idle_forever();
++}
++
++static int
++bw_start(int read_only, char *reply, size_t cap)
++{
++	thread_t th = THREAD_NULL;
++	uint32_t before = bw_get();
++
++	if (!pong_ufs_boot_locate || !pong_ufs_boot_io || !pong_ufs_boot_sync) {
++		strlcpy(reply, "bootwrite: this kernel's UFS driver has no boot partition access\n", cap);
++		return -1;
++	}
++	bw.read_only = read_only;
++	bw.why[0] = '\0';
++	bw.sha_part_valid = 0;
++	bw_set(read_only ? BW_LOCATE : BW_HASH);
++	if (kernel_thread_start(bw_thread, NULL, &th) != KERN_SUCCESS) {
++		bw_set(before);
++		strlcpy(reply, "bootwrite: no thread\n", cap);
++		return -1;
++	}
++	thread_deallocate(th);
++	strlcpy(reply, read_only ? "bootloc: started\n" : "bootput: committing\n", cap);
++	return 0;
++}
++
++int
++pong_boot_feed(const uint8_t *data, unsigned len, char *reply, size_t cap)
++{
++	uint32_t room = bw.len - bw.got;
++
++	if (bw_get() != BW_RECV) {
++		return 0;
++	}
++	if (len > room) {
++		len = room;
++	}
++	memcpy(bw.buf + bw.got, data, len);
++	bw.crc_run = crc32(bw.crc_run, data, len);
++	bw.got += len;
++	bw.deadline = bw_ms() + RX_TIMEOUT_MS;
++	if (bw.got < bw.len) {
++		return 0;
++	}
++	if (bw.crc_run != bw.crc_want) {
++		bzero(bw.buf, bw.len);
++		bw_set(BW_IDLE);
++		(void)snprintf(reply, cap, "bootput: crc-mismatch got %08x want %08x\n", bw.crc_run, bw.crc_want);
++	} else if (memcmp(bw.buf, "ANDROID!", 8) != 0) {
++		bzero(bw.buf, bw.len);
++		bw_set(BW_IDLE);
++		strlcpy(reply, "bootput: not an Android boot image\n", cap);
++	} else {
++		bw_set(BW_LOADED);
++		(void)snprintf(reply, cap, "bootput: ok %u %08x\n", bw.len, bw.crc_run);
++	}
++	return 1;
++}
++
++int
++pong_boot_check_timeout(char *reply, size_t cap)
++{
++	if (bw_get() != BW_RECV || bw_ms() < bw.deadline) {
++		return 0;
++	}
++	bzero(bw.buf, bw.got);
++	bw_set(BW_IDLE);
++	(void)snprintf(reply, cap, "bootput: timeout got %u\n", bw.got);
++	return 1;
++}
++
++/* cmd: the whole command line ("bootput ...", "bootloc", "bootwrite status") */
++int
++pong_boot_usb(char *reply, size_t cap, const char *cmd)
++{
++	uint32_t s = bw_get();
++
++	if (!reply || cap < 160 || !cmd) {
++		return -1;
++	}
++	if (strcmp(cmd, "bootwrite status") == 0) {
++		char sha[65];
++		uint32_t total = s == BW_RECV ? bw.len : BOOT_BLOCKS;
++		uint32_t done = s == BW_RECV ? bw.got : bw.done;
++
++		hex32(sha, bw.sha_part);
++		(void)snprintf(reply, cap, "bootwrite: %s %u/%u written %u equal %u retries %u lba %llu..%llu part %s why %s\n",
++		    bw_names[s < sizeof(bw_names) / sizeof(bw_names[0]) ? s : 0], done, total, bw.written, bw.skipped, bw.retries,
++		    (unsigned long long)bw.first, (unsigned long long)bw.last, bw.sha_part_valid ? sha : "-", bw.why[0] ? bw.why : "-");
++		return 0;
++	}
++	if (pong_boot_busy() || s == BW_VERIFY || s == BW_READ || (s == BW_LOCATE)) {
++		strlcpy(reply, "bootwrite: busy\n", cap);
++		return -1;
++	}
++	if (strcmp(cmd, "bootloc") == 0) {
++		if (s == BW_RECV) {
++			strlcpy(reply, "bootloc: an upload is in progress\n", cap);
++			return -1;
++		}
++		return bw_start(1, reply, cap);
++	}
++	if (strcmp(cmd, "bootput free") == 0) {
++		if (bw.buf) {
++			kfree_data(bw.buf, BOOT_PART_BYTES);
++			bw.buf = NULL;
++		}
++		bw.len = bw.got = 0;
++		bw_set(BW_IDLE);
++		strlcpy(reply, "bootput: freed\n", cap);
++		return 0;
++	}
++	if (strncmp(cmd, "bootput commit ", 15) == 0) {
++		const char *h = cmd + 15;
++
++		if (s != BW_LOADED) {
++			strlcpy(reply, "bootput: nothing loaded\n", cap);
++			return -1;
++		}
++		for (int i = 0; i < 32; i++) {
++			int hi = hexval(h[2 * i]), lo = hi < 0 ? -1 : hexval(h[2 * i + 1]);
++
++			if (hi < 0 || lo < 0) {
++				strlcpy(reply, "bootput: commit needs the 64-digit SHA-256\n", cap);
++				return -1;
++			}
++			bw.sha_want[i] = (uint8_t)(hi << 4 | lo);
++		}
++		if (pong_battery_last_permille < 300) {
++			(void)snprintf(reply, cap, "bootput: battery %d permille (unknown or below 30 %%): not writing\n",
++			    pong_battery_last_permille);
++			return -1;
++		}
++		return bw_start(0, reply, cap);
++	}
++	if (strncmp(cmd, "bootput ", 8) == 0) {
++		const char *p = cmd + 8;
++		uint32_t size = parse_u32(&p);
++		uint32_t crc = parse_u32(&p);
++
++		if (s == BW_RECV) {
++			strlcpy(reply, "bootput: an upload is in progress\n", cap);
++			return -1;
++		}
++		if (size < 4096u || size > BOOT_PART_BYTES || (size & 4095u)) {
++			strlcpy(reply, "bootput: size must be a multiple of 4096 up to 71303168\n", cap);
++			return -1;
++		}
++		if (!bw.buf) {
++			bw.buf = kalloc_data(BOOT_PART_BYTES, Z_WAITOK | Z_NOPAGEWAIT | Z_ZERO);
++			if (!bw.buf) {
++				strlcpy(reply, "bootput: no-mem\n", cap);
++				return -1;
++			}
++		} else {
++			bzero(bw.buf, BOOT_PART_BYTES);
++		}
++		bw.len = size;
++		bw.got = 0;
++		bw.crc_want = crc;
++		bw.crc_run = 0;
++		bw.deadline = bw_ms() + RX_TIMEOUT_MS;
++		bw_set(BW_RECV);
++		(void)snprintf(reply, cap, "bootput: ready %u\n", size);
++		return 0;
++	}
++	strlcpy(reply, "bootput: unknown subcommand\n", cap);
++	return -1;
++}
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 2d78632..c42bce3 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -92,6 +92,12 @@ extern int pong_bt_usb(char *reply, size_t reply_cap, int mode);
+ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_stack.c */
+ extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_tools.c */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
++/* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
++extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
++extern int pong_boot_rx_active(void);
++extern int pong_boot_feed(const uint8_t *data, unsigned len, char *reply, size_t cap);
++extern int pong_boot_check_timeout(char *reply, size_t cap);
++extern int pong_boot_busy(void);
+ extern struct vc_info vinfo;
+ 
+ /* Diagnostic pmsg output with synchronous barrier flush */
+@@ -1818,13 +1824,23 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_status();
+ 	} else if (strcmp(cmd, "log") == 0) {
+ 		cmd_handle_log();
+-	} else if (strcmp(cmd, "reboot") == 0) {
++	} else if ((strcmp(cmd, "reboot") == 0 || strncmp(cmd, "reboot-recovery", 15) == 0) && pong_boot_busy()) {
++		/* bsd/dev/pong_boot_write.c is writing chunks of the boot partition: a restart now leaves it mixed */
++		send_str("reboot: refused, the boot partition is being written ('bootwrite status'; 'reboot force' overrides)\n");
++	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reboot force") == 0) {
+ 		cmd_handle_reboot(false);
+ 	} else if (strcmp(cmd, "reboot-recovery") == 0) {
+ 		cmd_handle_reboot(true);
+ 	} else if (strcmp(cmd, "reboot-recovery warm") == 0) {
+ 		reboot_recovery_warm = true;
+ 		cmd_handle_reboot(true);
++	} else if (strncmp(cmd, "bootput", 7) == 0 || strcmp(cmd, "bootloc") == 0 || strcmp(cmd, "bootwrite status") == 0) {
++		/* a new boot image written from iOS (bsd/dev/pong_boot_write.c) */
++		static char bw_reply[400];
++
++		bw_reply[0] = '\0';
++		(void)pong_boot_usb(bw_reply, sizeof(bw_reply), cmd);
++		send_str(bw_reply[0] ? bw_reply : "bootput: no reply\n");
+ 	} else if (strcmp(cmd, "ponstat") == 0) {
+ 		/* the PMIC power-on peripheral: reset reasons, PS_HOLD reset type, restart reason (pong_buttons.c) */
+ 		char pon_reply[200];
+@@ -1990,6 +2006,23 @@ dispatch_command(const char *cmd)
+ static void
+ feed_input(const uint8_t *data, unsigned len)
+ {
++	if (pong_boot_rx_active()) {
++		/* boot image bytes (bootput), copied out of the device buffer in packet-sized pieces */
++		static char boot_reply[128];
++		uint8_t piece[512];
++
++		for (unsigned at = 0; at < len; ) {
++			unsigned n = len - at < sizeof(piece) ? len - at : (unsigned)sizeof(piece);
++
++			copy_from_device(piece, (const volatile uint8_t *)(data + at), n);
++			at += n;
++			if (pong_boot_feed(piece, n, boot_reply, sizeof(boot_reply))) {
++				send_str(boot_reply);
++				break;
++			}
++		}
++		return;
++	}
+ 	if (fwput_rx_active) {
+ 		fwput_feed(data, len);     /* firmware bytes, not a command line */
+ 		return;
+@@ -2493,6 +2526,13 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 	while (1) {
+ 		process_events();
+ 		fwput_check_timeout();
++		{
++			static char boot_timeout_reply[96];
++
++			if (pong_boot_check_timeout(boot_timeout_reply, sizeof(boot_timeout_reply))) {
++				send_str(boot_timeout_reply);
++			}
++		}
+ 		if (ctl_configured && !ctl_rx_active) {
+ 			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
+ 		}
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index b42e552..45383f0 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -600,6 +600,8 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+ void pong_battery_publish(IOPMPowerSource *, unsigned int, unsigned int, bool, bool, unsigned int, int, unsigned int, bool, bool, bool);
+ /* The battery temperature in tenths of a degree for the USB `temp` command; -32768 until the gauge was read. */
+ extern "C" { extern int pong_battery_last_decic; int pong_battery_last_decic = -32768; }
++/* state of charge in permille for bsd/dev/pong_boot_write.c (no boot write below 30 %); -1 until the gauge was read */
++extern "C" { extern int pong_battery_last_permille; int pong_battery_last_permille = -1; }
+ extern "C" { extern uint8_t pong_charger_cnfg[14]; uint8_t pong_charger_cnfg[14]; }   /* USB `temp`; [13] = valid */
+ namespace {
+ constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
+@@ -900,6 +902,7 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 				}
+ 			}
+ 			if (s.tempValid) pong_battery_last_decic = s.decic;
++			pong_battery_last_permille = int(s.permille);
+ 			if (s.chargerValid && unsigned((s.details & 0x0f) | (s.intOk & 0x40)) != lastState) {
+ 				lastState = unsigned((s.details & 0x0f) | (s.intOk & 0x40));
+ 				batteryPmsg("PONG_BATT chg dtls=%02x ok=%02x ext=%u chg=%u ma=%d kicks=%u\n", s.details, s.intOk,
