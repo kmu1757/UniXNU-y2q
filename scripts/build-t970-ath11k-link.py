@@ -93,6 +93,15 @@ NET_EDITS = (
     ('  note_frame(eth, length, false);\n',
      '  note_frame(eth, length, false);\n'
      '  gDst[(eth[0] & 1) ? ((eth[0] & eth[1] & eth[2] & eth[3] & eth[4] & eth[5]) == 0xff ? 0 : 1) : (memcmp(eth, gMac, 6) ? 3 : 2)]++;\n'),
+    # Packet filter readers: XNU leaves the tap to the driver (if_fake.c, if_bond.c, if_bridge.c call bpf_tap_in/out
+    # themselves). Attached but never tapped, a reader saw nothing: the address configuration's own ARP check of the
+    # router (sent through the filter) never saw a reply and asked again every second while the kernel's ARP was content.
+    ('  mbuf_pkthdr_setlen(m, length); mbuf_pkthdr_setrcvif(m, gIf);\n',
+     '  mbuf_pkthdr_setlen(m, length); mbuf_pkthdr_setrcvif(m, gIf);\n'
+     '  bpf_tap_in(gIf, DLT_EN10MB, m, nullptr, 0);   // the whole frame, before the header is set apart\n'),
+    ('    note_frame(frame, length, true);\n',
+     '    note_frame(frame, length, true);\n'
+     '    bpf_tap_out(gIf, DLT_EN10MB, m, nullptr, 0);\n'),
 )
 NET_TAIL = ('\nextern "C" void pong_wifi_net_traffic(void);\n'
             'extern "C" void pong_wifi_net_traffic(void) {\n'
