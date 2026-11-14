@@ -105,33 +105,6 @@ def t970_edits(gen, mhi, shared, out):
          '    memcpy(e, C.ap.bssid, 6); memcpy(e + 6, g_vif->addr, 6); e[12] = 0x88; e[13] = 0x8e; memcpy(e + 14, k, total);\n'
          '    tx_eth(e, 14 + total); return; }\n'),
     ])
-    # 6. nw_sta.c: on this tablet no broadcast frame reached the network stack while unicast frames did. Count the
-    #    group-addressed data frames at the station's receive hook and in to_eth(): seen at all, from the access
-    #    point, protected, decrypted, IV stripped, delivered, dropped for a bad LLC header or for being short; keep
-    #    the first one's eight bytes after the header. nw_wifi_t970_rx_stats() gives the board the line.
-    edit(out / 'nw_sta_pong.c', [
-        ('static void to_eth(struct sk_buff *skb) {\n',
-         'unsigned nw_wifi_t970_grp[10]; static u8 nw_t970_grp_head[8];\n'
-         'void nw_wifi_t970_rx_stats(char *b, int n) {\n'
-         '  if (n > 0) snprintf(b, n, "group data %u from-ap %u prot %u decr %u ivstr %u delivered %u bad-llc %u short %u; first %02x%02x%02x%02x%02x%02x%02x%02x flag %x fc %x",\n'
-         '    nw_wifi_t970_grp[8], nw_wifi_t970_grp[0], nw_wifi_t970_grp[1], nw_wifi_t970_grp[2], nw_wifi_t970_grp[3], nw_wifi_t970_grp[4],\n'
-         '    nw_wifi_t970_grp[5], nw_wifi_t970_grp[6], nw_t970_grp_head[0], nw_t970_grp_head[1], nw_t970_grp_head[2], nw_t970_grp_head[3],\n'
-         '    nw_t970_grp_head[4], nw_t970_grp_head[5], nw_t970_grp_head[6], nw_t970_grp_head[7], nw_wifi_t970_grp[7], nw_wifi_t970_grp[9]); }\n'
-         'static void to_eth(struct sk_buff *skb) {\n'),
-        ('  if (skb->len < hl + 8) return;\n  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) return;\n',
-         '  const int t970g = is_multicast_ether_addr(h->addr1);\n'
-         '  if (t970g) { nw_wifi_t970_grp[0]++; if (ieee80211_has_protected(h->frame_control)) nw_wifi_t970_grp[1]++;\n'
-         '    if (st->flag & RX_FLAG_DECRYPTED) nw_wifi_t970_grp[2]++; if (st->flag & RX_FLAG_IV_STRIPPED) nw_wifi_t970_grp[3]++;\n'
-         '    if (nw_wifi_t970_grp[0] == 1) { if (skb->len >= hl + 8) memcpy(nw_t970_grp_head, skb->data + hl, 8);\n'
-         '      nw_wifi_t970_grp[7] = (unsigned)st->flag; nw_wifi_t970_grp[9] = le16_to_cpu(h->frame_control); } }\n'
-         '  if (skb->len < hl + 8) { if (t970g) nw_wifi_t970_grp[6]++; return; }\n'
-         '  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) { if (t970g) nw_wifi_t970_grp[5]++; return; }\n'),
-        ('  if (g_ev.rx) g_ev.rx(eth, 14 + plen); }\n',
-         '  if (t970g) nw_wifi_t970_grp[4]++;\n  if (g_ev.rx) g_ev.rx(eth, 14 + plen); }\n'),
-        ('  if (ieee80211_is_data(h->frame_control) && !memcmp(h->addr2, C.ap.bssid, 6)) {\n',
-         '  if (ieee80211_is_data(h->frame_control) && is_multicast_ether_addr(h->addr1)) nw_wifi_t970_grp[8]++;\n'
-         '  if (ieee80211_is_data(h->frame_control) && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'),
-    ])
     return qrtr
 
 
