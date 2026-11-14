@@ -102,6 +102,15 @@ NET_EDITS = (
     ('    note_frame(frame, length, true);\n',
      '    note_frame(frame, length, true);\n'
      '    bpf_tap_out(gIf, DLT_EN10MB, m, nullptr, 0);\n'),
+    # auto-join (11-14): every set and the first request of each type in the log (it stopped after 96 lines)
+    ('if(logged++<96 || (set && (rq.req_type==kAssociate || rq.req_type==kCipherKey || rq.req_type==kAuthType)))log(',
+     'static uint32_t seenType[16]; const int ty = rq.req_type;\n    const bool firstOfType = ty >= 0 && ty < 512 && !(seenType[ty / 32] & (1u << (ty % 32)));\n    if (ty >= 0 && ty < 512) seenType[ty / 32] |= 1u << (ty % 32);\n    if(logged++<96 || set || firstOfType)log('),
+    # auto-join (11-14): CHANNELS_INFO answered
+    ('  case kCurrentNetwork: {\n',
+     '  case kChannelsInfo: {\n    // CHANNELS_INFO in the layout iOS 16.5 has (ref/G986N-iOS redwood_apple80211.c:106-117, 357-377): count at 12,\n    // channel numbers from 0x32e, flags words from 0x12d0; only when the daemon asks with exactly that size. Unanswered,\n    // the daemon waited four minutes after en0 appeared before its next step, on every boot.\n    if (rq.req_len != 10016) return EOPNOTSUPP;\n    static uint8_t info[10016]; memset(info, 0, sizeof info);\n    uint32_t frequencies[400]; const unsigned actual = nw_wifi_channel_list(frequencies, 400);\n    const uint16_t count = static_cast<uint16_t>(actual); memcpy(info + 12, &count, 2);\n    for (unsigned i = 0; i < actual; i++) { channel c; fill_channel(c, frequencies[i]); info[0x32e + i] = static_cast<uint8_t>(c.channel); memcpy(info + 0x12d0 + 4 * i, &c.flags, 4); }\n    log(6, "wifi-net: channels info answered: %u channels", actual);\n    return copy_out(rq, info, sizeof info, kernel); }\n  case kCurrentNetwork: {\n'),
+    # auto-join (11-14): POWER_CHANGED once en0 is up
+    ('  publish_registry("en0");\n',
+     '  publish_registry("en0");\n  lck_mtx_lock(gLock); notify_locked(NotifyPower); lck_mtx_unlock(gLock);   // the daemon learns the interface is powered\n'),
 )
 NET_TAIL = ('\nextern "C" void pong_wifi_net_traffic(void);\n'
             'extern "C" void pong_wifi_net_traffic(void) {\n'
