@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index eaba086..f4b9337 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -28,6 +28,7 @@
+ #include <sys/pong_usb_ctl.h>
+ #include <sys/bsdtask_info.h>
+ #include <IOKit/IOLib.h>
++#include <kern/kalloc.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+@@ -1562,6 +1563,7 @@ struct fwput_slot {
+     uint32_t len;
+     uint32_t crc;
+     bool     used;
++    bool     heap;     /* data came from kalloc_data (no contiguous range was free), not IOMallocContiguous */
+ };
+ 
+ static struct fwput_slot fwput_slots[FWPUT_MAX_SLOTS];
+@@ -1695,17 +1697,32 @@ cmd_handle_fwput(const char *args)
+     }
+ 
+     if (!slot->data || slot->cap < size) {
++        /*
++         * Every reader takes the image by its virtual address (pong_fw_lookup): the Wi-Fi stack and the hand-driven
++         * stages copy it, the GPU probe reads it. A physically contiguous buffer is only a preference: on the SM-T970
++         * the 4.4 MB amss20.bin found no contiguous range on 3 of 5 boots (11-14), so fall back to ordinary memory.
++         */
+         IOPhysicalAddress phys = 0;
++        bool heap = false;
+         void *buf = IOMallocContiguous(size, 4096, &phys);
++        if (!buf) {
++            buf = kalloc_data(size, Z_WAITOK);
++            heap = true;
++        }
+         if (!buf) {
+             send_str("fwput: no-mem\n");
+             return;
+         }
+         if (slot->data) {
+-            IOFreeContiguous(slot->data, slot->cap);
++            if (slot->heap) {
++                kfree_data(slot->data, slot->cap);
++            } else {
++                IOFreeContiguous(slot->data, slot->cap);
++            }
+         }
+         slot->data = buf;
+         slot->cap = size;
++        slot->heap = heap;
+     }
+ 
+     slot->len = size;
